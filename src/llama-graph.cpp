@@ -1774,28 +1774,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     assert(n_expert_used > 0);
 
-    // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+    ggml_tensor * moe_out;
+    // Single-token decode is per-op-submit bound and the n_expert_used-1 add chain dominates
+    // the node count; reduce over the expert dim in one op. Larger batch keeps the chain.
+    if (n_tokens == 1 && hparams.n_expert_used > 1) {
+        // [n_embd, n_expert_used, 1] -> [n_expert_used, n_embd, 1] -> sum over dim0
+        moe_out = ggml_cont(ctx0, ggml_permute(ctx0, experts, 1, 0, 2, 3));
+        moe_out = ggml_sum_rows(ctx0, moe_out);
+        moe_out = ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
+    } else {
+        // order the views before the adds
+        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
 
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
+        // aggregate experts
+        // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
+        //       to avoid potentially a large number of add nodes during warmup
+        //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
+        moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
-        ggml_build_forward_expand(gf, moe_out);
-    }
+            ggml_build_forward_expand(gf, moe_out);
+        }
 
-    if (hparams.n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
+        if (hparams.n_expert_used == 1) {
+            // avoid returning a non-contiguous tensor
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);
