@@ -1028,6 +1028,46 @@ void ggml_sycl_softplus(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_op_softplus(ctx, dst);
 }
 
+// Fused gated-delta-net gate glue: dst = softplus(a + b) * c, with b,c broadcast 1-D over dim0.
+// Collapses the ADD -> SOFTPLUS -> MUL serial chain (the alpha gate in each linear-attn layer) into
+// one kernel. See ggml_sycl_try_fuse() in ggml-sycl.cpp for detection.
+static void fused_add_softplus_mul_f32(const float * __restrict__ a, const float * __restrict__ b,
+                                       const float * __restrict__ c, float * __restrict__ dst,
+                                       const int64_t ne0, const int64_t nelements,
+                                       const sycl::nd_item<1> & item) {
+    const int64_t i = item.get_global_linear_id();
+    if (i >= nelements) {
+        return;
+    }
+    const int64_t i0 = i % ne0;
+    dst[i] = op_softplus(a[i] + b[i0]) * c[i0];
+}
+
+void ggml_sycl_op_fused_add_softplus_mul(ggml_backend_sycl_context & ctx, const ggml_tensor * a,
+                                         const ggml_tensor * b, const ggml_tensor * c, ggml_tensor * dst) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                c->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t ne0       = a->ne[0];
+    const int64_t nelements = ggml_nelements(a);
+
+    const float * a_d = (const float *) a->data;
+    const float * b_d = (const float *) b->data;
+    const float * c_d = (const float *) c->data;
+    float *       d_d = (float *) dst->data;
+
+    queue_ptr stream = ctx.stream();
+    ggml_sycl_set_device(ctx.device);
+
+    constexpr int block = 256;
+    const int64_t n_groups = (nelements + block - 1) / block;
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_groups * block), sycl::range<1>(block)),
+        [=](sycl::nd_item<1> item) {
+            fused_add_softplus_mul_f32(a_d, b_d, c_d, d_d, ne0, nelements, item);
+        });
+}
+
 void ggml_sycl_neg(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     ggml_sycl_op_neg(ctx, dst);

@@ -5162,6 +5162,36 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
         }
     }
 
+    // gated-delta-net gate glue: ADD -> SOFTPLUS(unary) -> MUL  =>  softplus(alpha + ssm_dt) * ssm_a.
+    // A 3-deep tiny-op serial chain per linear-attn layer (x30); collapse to one elementwise kernel.
+    // Default ON; A/B with GGML_SYCL_DISABLE_DELTANET_GLUE=1.
+    static const bool disable_dn_glue = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_DELTANET_GLUE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_dn_glue && node->op == GGML_OP_ADD &&
+        ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL })) {
+        ggml_tensor * add = node;
+        ggml_tensor * sp  = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS) {
+            // a = full-shape operand of the add, b = its broadcast 1-D operand; c = mul's non-softplus operand
+            ggml_tensor * a = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
+            ggml_tensor * b = (a == add->src[0]) ? add->src[1] : add->src[0];
+            ggml_tensor * c = (mul->src[0] == sp) ? mul->src[1] : mul->src[0];
+            const bool ok = a && b && c &&
+                a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                c->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(a, add) && ggml_is_contiguous(a) && ggml_is_contiguous(mul) &&
+                ggml_is_contiguous(b) && ggml_nelements(b) == a->ne[0] &&
+                ggml_is_contiguous(c) && ggml_nelements(c) == a->ne[0];
+            if (ok) {
+                ggml_sycl_op_fused_add_softplus_mul(ctx, a, b, c, mul);
+                return 2;
+            }
+        }
+    }
+
     // Glue fusion (RMS_NORM+MUL[+ADD]) is opt-in: measured-inert on this matmul-bound workload (the glue
     // already overlaps under matmul execution). Kept for archs/shapes where glue is NOT hidden. Enable
     // with GGML_SYCL_ENABLE_FUSION=1.
