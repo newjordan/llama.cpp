@@ -11,6 +11,7 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <assert.h>
 #include <atomic>
 #include <cinttypes>
@@ -5139,8 +5140,87 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Detect a fusable op subgraph starting at node i and, if found, dispatch a single fused kernel.
+// Returns the number of *following* nodes consumed (0 = no fusion, dispatch node i normally).
+// Decode on this backend is host-submit bound, so eliding glue submits (norm-weight MUL, residual
+// ADD) directly buys throughput. Mirrors the CUDA backend's ggml_cuda_try_fuse for the patterns
+// this model actually emits. Toggle off with GGML_SYCL_DISABLE_FUSION=1.
+static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+
+    // topk-moe router fusion: collapses the softmax->top-k->get_rows[->norm][->scale] serial chain that
+    // otherwise blocks the expert GEMVs. This chain is submit-bound (not hidden behind a big op), so it
+    // is the lever that actually moves decode here. Default ON; A/B with GGML_SYCL_DISABLE_TOPK_MOE=1.
+    static const bool disable_topk_moe = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_TOPK_MOE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_topk_moe) {
+        const int skip = ggml_sycl_try_fuse_topk_moe(ctx, cgraph, i);
+        if (skip != 0) {
+            return skip;
+        }
+    }
+
+    // Glue fusion (RMS_NORM+MUL[+ADD]) is opt-in: measured-inert on this matmul-bound workload (the glue
+    // already overlaps under matmul execution). Kept for archs/shapes where glue is NOT hidden. Enable
+    // with GGML_SYCL_ENABLE_FUSION=1.
+    static const bool enable_glue_fusion = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_FUSION");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enable_glue_fusion) {
+        return 0;
+    }
+
+    // RMS_NORM (+ MUL weight) (+ ADD residual/bias)  ->  one fused norm kernel
+    if (node->op == GGML_OP_RMS_NORM) {
+        auto types_ok = [](const ggml_tensor * t) {
+            return t->src[0]->type == GGML_TYPE_F32 && t->src[1]->type == GGML_TYPE_F32 && t->type == GGML_TYPE_F32;
+        };
+        // longest match first: RMS_NORM + MUL + ADD
+        if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            ggml_tensor * mul = cgraph->nodes[i + 1];
+            ggml_tensor * add = cgraph->nodes[i + 2];
+            const bool bcast_ok = !(node == mul->src[1] && !ggml_are_same_shape(mul->src[0], node));
+            if (node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                types_ok(mul) && types_ok(add) && bcast_ok &&
+                ggml_is_contiguous_rows(mul->src[0]) && ggml_is_contiguous_rows(mul->src[1]) &&
+                ggml_is_contiguous(add->src[0]) && ggml_is_contiguous_rows(add->src[1])) {
+                ggml_sycl_op_rms_norm_fused_add(ctx, node, mul, add);
+                return 2;
+            }
+        }
+        // RMS_NORM + MUL
+        if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            ggml_tensor * mul = cgraph->nodes[i + 1];
+            const bool bcast_ok = !(node == mul->src[1] && !ggml_are_same_shape(mul->src[0], node));
+            if (node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                types_ok(mul) && bcast_ok &&
+                ggml_is_contiguous_rows(mul->src[0]) && ggml_is_contiguous_rows(mul->src[1])) {
+                ggml_sycl_op_rms_norm_fused(ctx, node, mul);
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    // Optional per-op-type profiler (SIQ_PROF=1): serializes each op with a queue wait and accumulates
+    // host-observed GPU time per op type. Serialization inflates absolutes (removes overlap) but the
+    // RELATIVE breakdown + serialized-total-vs-wall ratio reveal where decode time goes. Diagnostic only.
+    static const bool prof = getenv("SIQ_PROF") != nullptr;
+    static double op_us[GGML_OP_COUNT] = { 0 };
+    static long   op_n [GGML_OP_COUNT] = { 0 };
+    static double unary_us = 0, fused_us = 0; static long unary_n = 0, fused_n = 0;
+    static int    geval = 0;
+    auto now_us = []() {
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -5150,6 +5230,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        {
+            const double tf0 = prof ? now_us() : 0.0;
+            const int nodes_to_skip = ggml_sycl_try_fuse(*sycl_ctx, cgraph, i);
+            if (nodes_to_skip != 0) {
+                if (prof) { sycl_ctx->stream()->wait(); fused_us += now_us() - tf0; fused_n++; }
+                i += nodes_to_skip;
+                continue;
+            }
+        }
 #ifndef NDEBUG
         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -5158,11 +5248,36 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        const double t0 = prof ? now_us() : 0.0;
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        if (prof) {
+            sycl_ctx->stream()->wait();
+            const double dt = now_us() - t0;
+            if (node->op == GGML_OP_UNARY) { unary_us += dt; unary_n++; }
+            else { op_us[node->op] += dt; op_n[node->op]++; }
+        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+
+    if (prof && (++geval % 50 == 0)) {
+        struct row { const char * name; double us; long n; };
+        std::vector<row> rows;
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (op_n[op] > 0) rows.push_back({ ggml_op_name((ggml_op) op), op_us[op], op_n[op] });
+        }
+        if (unary_n > 0) rows.push_back({ "UNARY", unary_us, unary_n });
+        if (fused_n > 0) rows.push_back({ "FUSED", fused_us, fused_n });
+        std::sort(rows.begin(), rows.end(), [](const row & a, const row & b){ return a.us > b.us; });
+        double tot = 0; for (auto & r : rows) tot += r.us;
+        fprintf(stderr, "[siq-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",
+                geval, tot / 1000.0, tot / geval);
+        for (auto & r : rows) {
+            fprintf(stderr, "  %-14s %9.1f ms  %6.1f%%  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
+                    r.name, r.us/1000.0, 100.0*r.us/tot, r.n, r.us/r.n, (double)r.n/geval);
+        }
     }
 }
 
