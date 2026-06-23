@@ -161,24 +161,28 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     auto *        inp_attn    = build_attn_inp_kv();
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
+    const bool  is_block = (ubatch.token != nullptr);  // token batch = drafted block; embd batch = context g
+    ggml_tensor * ctx_out = nullptr;                    // accumulates context-pass outputs (keeps K/V writes reachable)
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = h;
 
-        ggml_tensor * cur = build_norm(h, layer.attn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        // noise/block stream gets per-layer input_layernorm; the fused context g does NOT (it is
+        // already hidden_norm'd once by the encoder and fed raw to every layer's k/v_proj).
+        ggml_tensor * attn_in = is_block ? build_norm(h, layer.attn_norm, NULL, LLM_NORM_RMS, il) : h;
+        cb(attn_in, "attn_norm", il);
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, cur);
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur);
-        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur);
+        ggml_tensor * Qcur = build_lora_mm(layer.wq, attn_in);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, attn_in);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, attn_in);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
         Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
-        Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);  // k_norm over k_ctx and k_noise alike
 
         Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
                 n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
@@ -189,9 +193,17 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Qcur, "Qcur", il);
         cb(Kcur, "Kcur", il);
 
-        cur = build_attn(inp_attn, layer.wo, NULL, NULL,
+        ggml_tensor * cur = build_attn(inp_attn, layer.wo, NULL, NULL,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         cb(cur, "attn_out", il);
+
+        if (!is_block) {
+            // CONTEXT pass: each layer caches K/V from the FIXED g (h is not evolved), so the block's
+            // layer L later cross-attends k/v_proj_L(g). Accumulate the (discarded) outputs only to
+            // keep all the per-layer K/V cache writes reachable in the graph.
+            ctx_out = ctx_out ? ggml_add(ctx0, ctx_out, cur) : cur;
+            continue;
+        }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
@@ -208,9 +220,12 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(h, "layer_out", il);
     }
 
+    // block pass -> evolved h; context pass -> the accumulated (ignored) output
+    ggml_tensor * out_h = is_block ? h : ctx_out;
+
     // NOTE: unlike EAGLE3 (autoregressive), DFlash does not feed back a per-token pre-norm hidden,
     // so the decoder does not expose t_h_nextn (only the encoder's context output is read back).
-    ggml_tensor * cur = build_norm(h, model.output_norm, NULL, LLM_NORM_RMS, -1);
+    ggml_tensor * cur = build_norm(out_h, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
     // lm_head: borrow the target's if the draft ships none (placeholder during reserve probe)

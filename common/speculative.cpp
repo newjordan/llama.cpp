@@ -1003,8 +1003,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // committed token) is already in the cache, so the block is all-MASK and parallel.
             const llama_pos P = anchor_pos[seq_id];
             common_batch_clear(batch);
+            // [anchor, MASK x (block_len-1)] — the anchor token seeds the noise stream; the masks
+            // attend to it + the cached context and are predicted in parallel.
             for (int b = 0; b < block_len; ++b) {
-                common_batch_add(batch, mask_id, P + 1 + b, { seq_id }, /*logits=*/ true);
+                const llama_token tok = (b == 0) ? dp.id_last : mask_id;
+                common_batch_add(batch, tok, P + 1 + b, { seq_id }, /*logits=*/ true);
             }
             if (llama_decode(ctx_dft, batch) != 0) {
                 continue;
@@ -1013,7 +1016,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
             common_sampler_reset(smpl);
             auto & result = *dp.result;
-            for (int b = 0; b < block_len; ++b) {
+            for (int b = 1; b < block_len; ++b) {  // sample the masked positions
                 const llama_token id = common_sampler_sample(smpl, ctx_dft, b, true);
                 common_sampler_accept(smpl, id, true);
                 result.push_back(id);
