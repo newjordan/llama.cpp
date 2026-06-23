@@ -1121,6 +1121,23 @@ struct llama_model_eagle3 : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+struct llama_model_dflash : public llama_model_base {
+    llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // is_enc=true  : feature-fusion pass  (concat target hiddens -> fc -> hidden_norm -> context g)
+    // is_enc=false : block-draft decoder  (block tokens cross+self attend over [context || block])
+    template <bool is_enc>
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_inp_embd_enc() const;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 
 struct llama_model_mistral4 : public llama_model_deepseek2 {
     llama_model_mistral4(const struct llama_model_params & params) : llama_model_deepseek2(params) {}

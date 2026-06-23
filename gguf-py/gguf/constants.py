@@ -157,6 +157,7 @@ class Keys:
         TARGET_LAYERS                     = "{arch}.target_layers"
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
+        BLOCK_SIZE                        = "{arch}.block_size"
 
     class Attention:
         HEAD_COUNT                   = "{arch}.attention.head_count"
@@ -516,6 +517,7 @@ class MODEL_ARCH(IntEnum):
     PANGU_EMBED      = auto()
     MISTRAL3         = auto()
     EAGLE3           = auto()
+    DFLASH           = auto()
     MISTRAL4         = auto()
     PADDLEOCR        = auto()
     MIMO2            = auto()
@@ -917,6 +919,8 @@ class MODEL_TENSOR(IntEnum):
     # eagle3
     FC                     = auto()  # feature fusion layer
     D2T                    = auto()  # draft to target vocabulary mapping
+    # dflash
+    DFLASH_HIDDEN_NORM     = auto()  # norm over the fused target context (single, top-level)
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
@@ -1073,6 +1077,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.PANGU_EMBED:      "pangu-embedded",
     MODEL_ARCH.MISTRAL3:         "mistral3",
     MODEL_ARCH.EAGLE3:           "eagle3",
+    MODEL_ARCH.DFLASH:           "dflash",
     MODEL_ARCH.MISTRAL4:         "mistral4",
     MODEL_ARCH.PADDLEOCR:        "paddleocr",
     MODEL_ARCH.MIMO2:            "mimo2",
@@ -1500,6 +1505,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM:    "blk.{bid}.nextn.shared_head_norm",
     MODEL_TENSOR.FC:                        "fc",
     MODEL_TENSOR.D2T:                       "d2t",
+    MODEL_TENSOR.DFLASH_HIDDEN_NORM:        "hidden_norm",
 }
 
 MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
@@ -4084,6 +4090,24 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FC,
         MODEL_TENSOR.D2T,
+    ],
+    MODEL_ARCH.DFLASH: [
+        MODEL_TENSOR.TOKEN_EMBD,      # optional; normally borrowed from the target at runtime
+        MODEL_TENSOR.OUTPUT,          # optional; normally borrowed from the target lm_head
+        MODEL_TENSOR.OUTPUT_NORM,     # final norm  ("norm")
+        MODEL_TENSOR.FC,              # context fusion  [n_embd, n_target_layers*n_embd_tgt]
+        MODEL_TENSOR.DFLASH_HIDDEN_NORM,  # norm over fused context (single, top-level)
+        MODEL_TENSOR.ATTN_NORM,       # input_layernorm
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_Q_NORM,     # Qwen3 per-head q_norm
+        MODEL_TENSOR.ATTN_K_NORM,     # Qwen3 per-head k_norm
+        MODEL_TENSOR.FFN_NORM,        # post_attention_layernorm
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_DOWN,
+        MODEL_TENSOR.FFN_UP,
     ],
     MODEL_ARCH.MISTRAL4: [
         MODEL_TENSOR.TOKEN_EMBD,

@@ -573,6 +573,9 @@ struct llama_model {
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // dflash: single norm over the fused target context (applied once in the encoder pass)
+    struct ggml_tensor * hidden_norm = nullptr;
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
