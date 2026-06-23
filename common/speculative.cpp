@@ -883,8 +883,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
-        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd_dec, /*n_seq_max=*/ 1);
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ 0, /*n_seq_max=*/ 1);  // token batch (block)
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -905,10 +904,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_draft_dflash() override {
-        if (batch.token != nullptr) {
-            free(batch.token);
-            batch.token = nullptr;
-        }
         llama_batch_free(batch);
     }
 
@@ -957,19 +952,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         (size_t) n_chunk * n_embd_dec * sizeof(float));
         }
 
-        // stash each seq's last-token context as its anchor
+        // cache the committed-context K/V: decode the fused context g as an EMBD batch at the
+        // committed positions (token=nullptr -> decoder uses the embd path). The drafted block then
+        // attends to this cached context via the KV cache.
+        llama_set_embeddings_nextn(ctx_dft, false, /*masked*/ false);  // the context decode has no nextn
+        // request >=1 output (last pos, value ignored) so build_inp_out_ids allocates its out_ids
+        std::vector<int8_t> gctx_logits((size_t) n_tokens, 0);
+        gctx_logits[n_tokens - 1] = 1;
+        llama_batch gctx = {
+            /*n_tokens =*/ n_tokens,
+            /*token    =*/ nullptr,
+            /*embd     =*/ g_embd_buf.data(),
+            /*pos      =*/ batch_in.pos,
+            /*n_seq_id =*/ batch_in.n_seq_id,
+            /*seq_id   =*/ batch_in.seq_id,
+            /*logits   =*/ gctx_logits.data(),
+        };
+        if (llama_decode(ctx_dft, gctx) != 0) {
+            return false;
+        }
+
+        // track each seq's last committed position (the frontier the block decodes after)
         for (int32_t k = 0; k < n_tokens; ++k) {
             if (batch_in.n_seq_id[k] != 1) {
                 continue;
             }
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-                continue;
-            }
-            if (batch_in.pos[k] >= anchor_pos[seq_id]) {
+            if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && batch_in.pos[k] > anchor_pos[seq_id]) {
                 anchor_pos[seq_id] = batch_in.pos[k];
-                std::memcpy(anchor_g[seq_id].data(), g_embd_buf.data() + (size_t) k * n_embd_dec,
-                            (size_t) n_embd_dec * sizeof(float));
             }
         }
         return true;
@@ -984,39 +994,33 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
-            if (!dp.drafting || anchor_pos[seq_id] < 0 || block_len < 2 || mask_id < 0) {
+            if (!dp.drafting || anchor_pos[seq_id] < 0 || block_len < 1 || mask_id < 0) {
                 continue;
             }
 
-            // build the masked block [anchor, MASK x (block_len-1)] and feed the anchor context to
-            // each position. NOTE: first-cut context feeding (anchor-only, block-length); the full
-            // cross-length committed context + per-position RoPE is the remaining integration. KV is
-            // recomputed per block, so clear ctx_dft past the anchor first.
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, anchor_pos[seq_id] + 1, -1);
+            // decode a block of MASK tokens at positions after the committed frontier; each attends
+            // (via the KV cache) to the committed context cached by process(). The anchor (last
+            // committed token) is already in the cache, so the block is all-MASK and parallel.
+            const llama_pos P = anchor_pos[seq_id];
             common_batch_clear(batch);
-            const size_t row_bytes = (size_t) n_embd_dec * sizeof(float);
             for (int b = 0; b < block_len; ++b) {
-                const llama_token tok = (b == 0) ? dp.id_last : mask_id;
-                // request logits at every block position so n_outputs == n_tokens (avoids the
-                // decode extraction reading n_tokens rows from an n_outputs-sized logits tensor)
-                common_batch_add(batch, tok, anchor_pos[seq_id] + 1 + b, { seq_id }, /*logits=*/ true);
-                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd_dec,
-                            anchor_g[seq_id].data(), row_bytes);
+                common_batch_add(batch, mask_id, P + 1 + b, { seq_id }, /*logits=*/ true);
             }
-
             if (llama_decode(ctx_dft, batch) != 0) {
                 continue;
             }
 
-            // sample the block-1 unmasked positions in parallel (greedy)
             auto * smpl = smpls[seq_id].get();
             common_sampler_reset(smpl);
             auto & result = *dp.result;
-            for (int b = 1; b < block_len; ++b) {
+            for (int b = 0; b < block_len; ++b) {
                 const llama_token id = common_sampler_sample(smpl, ctx_dft, b, true);
                 common_sampler_accept(smpl, id, true);
                 result.push_back(id);
             }
+
+            // discard the transient block K/V -> keep the draft cache context-only
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, P + 1, -1);
         }
     }
 

@@ -134,39 +134,37 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);   // context g
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
     ggml_set_input(inp->embd);
 
-    ggml_tensor * h;                                                         // block embeddings (noise)
-    if (tok_embd != nullptr) {
-        h = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+    // Input selection (mirrors build_inp_embd via ubatch.token): a TOKEN batch is the drafted block
+    // (embed via the borrowed target table); an EMBD batch is the fused context g that process()
+    // decodes to populate the committed-context K/V — the block then attends to that cached context.
+    ggml_tensor * h;
+    if (ubatch.token) {
+        if (tok_embd != nullptr) {
+            h = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        } else {
+            // reserve probe (no target bound): keep inp->tokens consumed (zeroed) so it allocates
+            ggml_tensor * base  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_input(base);
+            ggml_tensor * tok_f = ggml_reshape_2d(ctx0, ggml_cast(ctx0, inp->tokens, GGML_TYPE_F32), 1, n_tokens);
+            h = ggml_add(ctx0, base, ggml_scale(ctx0, tok_f, 0.0f));
+        }
     } else {
-        // probe/reserve build (no target bound yet): keep inp->tokens consumed so the scheduler
-        // allocates its buffer (set_input writes it for token batches), with a zeroed contribution.
-        ggml_tensor * base  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_input(base);
-        ggml_tensor * tok_f = ggml_reshape_2d(ctx0, ggml_cast(ctx0, inp->tokens, GGML_TYPE_F32), 1, n_tokens);
-        h = ggml_add(ctx0, base, ggml_scale(ctx0, tok_f, 0.0f));             // [n_embd,N] + 0*[1,N]
+        h = inp->embd;  // fused context g (cached by process())
     }
     cb(h, "inp_embd", -1);
-    ggml_tensor * g = inp->embd;                                             // fused context
-    cb(g, "inp_context", -1);
     res->add_input(std::move(inp));
 
-    // v0 (runs end-to-end, lossless): a draft context is a CACHED spec context (the server does
-    // seq_rm rollback on it) -> attention MUST be KV-cached. Condition the block on context
-    // additively, then a standard KV-cached Qwen3 decode. The faithful DFlash two-source
-    // bidirectional cross-attention over a separately-cached committed context is the
-    // acceptance-tuning refinement (does not affect losslessness: the target verifies every token).
-    h = ggml_add(ctx0, h, g);
-
-    ggml_tensor * inp_pos = build_inp_pos();
-    auto * inp_attn = build_attn_inp_kv();
+    ggml_tensor * inp_pos     = build_inp_pos();
+    auto *        inp_attn    = build_attn_inp_kv();
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+        ggml_tensor * inpSA = h;
 
         ggml_tensor * cur = build_norm(h, layer.attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
@@ -195,7 +193,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
         cb(cur, "attn_out", il);
 
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, h);
+        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
 
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
