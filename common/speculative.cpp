@@ -844,6 +844,28 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t      block_len   = 0;        // tokens drafted per block (anchor + masks)
     llama_token  mask_id     = -1;       // diffusion MASK token (from the target vocab)
 
+    // slipgram-native draft: the draft predicts in a small "slip" vocab (canonicalized prose, e.g.
+    // run<ING>); the block is all-MASK and each predicted slip unit is expanded to its surface form,
+    // the surfaces are concatenated and re-tokenized with the TARGET vocab so block boundaries align
+    // with the target exactly. Losslessness is unchanged (the target still verifies every token).
+    bool                 slip_native = false;
+    const llama_vocab *  tgt_vocab   = nullptr;   // target vocab (expansion re-tokenizes into this)
+    const llama_vocab *  dft_vocab   = nullptr;   // draft (slip) vocab (token_to_piece of slip units)
+
+    // slip suffix markers -> their canonicalized letters (inverse of the slipgram transform)
+    static std::string slip_unslip(std::string s) {
+        static const std::pair<std::string, std::string> M[] = {
+            {"<ING>","ing"}, {"<ED>","ed"}, {"<ER_PL>","ers"}, {"<ER>","er"}, {"<PL>","s"},
+        };
+        for (const auto & m : M) {
+            for (size_t p = s.find(m.first); p != std::string::npos; p = s.find(m.first, p)) {
+                s.replace(p, m.first.size(), m.second);
+                p += m.second.size();
+            }
+        }
+        return s;
+    }
+
     // [per-seq] anchor context: fused features + position of the last committed token
     std::vector<std::vector<float>> anchor_g;      // [n_seq][n_embd_dec]
     std::vector<llama_pos>          anchor_pos;    // [n_seq]
@@ -874,9 +896,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         mask_id   = llama_vocab_mask(llama_model_get_vocab(model_dft));
         block_len = std::max(1, this->params.n_max);
-        LOG_INF("%s: mask_id=%d block_len=%d n_embd_dec=%d n_embd_tgt=%d taps=%u n_batch=%d\n",
+
+        // slipgram-native mode: draft vocab != target vocab; expand slip units before proposing
+        dft_vocab = llama_model_get_vocab(model_dft);
+        tgt_vocab = llama_model_get_vocab(model_tgt);
+        char sbuf[8] = {0};
+        if (llama_model_meta_val_str(model_dft, "dflash.slip_native", sbuf, sizeof(sbuf)) > 0) {
+            slip_native = (sbuf[0] == '1' || sbuf[0] == 't');
+        }
+
+        LOG_INF("%s: mask_id=%d block_len=%d n_embd_dec=%d n_embd_tgt=%d taps=%u slip_native=%d n_batch=%d\n",
                 __func__, (int) mask_id, block_len, n_embd_dec, n_embd_tgt, target_layer_ids_n,
-                (int) llama_n_batch(ctx_dft));
+                (int) slip_native, (int) llama_n_batch(ctx_dft));
         if (mask_id < 0) {
             LOG_WRN("%s: no mask token in draft vocab (tokenizer.ggml.mask_token_id missing) — "
                     "draft will be disabled to stay safe\n", __func__);
@@ -1003,10 +1034,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // committed token) is already in the cache, so the block is all-MASK and parallel.
             const llama_pos P = anchor_pos[seq_id];
             common_batch_clear(batch);
-            // [anchor, MASK x (block_len-1)] — the anchor token seeds the noise stream; the masks
-            // attend to it + the cached context and are predicted in parallel.
+            // standard: [anchor, MASK x (block_len-1)] — the anchor token seeds the noise stream.
+            // slip-native: all-MASK — the draft vocab can't embed the target's id_last, and the head
+            // is trained to predict the block purely from the cached context, so predict from offset 0.
+            const int b_first = slip_native ? 0 : 1;
             for (int b = 0; b < block_len; ++b) {
-                const llama_token tok = (b == 0) ? dp.id_last : mask_id;
+                const llama_token tok = (!slip_native && b == 0) ? dp.id_last : mask_id;
                 common_batch_add(batch, tok, P + 1 + b, { seq_id }, /*logits=*/ true);
             }
             if (llama_decode(ctx_dft, batch) != 0) {
@@ -1016,10 +1049,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto * smpl = smpls[seq_id].get();
             common_sampler_reset(smpl);
             auto & result = *dp.result;
-            for (int b = 1; b < block_len; ++b) {  // sample the masked positions
-                const llama_token id = common_sampler_sample(smpl, ctx_dft, b, true);
-                common_sampler_accept(smpl, id, true);
-                result.push_back(id);
+            if (slip_native) {
+                // sample the slip block, expand each unit to its surface form, concatenate, then
+                // re-tokenize with the TARGET vocab so the proposed tokens land on the target's own
+                // boundaries (e.g. " run"+"<ING>" -> " running" -> the target's single token).
+                std::string surface;
+                for (int b = b_first; b < block_len; ++b) {
+                    const llama_token sid = common_sampler_sample(smpl, ctx_dft, b, true);
+                    common_sampler_accept(smpl, sid, true);
+                    surface += slip_unslip(common_token_to_piece(ctx_dft, sid, /*special=*/ true));
+                }
+                for (const llama_token id : common_tokenize(tgt_vocab, surface, false, false)) {
+                    result.push_back(id);
+                }
+            } else {
+                for (int b = b_first; b < block_len; ++b) {  // sample the masked positions
+                    const llama_token id = common_sampler_sample(smpl, ctx_dft, b, true);
+                    common_sampler_accept(smpl, id, true);
+                    result.push_back(id);
+                }
             }
 
             // discard the transient block K/V -> keep the draft cache context-only
