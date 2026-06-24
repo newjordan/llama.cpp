@@ -109,6 +109,18 @@ llama_context::llama_context(
         }
     }
 
+    // pSYCho: a head that ships no token_embd/lm_head borrows the target's (the full target vocab,
+    // bottom embeddings -> top lm_head) via ctx_other. A self-contained head (e.g. slip-native, with
+    // its own embd+output) skips this and runs standalone.
+    if (model.arch == LLM_ARCH_PSYCHO) {
+        if (model.tok_embd == nullptr || model.output == nullptr) {
+            if (params.ctx_other == nullptr) {
+                throw std::runtime_error("pSYCho draft requires ctx_other to be set (this warning is normal during memory fitting)");
+            }
+            cparams.ctx_other = params.ctx_other;
+        }
+    }
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.

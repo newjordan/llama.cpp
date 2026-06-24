@@ -26,7 +26,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
-    {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+    {"psycho",  COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -814,21 +814,21 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 };
 
-// DFlash block-diffusion drafter.
+// pSYCho block drafter (original work, inspired by the DFlash block-diffusion concept).
 //
 // Reuses EAGLE3's feature-extraction path: per committed position it taps the target's
 // `target_layer_ids` hidden states and runs the draft encoder (fc + hidden_norm) to get the
-// fused "context" g. Unlike EAGLE3 (autoregressive, one draft token per decode), DFlash drafts
+// fused "context" g. Unlike EAGLE3 (autoregressive, one draft token per decode), pSYCho drafts
 // a whole block in ONE bidirectional decoder pass: [anchor, MASK x (block-1)] -> block-1 logits.
 //
 // STATUS (P4, honest): the ctor/encoder/feature-extraction below are functional. draft() builds
 // the masked block and runs the decoder, but the decoder graph currently feeds the context with
-// the same length as the block (see src/models/dflash.cpp). The full cross-length context path
+// the same length as the block (see src/models/psycho.cpp). The full cross-length context path
 // (block queries attending a variable-length committed context) + numerical parity vs the HF
 // reference are the remaining work before drafts are accepted. Speculative decoding stays LOSSLESS
 // regardless of draft quality (the target verifies every token), so wiring this in is safe: until
 // parity lands it simply yields low acceptance, never wrong output.
-struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+struct common_speculative_impl_draft_psycho : public common_speculative_impl {
     common_params_speculative_draft params;
     llama_batch batch;
 
@@ -873,11 +873,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     std::vector<float> features_buf;
     std::vector<float> g_embd_buf;
 
-    common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, n_seq)
+    common_speculative_impl_draft_psycho(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO, n_seq)
         , params(params.draft)
     {
-        LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
+        LOG_INF("%s: adding speculative implementation 'psycho'\n", __func__);
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -901,7 +901,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         dft_vocab = llama_model_get_vocab(model_dft);
         tgt_vocab = llama_model_get_vocab(model_tgt);
         char sbuf[8] = {0};
-        if (llama_model_meta_val_str(model_dft, "dflash.slip_native", sbuf, sizeof(sbuf)) > 0) {
+        if (llama_model_meta_val_str(model_dft, "psycho.slip_native", sbuf, sizeof(sbuf)) > 0) {
             slip_native = (sbuf[0] == '1' || sbuf[0] == 't');
         }
 
@@ -934,7 +934,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         anchor_pos.assign(n_seq, -1);
     }
 
-    ~common_speculative_impl_draft_dflash() override {
+    ~common_speculative_impl_draft_psycho() override {
         llama_batch_free(batch);
     }
 
@@ -1966,7 +1966,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO:  return "psycho";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram-map-k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
@@ -2019,7 +2019,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -2057,7 +2057,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         bool has_draft_simple = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE));
         bool has_draft_eagle3 = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)) && params.draft.ctx_dft != nullptr;
         bool has_mtp = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) && params.draft.ctx_dft != nullptr;
-        bool has_dflash = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) && params.draft.ctx_dft != nullptr;
+        bool has_psycho = (enabled_configs & (1u << COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO)) && params.draft.ctx_dft != nullptr;
 
 
 
@@ -2098,8 +2098,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         if (has_mtp) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
         }
-        if (has_dflash) {
-            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params));
+        if (has_psycho) {
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO, params));
         }
     }
 
@@ -2121,8 +2121,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(config.params, n_seq));
+            case COMMON_SPECULATIVE_TYPE_DRAFT_PSYCHO: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_psycho>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

@@ -1,6 +1,8 @@
 #include "models.h"
 
-// DFlash block-diffusion speculative-decode draft head (z-lab).
+// pSYCho: a SYCL-targeted block-draft speculative-decode head. Original work, inspired by the
+// DFlash block-diffusion concept but with our own single-cache architecture, our own distilled
+// weights, and our own seeded all-/anchor-block draft. No external weights or arch are used.
 //
 // A small standalone Qwen3-style transformer that drafts a whole block of tokens in ONE
 // parallel forward pass (bidirectional, is_causal=false). It does not own token embeddings
@@ -15,7 +17,7 @@
 // Per-layer attention (Qwen3DFlashAttention): Q = q_norm(q_proj(h))  [noise/block stream only];
 // K = k_norm(concat(k_proj(g), k_proj(h))); V = concat(v_proj(g), v_proj(h)); bidirectional.
 
-void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+void llama_model_psycho::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) || target_layer_ids.empty()) {
@@ -34,14 +36,14 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
+void llama_model_psycho::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
     const int64_t n_embd_inp = hparams.n_embd_inp();
 
     // feature fusion (context): [n_embd_inp -> n_embd], then a single RMSNorm
     fc          = create_tensor(tn(LLM_TENSOR_FC,                 "weight"), {n_embd_inp, n_embd}, 0);
-    hidden_norm = create_tensor(tn(LLM_TENSOR_DFLASH_HIDDEN_NORM, "weight"), {n_embd}, 0);
+    hidden_norm = create_tensor(tn(LLM_TENSOR_PSYCHO_HIDDEN_NORM, "weight"), {n_embd}, 0);
 
     // final norm; lm_head + token embeddings are normally borrowed from the target (optional here)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -69,7 +71,7 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const llm_graph_params & params) const {
+std::unique_ptr<llm_graph_context> llama_model_psycho::build_arch_graph(const llm_graph_params & params) const {
     switch (params.gtype) {
         case LLM_GRAPH_TYPE_ENCODER:
             return std::make_unique<graph<true>>(*this, params);
@@ -82,7 +84,7 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
 }
 
 template <>
-ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
+ggml_tensor * llama_model_psycho::graph<true>::build_inp_embd_enc() const {
     auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp());
     inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
     ggml_set_input(inp_target->embd);
@@ -97,7 +99,7 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
 // Encoder: fuse the concatenated target hidden states into the context g = hidden_norm(fc(features)).
 // Stored in t_h_nextn so the runtime can read it back (same channel EAGLE3/MTP use).
 template <>
-llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_psycho::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
 
     cur = build_lora_mm(model.fc, cur);
@@ -120,7 +122,7 @@ llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_grap
 // position set as the block; incremental context KV + per-stream RoPE positions land in the runtime
 // integration (P4) + numerical-parity pass (P3).
 template <>
-llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_psycho::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
