@@ -691,9 +691,20 @@ class DSparkModel(Qwen3Model):
             )
         logger.info(f"DSpark: Using tokenizer from target model: {self.target_model_dir}")
         original_dir = self.dir_model
-        self.dir_model = self.target_model_dir
-        super().set_vocab()
-        self.dir_model = original_dir
+        original_is_mistral_format = self.is_mistral_format
+        original_disable_mistral_template = self.disable_mistral_community_chat_template
+        try:
+            self.dir_model = self.target_model_dir
+            if (self.dir_model / "tekken.json").is_file():
+                self.is_mistral_format = True
+                self.disable_mistral_community_chat_template = True
+                self._set_vocab_mistral()
+            else:
+                super().set_vocab()
+        finally:
+            self.dir_model = original_dir
+            self.is_mistral_format = original_is_mistral_format
+            self.disable_mistral_community_chat_template = original_disable_mistral_template
 
         mask_token_id = self.hparams.get("mask_token_id")
         if mask_token_id is not None:
