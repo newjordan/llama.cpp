@@ -16,6 +16,7 @@ if (EMSCRIPTEN)
 else()
     add_subdirectory(batched)
     add_subdirectory(debug)
+    add_subdirectory(dspark-cache-probe)
     add_subdirectory(embedding)
     add_subdirectory(eval-callback)
 
