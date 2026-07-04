@@ -747,6 +747,33 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
                         np.where(ue4m3_exp >= 15, np.uint8(0x7E), normal_result)))
 
     @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        """Quantize FP32 blocks to NVFP4 super-blocks.
+
+        Input:  (n_super, 64) float32
+        Output: (n_super, 36) uint8   [4 UE4M3 scales, 32 nibble bytes]
+        """
+        n_super = blocks.shape[0]
+        vals = blocks.reshape(n_super, 4, 16)  # 4 sub-blocks of 16
+
+        amax = np.maximum(np.max(vals, axis=2), np.abs(np.min(vals, axis=2)))
+        ue = cls.fp32_to_ue4m3(amax / 6.0).astype(np.uint8)  # (n_super, 4)
+        d = cls.ue4m3_to_fp32(ue).reshape(n_super, 4, 1)     # (n_super, 4, 1)
+
+        kvals = np.array(cls.kvalues, dtype=np.float32).reshape(1, 1, 1, 16)
+        candidates = kvals * d.reshape(n_super, 4, 1, 1)      # (n_super, 4, 16, 16)
+
+        vals_expanded = vals.reshape(n_super, 4, 16, 1)
+        errors = np.abs(candidates - vals_expanded)           # (n_super, 4, 16, 16)
+        indices = np.argmin(errors, axis=3).astype(np.uint8)  # (n_super, 4, 16)
+
+        lo = indices[:, :, :8]
+        hi = indices[:, :, 8:]
+        qs = (lo | (hi << 4)).reshape(n_super, 32)            # (n_super, 32)
+
+        return np.concatenate([ue, qs], axis=1).astype(np.uint8)
+
+    @classmethod
     def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
         n_super = blocks.shape[0]
 

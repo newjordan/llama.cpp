@@ -167,6 +167,17 @@ class MistralMoeModel(DeepseekV2Model):
         config["norm_topk_prob"] = True
         config["scoring_func"] = "softmax"
 
+    def dequant_model(self):
+        quant_config = self.hparams.get("quantization")
+        if quant_config is not None:
+            assert quant_config["qformat_weight"] == "fp8_e4m3"
+            self.hparams["quantization_config"] = {
+                "activation_scheme": "static",
+                "quant_method": "fp8",
+                "weight_block_size": None,
+            }
+        return super().dequant_model()
+
     def set_vocab(self):
         self._set_vocab_mistral()
 
