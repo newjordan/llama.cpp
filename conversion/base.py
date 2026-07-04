@@ -450,7 +450,16 @@ class ModelBase:
                         tensors_to_remove.append(name)
                         if self._fp8_as_q8:
                             self._fp8_dequantized.add(weight_name)
-                    if name.endswith(".qscale_act"):
+                    if name.endswith(".weight_scale"):
+                        weight_name = name.removesuffix("_scale")
+                        if weight_name in self.model_tensors:
+                            w = self.model_tensors[weight_name]
+                            s = self.model_tensors[name]
+                            self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
+                            tensors_to_remove.append(name)
+                            if self._fp8_as_q8:
+                                self._fp8_dequantized.add(weight_name)
+                    if name.endswith((".qscale_act", ".input_scale")):
                         tensors_to_remove.append(name)
             elif quant_method == "gptq":
                 for name in self.model_tensors.keys():
