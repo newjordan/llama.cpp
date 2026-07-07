@@ -3541,8 +3541,8 @@ enum class mul_mat_algo {
 
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
     // The DP4A-tiled MMQ GEMM (mmq.cpp) was disabled upstream with an unquantified
-    // "accuracy issues" note. Opt-in on B70 to A/B it for the large-ne11 dense path
-    // (prefill + np>8 batched decode) where a tiled GEMM beats per-column MMVQ.
+    // "accuracy issues" note. Keep this opt-in and limited to Qwen3.6 Q5_K_XL's
+    // tensor formats; broad enablement still fails MUL_MAT (q4_0 large shape -> NaN).
     // GGML_SYCL_ENABLE_MMQ=1 turns it on; accuracy is gated by test-backend-ops MUL_MAT.
     static const bool enable_mmq = []() {
         const char * env = getenv("GGML_SYCL_ENABLE_MMQ");
@@ -3552,14 +3552,7 @@ inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
         return false;
     }
     switch (type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
             return true;
@@ -4262,8 +4255,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(src0, src1, dst);
 
-    bool use_mul_mat_q =  ggml_sycl_supports_mmq(src0->type)
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    const bool supports_mmq = ggml_sycl_supports_mmq(src0->type);
+    bool use_mul_mat_q = supports_mmq && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
 
     // mmvq and mmq need the __dp4a instruction which is available for gen12+
@@ -4274,7 +4267,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // f16 dequant GEMM. When MMQ is explicitly enabled, drop the cap so the tiled int8 GEMM
     // takes the large-ne11 dense path (prefill / big batch); MMVQ still wins ne11<=32 by
     // dispatch precedence below.
-    if (!ggml_sycl_supports_mmq(src0->type)) {
+    if (!supports_mmq) {
         use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
     }
 #endif // SYCL_USE_XMX
