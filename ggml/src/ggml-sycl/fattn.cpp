@@ -11,6 +11,9 @@
 //
 
 
+#include <set>
+#include <tuple>
+
 #include <sycl/sycl.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
@@ -210,7 +213,21 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
-    switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+    // GGML_SYCL_FA_DEBUG=1: print each distinct (kernel, KV type, Q rows) dispatch once,
+    // to see which FA kernel serves decode vs prefill at a given KV length/quant.
+    static const bool fa_debug = getenv("GGML_SYCL_FA_DEBUG") != nullptr;
+    if (fa_debug) {
+        static std::set<std::tuple<int, int, int64_t>> seen;
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        if (seen.emplace((int) kernel, (int) K->type, Q->ne[1]).second) {
+            fprintf(stderr, "[fa-debug] kernel=%s Ktype=%s Qrows=%ld KVlen=%ld head=%ld\n",
+                    kernel == BEST_FATTN_KERNEL_VEC ? "VEC" : kernel == BEST_FATTN_KERNEL_TILE ? "TILE" : "NONE",
+                    ggml_type_name(K->type), (long) Q->ne[1], (long) K->ne[1], (long) K->ne[0]);
+        }
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
         case BEST_FATTN_KERNEL_TILE:
