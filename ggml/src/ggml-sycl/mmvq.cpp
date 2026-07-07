@@ -2322,6 +2322,25 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     GGML_UNUSED(ctx);
 }
 
+// Wide-batch MMVQ: the ncols kernels amortize one weight-matrix pass over up to 8 dst columns.
+// For src1_ncols > 8 (batched decode with more than 8 parallel sequences), process in chunks of 8
+// instead of falling back to the dequantize+GEMM path, which streams ~6x the weight bytes for
+// small-token batches. Chunk k reads src1/dst at a column offset; strides are unchanged.
+void ggml_sycl_op_mul_mat_vec_q_wide(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i,
+                                     const float * src1_ddf_i, const char * src1_ddq_i, float * dst_dd_i,
+                                     const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
+                                     const int64_t src1_padded_col_size, const dpct::queue_ptr & stream) {
+    constexpr int64_t chunk = 8;  // max ncols_dst the templated multi-column kernels support
+    for (int64_t col0 = 0; col0 < src1_ncols; col0 += chunk) {
+        const int64_t ncols_chunk  = std::min(src1_ncols - col0, chunk);
+        const char *  src1_ddq_col = src1_ddq_i + col0 * src1_padded_col_size * sizeof(block_q8_1) / QK8_1;
+        float *       dst_dd_col   = dst_dd_i + col0 * dst->ne[0];
+        ggml_sycl_op_mul_mat_vec_q(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_col, dst_dd_col,
+                                   row_low, row_high, ncols_chunk, src1_padded_col_size, stream);
+    }
+}
+
 // src1_row_stride: 0 for shared src1 (gate/up proj), else per-expert stride (down proj).
 // Batched over tokens via grid dim 0: each token reads its own ids row / activation / dst slice,
 // so a whole batched-decode MUL_MAT_ID is ONE launch with no host readback of the routing ids.
@@ -2578,6 +2597,264 @@ static void launch_mul_mat_vec_q_moe_reorder(
                     ids_row_stride, src1_token_stride, dst_token_stride, item);
             });
     });
+}
+
+// ------- grouped expert GEMM (phase 2): read each expert's weights once per batch -------
+//
+// The batched kernel above launches one workgroup-column per (token, expert-slot) pair, so two
+// pairs routed to the same expert stream its weight matrix from VRAM twice. The grouped path
+// first buckets the pairs by expert on device (one tiny single-workgroup kernel), then launches
+// the GEMV grid over *distinct* experts, with each row-workgroup dotting all of its expert's
+// routed tokens per weight pass (up to MMID_GROUP_TCHUNK at a time).
+//
+// Scratch layout (int32): [0..n_as] offsets | [n_as+1 .. 2*n_as] active expert list |
+// [2*n_as+1] n_active | [2*n_as+2 ..) packed pairs (token<<16 | slot), bucketed by expert.
+
+#define MMID_GROUP_WG     256  // routing pre-pass workgroup size; also the n_as ceiling
+#define MMID_GROUP_TCHUNK 4    // tokens dotted per weight pass (register-resident accumulators)
+
+static void k_mmid_group_pairs(
+    const int32_t * __restrict__ ids_dev, int32_t * __restrict__ scratch,
+    const int n_tokens, const int n_ids, const int ids_row_stride, const int n_as,
+    const sycl::nd_item<1> & it,
+    int32_t * counts, int32_t * cursors, int32_t * n_active_l) {
+    const int lid     = it.get_local_id(0);
+    const int n_pairs = n_tokens * n_ids;
+
+    int32_t * offsets  = scratch;
+    int32_t * active   = scratch + n_as + 1;
+    int32_t * n_active = scratch + 2 * n_as + 1;
+    int32_t * pairs    = scratch + 2 * n_as + 2;
+
+    if (lid < n_as) {
+        counts[lid] = 0;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    for (int p = lid; p < n_pairs; p += MMID_GROUP_WG) {
+        const int e = ids_dev[(p / n_ids) * ids_row_stride + (p % n_ids)];
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                         sycl::access::address_space::local_space> cnt(counts[e]);
+        cnt.fetch_add(1);
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    if (lid == 0) {
+        int off = 0;
+        for (int e = 0; e < n_as; ++e) {
+            offsets[e]  = off;
+            cursors[e]  = off;
+            off        += counts[e];
+        }
+        offsets[n_as] = off;
+        *n_active_l   = 0;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    if (lid < n_as && counts[lid] > 0) {
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                         sycl::access::address_space::local_space> na(*n_active_l);
+        active[na.fetch_add(1)] = lid;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    for (int p = lid; p < n_pairs; p += MMID_GROUP_WG) {
+        const int tok  = p / n_ids;
+        const int slot = p % n_ids;
+        const int e    = ids_dev[tok * ids_row_stride + slot];
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                         sycl::access::address_space::local_space> cur(cursors[e]);
+        pairs[cur.fetch_add(1)] = (tok << 16) | slot;
+    }
+    if (lid == 0) {
+        *n_active = *n_active_l;
+    }
+}
+
+static void launch_mmid_group_pairs(
+    const int32_t * ids_dev, int32_t * scratch,
+    const int n_tokens, const int n_ids, const int ids_row_stride, const int n_as,
+    dpct::queue_ptr stream) {
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<int32_t, 1> counts(sycl::range<1>(MMID_GROUP_WG), cgh);
+        sycl::local_accessor<int32_t, 1> cursors(sycl::range<1>(MMID_GROUP_WG), cgh);
+        sycl::local_accessor<int32_t, 1> n_active_l(sycl::range<1>(1), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(MMID_GROUP_WG), sycl::range<1>(MMID_GROUP_WG)),
+            [=](sycl::nd_item<1> it) {
+                k_mmid_group_pairs(ids_dev, scratch, n_tokens, n_ids, ids_row_stride, n_as, it,
+                                   counts.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   cursors.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                   n_active_l.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_grouped_reorder(
+    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    float * __restrict__ dst_base, const int32_t * __restrict__ scratch,
+    const int ncols, const int nrows, const int n_as,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride,
+    const size_t src1_token_stride, const size_t dst_token_stride,
+    const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const int32_t * offsets  = scratch;
+    const int32_t * active   = scratch + n_as + 1;
+    const int32_t   n_active = scratch[2 * n_as + 1];
+    const int32_t * pairs    = scratch + 2 * n_as + 2;
+
+    const int g = item_ct1.get_group(1);
+    if (g >= n_active) {
+        return;
+    }
+    const int e     = active[g];
+    const int start = offsets[e];
+    const int cnt   = offsets[e + 1] - start;
+
+    const char * vx = (const char *) vx_base + (size_t) e * expert_weight_stride;
+
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    if (row >= nrows) {
+        return;
+    }
+
+    const auto sg = item_ct1.get_sub_group();
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    for (int t0 = 0; t0 < cnt; t0 += MMID_GROUP_TCHUNK) {
+        const int tc = sycl::min(cnt - t0, MMID_GROUP_TCHUNK);
+
+        const char * vys [MMID_GROUP_TCHUNK];
+        float *      dsts[MMID_GROUP_TCHUNK];
+        for (int j = 0; j < tc; ++j) {
+            const int32_t pair = pairs[start + t0 + j];
+            const int     tok  = pair >> 16;
+            const int     slot = pair & 0xffff;
+            vys[j]  = (const char *) vy_base + (size_t) tok * src1_token_stride + (size_t) slot * src1_row_stride;
+            dsts[j] = (float *) ((char *) dst_base + (size_t) tok * dst_token_stride + (size_t) slot * dst_row_stride);
+        }
+
+        float partial[MMID_GROUP_TCHUNK] = { 0.0f };
+        for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+            const int ibx = row * blocks_per_row + i;
+
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+
+            const int iby = i * block_type::block_to_q8_1_ratio();
+
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                // one weight-block fetch feeds every routed token in the chunk
+                for (int j = 0; j < tc; ++j) {
+                    const int8_t *      q8_1_quant_ptr = (const int8_t *) vys[j] + iby * QK8_1;
+                    const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                    partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                }
+            }
+        }
+
+        for (int j = 0; j < tc; ++j) {
+            const auto sum = sycl::reduce_over_group(sg, partial[j], std::plus<>());
+            if (sg.leader()) {
+                dsts[j][row] = sum;
+            }
+        }
+    }
+}
+
+template <typename reorder_vec_dot_q_sycl>
+static void launch_mul_mat_vec_q_moe_grouped_reorder(
+    const void * vx_base, const void * vy, const int32_t * scratch,
+    float * dst_base, const int ncols, const int nrows, const int n_as, const int max_groups,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride,
+    const size_t src1_token_stride, const size_t dst_token_stride,
+    dpct::queue_ptr stream) {
+    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, (unsigned) max_groups, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_moe_grouped_reorder<reorder_vec_dot_q_sycl>(
+                    vx_base, vy, dst_base, scratch, ncols, nrows, n_as,
+                    expert_weight_stride, dst_row_stride, src1_row_stride,
+                    src1_token_stride, dst_token_stride, item);
+            });
+    });
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_grouped_reorder(
+    enum ggml_type     src0_type,
+    const void *       vx_base,
+    const void *       vy,
+    const int32_t *    ids_dev,
+    int32_t *          scratch,
+    float *            dst_base,
+    int                ncols,
+    int                nrows,
+    int                n_experts_used,
+    int                n_as,
+    size_t             expert_weight_stride,
+    size_t             dst_row_stride,
+    size_t             src1_row_stride,
+    int                n_tokens,
+    int                ids_row_stride,
+    size_t             src1_token_stride,
+    size_t             dst_token_stride,
+    dpct::queue_ptr    stream) {
+    if (n_as > MMID_GROUP_WG || n_tokens > 0xffff || n_experts_used > 0xffff) {
+        return false;
+    }
+    // dispatchability check BEFORE submitting the pre-pass, so a bail leaves the stream untouched
+    switch (src0_type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    launch_mmid_group_pairs(ids_dev, scratch, n_tokens, n_experts_used, ids_row_stride, n_as, stream);
+
+    const int max_groups = std::min(n_tokens * n_experts_used, n_as);
+    switch (src0_type) {
+        case GGML_TYPE_Q4_K:
+            launch_mul_mat_vec_q_moe_grouped_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                vx_base, vy, scratch, dst_base, ncols, nrows, n_as, max_groups,
+                expert_weight_stride, dst_row_stride, src1_row_stride,
+                src1_token_stride, dst_token_stride, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            launch_mul_mat_vec_q_moe_grouped_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(
+                vx_base, vy, scratch, dst_base, ncols, nrows, n_as, max_groups,
+                expert_weight_stride, dst_row_stride, src1_row_stride,
+                src1_token_stride, dst_token_stride, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            launch_mul_mat_vec_q_moe_grouped_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
+                vx_base, vy, scratch, dst_base, ncols, nrows, n_as, max_groups,
+                expert_weight_stride, dst_row_stride, src1_row_stride,
+                src1_token_stride, dst_token_stride, stream);
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool ggml_sycl_mul_mat_vec_q_id_reorder(

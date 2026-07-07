@@ -4198,8 +4198,17 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Wide-batch: past the 8-column kernel templates, chunk-of-8 MMVQ still beats the
+    // dequantize+GEMM fallback for small token counts (batched decode at np<=32) — the
+    // fallback streams the dequantized f16 weights per op.
+    // GGML_SYCL_DISABLE_MMVQ_WIDE_BATCH=1 restores the old ne11<=8 cap.
+    static const bool disable_wide_batch = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMVQ_WIDE_BATCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const int64_t max_batch = disable_wide_batch ? MMVQ_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE_WIDE;
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+           src1->ne[1] <= max_batch;
 }
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4279,9 +4288,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
-            ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q_wide);
         } else {
-            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q_wide);
         }
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
@@ -4338,6 +4347,56 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     }
 }
 
+// A/B gate for the batched fused MUL_MAT_ID extension: =1 restores the old behavior
+// (fused only for ne12==1, sorted host path otherwise).
+static bool ggml_sycl_mmid_fused_batch_disabled() {
+    static const bool disabled = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_FUSED_BATCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+// True when ggml_sycl_mul_mat_id is guaranteed to take the fused device-routed path for this
+// node — i.e. no blocking host sync, which makes MUL_MAT_ID safe inside a SYCL graph record.
+// Must stay in lockstep with the bail checks in ggml_sycl_mul_mat_id_mmvq_fused and the type
+// switches in ggml_sycl_mul_mat_vec_q_id[_reorder] (reorder is decided lazily at exec time, so
+// a type is only eligible if BOTH switches dispatch it — Q4_K/Q5_K/Q6_K may go either way,
+// everything else always takes the plain switch because opt_for_reorder_id skips it).
+static bool ggml_sycl_mul_mat_id_fused_eligible(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    if (ne12 < 1 || ne12 > 64) return false;
+    if (ne12 > 1 && ggml_sycl_mmid_fused_batch_disabled()) return false;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
+    if (!ggml_is_contiguous(src1)) return false;
+    if (ids->ne[1] != ne12) return false;
+    if (ids->nb[0] != sizeof(int32_t)) return false;
+    if (ne11 != 1 && ne11 != ids->ne[0]) return false;
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
@@ -4388,6 +4447,30 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const size_t src1_row_stride   = (ne11 == 1) ? 0 : bytes_per_qrow;
     const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
     const int    ids_row_stride    = (int) (ids->nb[1] / sizeof(int32_t));
+
+    // Grouped phase-2 path: for multi-token batches, bucket the routed (token, slot) pairs by
+    // expert on device and read each distinct expert's weights once. Below 4 tokens collisions
+    // are rare enough that the extra routing launch isn't worth it.
+    // A/B gate: GGML_SYCL_DISABLE_MMID_GROUPED=1 keeps the per-pair batched kernel.
+    static const bool disable_grouped = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_GROUPED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const int64_t n_as = src0->ne[2];
+    if (use_reorder && !disable_grouped && ne12 >= 4) {
+        ggml_sycl_pool_alloc<int32_t> mmid_scratch(ctx.pool(),
+            (size_t) (2 * n_as + 2 + ne12 * n_experts_used));
+        if (ggml_sycl_mul_mat_vec_q_id_grouped_reorder(
+                src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
+                mmid_scratch.get(), (float *) dst->data, (int) ne10, nrows, n_experts_used,
+                (int) n_as,
+                /*expert_weight_stride=*/ src0->nb[2],
+                /*dst_row_stride=*/ dst->nb[1],
+                src1_row_stride, (int) ne12, ids_row_stride,
+                src1_token_stride, /*dst_token_stride=*/ dst->nb[2], stream)) {
+            return true;
+        }
+    }
 
     if (use_reorder) {
         return ggml_sycl_mul_mat_vec_q_id_reorder(
@@ -4464,13 +4547,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_ids = ids->ne[0];
 
     // Fused device-routed expert GEMV: handles ne12 up to its batch cap (see the bail checks).
-    // A/B gate for the batched extension: GGML_SYCL_DISABLE_MMID_FUSED_BATCH=1 restores the
-    // old behavior (fused only for ne12==1, sorted host path otherwise).
-    static const bool disable_fused_batch = []() {
-        const char * env = getenv("GGML_SYCL_DISABLE_MMID_FUSED_BATCH");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    if (ne12 == 1 || !disable_fused_batch) {
+    if (ne12 == 1 || !ggml_sycl_mmid_fused_batch_disabled()) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -5334,23 +5411,29 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
         return false;
     }
 
+    // GGML_SYCL_DISABLE_MMID_GRAPH=1 restores the blanket MUL_MAT_ID graph ban (A/B gate).
+    static const bool disable_mmid_graph = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_GRAPH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_op node_op = cgraph->nodes[i]->op;
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                [[fallthrough]];
             case GGML_OP_MUL_MAT_ID:
-                // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
-                // submitting a memcpy operation, but wait() can't be called on a queue that
-                // is recording to a graph.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
-                return false;
+                // The fused device-routed path reads the routing ids on device — no host sync —
+                // so it records into a graph fine (its pool allocs still need the async mem-op
+                // extension, same as MUL_MAT). Any node that would fall to the generic path does
+                // a blocking ids readback and must keep graphs disabled.
+                if (disable_mmid_graph || !g_ggml_sycl_use_async_mem_op ||
+                    !ggml_sycl_mul_mat_id_fused_eligible(cgraph->nodes[i])) {
+                    GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
+                                  ggml_op_name(node_op));
+                    return false;
+                }
+                break;
             case GGML_OP_MUL_MAT:
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
                 // as SYCL malloc / free and host wait calls are not supported when recording to a graph which are all present

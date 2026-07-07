@@ -166,6 +166,8 @@ typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
 #define MMVQ_MAX_BATCH_SIZE  8
+// wide-batch cap: chunk-of-8 MMVQ stays ahead of dequant+GEMM up to ~32 token columns
+#define MMVQ_MAX_BATCH_SIZE_WIDE 32
 
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
