@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <limits>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -55,6 +56,15 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
+static uint32_t server_mtp_tree_width(const common_params & params) {
+    return std::max<int32_t>(1, params.speculative.draft.mtp_tree_width);
+}
+
+static uint32_t server_mtp_n_seq_max(const common_params & params) {
+    const uint64_t n_seq = (uint64_t) std::max<int32_t>(1, params.n_parallel) * server_mtp_tree_width(params);
+    return (uint32_t) std::min<uint64_t>(n_seq, (uint64_t) std::numeric_limits<uint32_t>::max());
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -834,7 +844,9 @@ private:
                     measure_model_bytes = false;
                 }
 
-                params_dft.n_outputs_max = params_base.n_parallel;
+                params_dft.n_outputs_max = spec_mtp
+                    ? (int32_t) server_mtp_n_seq_max(params_base)
+                    : params_base.n_parallel;
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -842,6 +854,7 @@ private:
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                     cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
                     cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
+                    cparams_dft.n_seq_max = server_mtp_n_seq_max(params_base);
                 }
                 cparams_dft.n_rs_seq = 0;
 
@@ -943,6 +956,8 @@ private:
 
             if (spec_mtp) {
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams.n_seq_max = server_mtp_n_seq_max(params_base);
+                cparams.n_outputs_max = server_mtp_n_seq_max(params_base);
             }
 
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
@@ -963,8 +978,9 @@ private:
             cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
             cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
             cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
+            cparams_mtp.n_seq_max     = server_mtp_n_seq_max(params_base);
             cparams_mtp.n_rs_seq      = 0;
-            cparams_mtp.n_outputs_max = params_base.n_parallel;
+            cparams_mtp.n_outputs_max = server_mtp_n_seq_max(params_base);
             cparams_mtp.ctx_other     = ctx_tgt;
 
             ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));

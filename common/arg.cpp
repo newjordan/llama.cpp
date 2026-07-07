@@ -3607,6 +3607,53 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
+        {"--spec-draft-mtp-branch-k"}, "N",
+        string_format("number of top draft candidates scored by the MTP branch policy (default: %d)",
+            params.speculative.draft.mtp_branch_k),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_branch_k = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_BRANCH_K"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-tree-width"}, "N",
+        string_format("number of MTP draft branch sequence slots reserved per active sequence (default: %d)",
+            params.speculative.draft.mtp_tree_width),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_tree_width = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_TREE_WIDTH"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-tree-depth"}, "N",
+        string_format("maximum MTP draft tree depth, 0 = n-max (default: %d)",
+            params.speculative.draft.mtp_tree_depth),
+        [](common_params & params, int value) {
+            params.speculative.draft.mtp_tree_depth = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_TREE_DEPTH"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-route-head"}, "PATH",
+        "path to exported low-rank MTP route-cost head manifest",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_route_head = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_ROUTE_HEAD"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-route-alpha"}, "A",
+        string_format("MTP branch policy verifier route-cost penalty (default: %.2f)",
+            (double) params.speculative.draft.mtp_route_alpha),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_route_alpha = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_ROUTE_ALPHA"));
+    add_opt(common_arg(
+        {"--spec-draft-mtp-token-alpha"}, "A",
+        string_format("MTP branch policy per-token cost penalty (default: %.2f)",
+            (double) params.speculative.draft.mtp_token_alpha),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mtp_token_alpha = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MTP_TOKEN_ALPHA"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",

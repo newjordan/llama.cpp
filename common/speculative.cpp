@@ -11,11 +11,18 @@
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <cinttypes>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -121,6 +128,291 @@ static bool common_speculative_are_compatible(
 }
 
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
+
+struct common_speculative_mtp_policy_choice {
+    int index = 0;
+
+    float score = 0.0f;
+    float expected_accept = 0.0f;
+    float route_cost = 0.0f;
+};
+
+struct common_speculative_mtp_route_head {
+    int32_t hidden_size = 0;
+    int32_t vocab_size  = 0;
+    int32_t rank        = 0;
+
+    float scale = 1.0f;
+    float route_cost_target_scale = 1.0f;
+    std::string route_cost_output_transform = "identity";
+    std::string route_cost_target = "unknown";
+
+    std::vector<float> context_weight; // [rank, hidden_size], row-major
+    std::vector<float> context_bias;   // [rank]
+    std::vector<float> token_embed;    // [vocab_size, rank], row-major
+    std::vector<float> token_bias;     // [vocab_size]
+
+    bool loaded() const {
+        return hidden_size > 0 && vocab_size > 0 && rank > 0 &&
+            context_weight.size() == (size_t) rank * hidden_size &&
+            context_bias.size() == (size_t) rank &&
+            token_embed.size() == (size_t) vocab_size * rank &&
+            token_bias.size() == (size_t) vocab_size;
+    }
+
+    void compute_context(const float * hidden, int32_t n_embd, std::vector<float> & out) const {
+        GGML_ASSERT(loaded());
+        GGML_ASSERT(hidden != nullptr);
+        GGML_ASSERT(n_embd == hidden_size);
+
+        out.resize(rank);
+        for (int32_t r = 0; r < rank; ++r) {
+            const float * w = context_weight.data() + (size_t) r * hidden_size;
+            float sum = context_bias[r];
+            for (int32_t i = 0; i < hidden_size; ++i) {
+                sum += w[i] * hidden[i];
+            }
+            out[r] = sum;
+        }
+    }
+
+    float decode_route_cost(float raw) const {
+        if (route_cost_output_transform == "identity") {
+            return raw;
+        }
+        if (route_cost_output_transform == "log1p_scaled") {
+            const float target_scale = std::max(1.0f, route_cost_target_scale);
+            const float log_scale = std::log1p(target_scale);
+            const float x = std::min(std::max(0.0f, raw) * log_scale, 80.0f);
+            return std::expm1(x);
+        }
+        GGML_ABORT("unsupported MTP route-cost output transform");
+    }
+
+    float estimate_from_context(const std::vector<float> & context, llama_token id) const {
+        if (!loaded() || id < 0 || id >= vocab_size || (int32_t) context.size() != rank) {
+            return 0.0f;
+        }
+
+        const float * e = token_embed.data() + (size_t) id * rank;
+        float sum = token_bias[id];
+        for (int32_t r = 0; r < rank; ++r) {
+            sum += scale * context[r] * e[r];
+        }
+        return decode_route_cost(sum);
+    }
+};
+
+static std::string common_speculative_dirname(const std::string & path) {
+    const size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    if (pos == 0) {
+        return "/";
+    }
+    return path.substr(0, pos);
+}
+
+static std::string common_speculative_join_path(const std::string & dir, const std::string & file) {
+    if (file.empty()) {
+        return dir;
+    }
+    if (file[0] == '/' || (file.size() > 2 && file[1] == ':')) {
+        return file;
+    }
+    if (dir.empty() || dir == ".") {
+        return file;
+    }
+    return dir + "/" + file;
+}
+
+static std::vector<float> common_speculative_read_f32_file(const std::string & path, size_t count) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        throw std::runtime_error("failed to open route-head tensor: " + path);
+    }
+
+    const std::streamsize size = in.tellg();
+    const std::streamsize expected = (std::streamsize) (count * sizeof(float));
+    if (size != expected) {
+        throw std::runtime_error(string_format(
+            "route-head tensor %s has %lld bytes, expected %lld",
+            path.c_str(), (long long) size, (long long) expected));
+    }
+
+    std::vector<float> data(count);
+    in.seekg(0, std::ios::beg);
+    if (!in.read(reinterpret_cast<char *>(data.data()), expected)) {
+        throw std::runtime_error("failed to read route-head tensor: " + path);
+    }
+    return data;
+}
+
+static std::vector<int64_t> common_speculative_json_shape(const nlohmann::json & tensor) {
+    std::vector<int64_t> shape;
+    for (const auto & value : tensor.at("shape")) {
+        shape.push_back(value.get<int64_t>());
+    }
+    return shape;
+}
+
+static void common_speculative_expect_shape(
+        const nlohmann::json & tensor,
+        const std::vector<int64_t> & expected,
+        const char * name) {
+    const auto shape = common_speculative_json_shape(tensor);
+    if (shape != expected) {
+        throw std::runtime_error(string_format("route-head tensor %s has unexpected shape", name));
+    }
+}
+
+static std::vector<float> common_speculative_load_tensor(
+        const nlohmann::json & tensors,
+        const std::string & base_dir,
+        const char * name,
+        const std::vector<int64_t> & expected_shape) {
+    const auto & tensor = tensors.at(name);
+    common_speculative_expect_shape(tensor, expected_shape, name);
+
+    if (tensor.at("dtype").get<std::string>() != "float32") {
+        throw std::runtime_error(string_format("route-head tensor %s must be float32", name));
+    }
+
+    size_t count = 1;
+    for (int64_t dim : expected_shape) {
+        count *= (size_t) dim;
+    }
+    return common_speculative_read_f32_file(
+        common_speculative_join_path(base_dir, tensor.at("path").get<std::string>()),
+        count);
+}
+
+static common_speculative_mtp_route_head common_speculative_load_mtp_route_head(
+        const std::string & manifest_path,
+        int32_t expected_hidden_size,
+        int32_t expected_vocab_size) {
+    std::ifstream in(manifest_path);
+    if (!in) {
+        throw std::runtime_error("failed to open route-head manifest: " + manifest_path);
+    }
+
+    nlohmann::json manifest;
+    in >> manifest;
+
+    if (manifest.at("schema_version").get<int>() != 1 ||
+            manifest.at("format").get<std::string>() != "ornith_mtp_route_head_low_rank_v1") {
+        throw std::runtime_error("unsupported route-head manifest format: " + manifest_path);
+    }
+
+    common_speculative_mtp_route_head head;
+    head.hidden_size = manifest.at("hidden_size").get<int32_t>();
+    head.vocab_size  = manifest.at("vocab_size").get<int32_t>();
+    head.rank        = manifest.at("rank").get<int32_t>();
+    head.scale       = manifest.value("scale", std::pow((float) head.rank, -0.5f));
+    head.route_cost_target_scale = manifest.value("route_cost_target_scale", 1.0f);
+    head.route_cost_output_transform = manifest.value(
+        "route_cost_output_transform",
+        manifest.contains("route_cost_target_scale") ? "log1p_scaled" : "identity");
+    head.route_cost_target = manifest.value("route_cost_target", "unknown");
+
+    if (head.hidden_size != expected_hidden_size) {
+        throw std::runtime_error(string_format(
+            "route-head hidden_size=%d does not match MTP hidden size=%d",
+            head.hidden_size, expected_hidden_size));
+    }
+    if (head.vocab_size != expected_vocab_size) {
+        throw std::runtime_error(string_format(
+            "route-head vocab_size=%d does not match draft vocab size=%d",
+            head.vocab_size, expected_vocab_size));
+    }
+    if (head.rank <= 0) {
+        throw std::runtime_error("route-head rank must be positive");
+    }
+    if (head.route_cost_target_scale < 1.0f) {
+        throw std::runtime_error("route-head route_cost_target_scale must be >= 1");
+    }
+    if (head.route_cost_output_transform != "identity" &&
+            head.route_cost_output_transform != "log1p_scaled") {
+        throw std::runtime_error("unsupported route-head route_cost_output_transform: " +
+                head.route_cost_output_transform);
+    }
+
+    const auto & tensors = manifest.at("tensors");
+    const std::string base_dir = common_speculative_dirname(manifest_path);
+    head.context_weight = common_speculative_load_tensor(
+        tensors, base_dir, "route_context_proj_weight", { head.rank, head.hidden_size });
+    head.context_bias = common_speculative_load_tensor(
+        tensors, base_dir, "route_context_proj_bias", { head.rank });
+    head.token_embed = common_speculative_load_tensor(
+        tensors, base_dir, "route_token_embed_weight", { head.vocab_size, head.rank });
+    auto token_bias_2d = common_speculative_load_tensor(
+        tensors, base_dir, "route_token_bias_weight", { head.vocab_size, 1 });
+    head.token_bias = std::move(token_bias_2d);
+
+    GGML_ASSERT(head.loaded());
+    return head;
+}
+
+static common_speculative_mtp_policy_choice common_speculative_mtp_select_candidate(
+        const llama_token_data_array * cur_p,
+        const common_speculative_mtp_route_head * route_head,
+        const float * h_row,
+        int32_t n_embd,
+        std::vector<float> & route_context,
+        int32_t branch_k,
+        float p_min,
+        float route_alpha,
+        float token_alpha,
+        int step) {
+    common_speculative_mtp_policy_choice best;
+
+    if (cur_p == nullptr || cur_p->size == 0) {
+        return best;
+    }
+
+    const int n_candidates = std::max(1, std::min<int>((int) cur_p->size, std::max(1, branch_k)));
+    float best_score = -std::numeric_limits<float>::infinity();
+    const bool use_route_head = route_head != nullptr && route_head->loaded() && h_row != nullptr && route_alpha > 0.0f;
+    if (use_route_head) {
+        route_head->compute_context(h_row, n_embd, route_context);
+    }
+
+    for (int k = 0; k < n_candidates; ++k) {
+        const auto & cand = cur_p->data[k];
+        const float p = std::max(0.0f, cand.p);
+
+        if (p < p_min) {
+            continue;
+        }
+
+        GGML_UNUSED(step);
+        const float route_cost = use_route_head
+            ? std::max(0.0f, route_head->estimate_from_context(route_context, cand.id))
+            : 0.0f;
+        const float denom = 1.0f + std::max(0.0f, token_alpha) + std::max(0.0f, route_alpha) * route_cost;
+        const float score = p / denom;
+
+        if (score > best_score) {
+            best_score = score;
+            best.index = k;
+            best.score = score;
+            best.expected_accept = p;
+            best.route_cost = route_cost;
+        }
+    }
+
+    if (!std::isfinite(best_score)) {
+        best.index = 0;
+        best.score = 0.0f;
+        best.expected_accept = std::max(0.0f, cur_p->data[0].p);
+        best.route_cost = use_route_head
+            ? route_head->estimate_from_context(route_context, cur_p->data[0].id)
+            : 0.0f;
+    }
+
+    return best;
+}
 
 // state of an implementation of speculative decoding
 //
@@ -419,6 +711,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t n_embd = 0;
 
+    common_speculative_mtp_route_head route_head;
+    std::vector<float> route_context;
+
     bool is_mem_shared = false;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
@@ -439,6 +734,399 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    struct mtp_tree_branch {
+        llama_seq_id seq_id = -1;
+        int32_t branch = 0;
+        int32_t i_batch = -1;
+
+        llama_tokens tokens;
+        common_sampler_ptr smpl;
+
+        float prefix_p = 1.0f;
+        float expected_accept = 0.0f;
+        float route_cost = 0.0f;
+        float score = 0.0f;
+
+        bool active = true;
+    };
+
+    struct mtp_tree_candidate {
+        int parent = -1;
+        int parent_i_batch = -1;
+        int index = 0;
+        llama_token id = LLAMA_TOKEN_NULL;
+
+        float p = 0.0f;
+        float route_cost = 0.0f;
+        float score = 0.0f;
+    };
+
+    bool has_tree_scratch() const {
+        return params.mtp_tree_width > 1;
+    }
+
+    llama_seq_id scratch_seq_id(llama_seq_id seq_id, int32_t branch) const {
+        GGML_ASSERT(branch > 0 && branch < params.mtp_tree_width);
+        return (llama_seq_id) n_seq + seq_id*(params.mtp_tree_width - 1) + (branch - 1);
+    }
+
+    llama_seq_id tree_seq_id(llama_seq_id seq_id, int32_t branch) const {
+        GGML_ASSERT(branch >= 0 && branch < params.mtp_tree_width);
+        return branch == 0 ? seq_id : scratch_seq_id(seq_id, branch);
+    }
+
+    float score_branch(float expected_accept, float route_cost, int32_t n_tokens) const {
+        const float denom =
+            1.0f +
+            std::max(0.0f, params.mtp_token_alpha) * (float) n_tokens +
+            std::max(0.0f, params.mtp_route_alpha) * std::max(0.0f, route_cost) +
+            1.0e-6f;
+
+        return expected_accept / denom;
+    }
+
+    float estimate_route_cost(const float * h_row, llama_token id) {
+        if (!route_head.loaded() || h_row == nullptr || params.mtp_route_alpha <= 0.0f) {
+            return 0.0f;
+        }
+
+        route_head.compute_context(h_row, n_embd, route_context);
+        return std::max(0.0f, route_head.estimate_from_context(route_context, id));
+    }
+
+    void append_branch_token(mtp_tree_branch & branch, llama_token id, float p, float route_cost) const {
+        branch.tokens.push_back(id);
+        branch.prefix_p *= std::max(0.0f, p);
+        branch.expected_accept += branch.prefix_p;
+        branch.route_cost += std::max(0.0f, route_cost);
+        branch.score = score_branch(branch.expected_accept, branch.route_cost, (int32_t) branch.tokens.size());
+    }
+
+    bool better_branch(const mtp_tree_branch & lhs, const mtp_tree_branch & rhs) const {
+        if (lhs.score != rhs.score) {
+            return lhs.score > rhs.score;
+        }
+        if (lhs.expected_accept != rhs.expected_accept) {
+            return lhs.expected_accept > rhs.expected_accept;
+        }
+        return lhs.tokens.size() > rhs.tokens.size();
+    }
+
+    mtp_tree_branch make_child_branch(
+            const mtp_tree_branch & parent,
+            llama_seq_id seq_id,
+            int32_t branch_slot,
+            const mtp_tree_candidate & cand) const {
+        mtp_tree_branch child;
+        child.seq_id = seq_id;
+        child.branch = branch_slot;
+        child.i_batch = -1;
+        child.tokens = parent.tokens;
+        child.smpl.reset(common_sampler_clone(parent.smpl.get()));
+        child.prefix_p = parent.prefix_p;
+        child.expected_accept = parent.expected_accept;
+        child.route_cost = parent.route_cost;
+        child.score = parent.score;
+        child.active = true;
+
+        common_sampler_accept(child.smpl.get(), cand.id, true);
+        append_branch_token(child, cand.id, cand.p, cand.route_cost);
+
+        return child;
+    }
+
+    void clear_tree_scratch(llama_seq_id seq_id) {
+        if (!has_tree_scratch()) {
+            return;
+        }
+
+        auto * mem_dft = llama_get_memory(params.ctx_dft);
+        for (int32_t branch = 1; branch < params.mtp_tree_width; ++branch) {
+            llama_memory_seq_rm(mem_dft, scratch_seq_id(seq_id, branch), -1, -1);
+        }
+    }
+
+    void clear_tree_scratch() {
+        if (!has_tree_scratch()) {
+            return;
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            clear_tree_scratch(seq_id);
+        }
+    }
+
+    void draft_tree_for_seq(
+            llama_seq_id seq_id,
+            common_speculative_draft_params & dp,
+            int32_t root_i_batch) {
+        auto * ctx_dft = params.ctx_dft;
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        auto * root_smpl = smpls[seq_id].get();
+
+        auto & result = *dp.result;
+        result.clear();
+
+        const int32_t max_len = std::max<int32_t>(0, std::min<int32_t>(
+            std::max(0, params.n_max),
+            dp.n_max > 0 ? dp.n_max : params.n_max));
+        const int32_t max_depth = std::max<int32_t>(0, std::min<int32_t>(params.mtp_tree_depth, max_len));
+        if (max_depth <= 0 || root_i_batch < 0) {
+            return;
+        }
+
+        common_sampler_sample(root_smpl, ctx_dft, root_i_batch, true);
+        const float * h_root = llama_get_embeddings_nextn_ith(ctx_dft, root_i_batch);
+        const auto * cur_p = common_sampler_get_candidates(root_smpl, true);
+
+        if (cur_p == nullptr || cur_p->size == 0) {
+            return;
+        }
+
+        std::vector<mtp_tree_candidate> candidates;
+        const int32_t n_candidates = std::min<int32_t>(
+            (int32_t) cur_p->size,
+            std::max<int32_t>(1, params.mtp_branch_k));
+        candidates.reserve((size_t) n_candidates);
+
+        for (int32_t k = 0; k < n_candidates; ++k) {
+            const auto & cand = cur_p->data[k];
+            const float p = std::max(0.0f, cand.p);
+            if (p < params.p_min) {
+                continue;
+            }
+
+            const float route_cost = estimate_route_cost(h_root, cand.id);
+            candidates.push_back({
+                /* .parent         = */ -1,
+                /* .parent_i_batch = */ root_i_batch,
+                /* .index          = */ k,
+                /* .id             = */ cand.id,
+                /* .p              = */ p,
+                /* .route_cost     = */ route_cost,
+                /* .score          = */ score_branch(p, route_cost, 1),
+            });
+        }
+
+        if (candidates.empty()) {
+            return;
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const mtp_tree_candidate & lhs, const mtp_tree_candidate & rhs) {
+            if (lhs.score != rhs.score) {
+                return lhs.score > rhs.score;
+            }
+            return lhs.p > rhs.p;
+        });
+
+        const int32_t n_branches = std::min<int32_t>((int32_t) candidates.size(), params.mtp_tree_width);
+        std::vector<mtp_tree_branch> branches;
+        branches.reserve((size_t) n_branches);
+
+        clear_tree_scratch(seq_id);
+
+        common_batch_clear(batch);
+        std::vector<int32_t> decode_branch_indices;
+        decode_branch_indices.reserve((size_t) n_branches);
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        for (int32_t b = 0; b < n_branches; ++b) {
+            const auto & cand = candidates[b];
+
+            mtp_tree_branch branch;
+            branch.branch = b;
+            branch.seq_id = tree_seq_id(seq_id, b);
+            branch.i_batch = root_i_batch;
+            branch.smpl.reset(common_sampler_clone(root_smpl));
+            common_sampler_accept(branch.smpl.get(), cand.id, true);
+            append_branch_token(branch, cand.id, cand.p, cand.route_cost);
+
+            if (b > 0) {
+                llama_memory_seq_rm(mem_dft, branch.seq_id, -1, -1);
+                llama_memory_seq_cp(mem_dft, seq_id, branch.seq_id, -1, -1);
+            }
+
+            LOG_DBG(" - seq_id %d, MTP tree root branch %d selected candidate %d, score %.6f, p %.6f, route_cost %.3f\n",
+                    seq_id, b, cand.index, branch.score, cand.p, cand.route_cost);
+
+            branches.push_back(std::move(branch));
+
+            if (max_depth > 1) {
+                const auto & state = branches.back();
+                const llama_pos pos = is_mem_shared ? dp.n_past : dp.n_past + (llama_pos) state.tokens.size();
+                common_batch_add(batch, state.tokens.back(), pos, { state.seq_id }, true);
+                std::memcpy(batch.embd + (size_t) n_embd*(batch.n_tokens - 1), h_root, row_bytes);
+                decode_branch_indices.push_back((int32_t) branches.size() - 1);
+            }
+        }
+
+        if (batch.n_tokens > 0) {
+            const int ret = llama_decode(ctx_dft, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode initial tree branches returned %d\n", __func__, ret);
+                batch.n_tokens = 0;
+            } else {
+                for (int32_t i = 0; i < (int32_t) decode_branch_indices.size(); ++i) {
+                    branches[decode_branch_indices[i]].i_batch = i;
+                }
+            }
+        }
+
+        for (int32_t depth = 1; depth < max_depth; ++depth) {
+            std::vector<mtp_tree_candidate> expansions;
+            expansions.reserve((size_t) branches.size() * std::max<int32_t>(1, params.mtp_branch_k));
+
+            for (int32_t b = 0; b < (int32_t) branches.size(); ++b) {
+                auto & branch = branches[b];
+                if (!branch.active || (int32_t) branch.tokens.size() >= max_depth || branch.i_batch < 0) {
+                    branch.active = false;
+                    continue;
+                }
+
+                common_sampler_sample(branch.smpl.get(), ctx_dft, branch.i_batch, true);
+                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, branch.i_batch);
+                const auto * branch_p = common_sampler_get_candidates(branch.smpl.get(), true);
+                if (branch_p == nullptr || branch_p->size == 0) {
+                    branch.active = false;
+                    continue;
+                }
+
+                const int32_t n_candidates = std::min<int32_t>(
+                    (int32_t) branch_p->size,
+                    std::max<int32_t>(1, params.mtp_branch_k));
+
+                for (int32_t k = 0; k < n_candidates; ++k) {
+                    const auto & cand = branch_p->data[k];
+                    const float p = std::max(0.0f, cand.p);
+                    if (p < params.p_min) {
+                        continue;
+                    }
+
+                    const float route_cost = estimate_route_cost(h_row, cand.id);
+                    const float child_prefix = branch.prefix_p * p;
+                    const float child_expected = branch.expected_accept + child_prefix;
+                    const float child_route_cost = branch.route_cost + route_cost;
+                    expansions.push_back({
+                        /* .parent         = */ b,
+                        /* .parent_i_batch = */ branch.i_batch,
+                        /* .index          = */ k,
+                        /* .id             = */ cand.id,
+                        /* .p              = */ p,
+                        /* .route_cost     = */ route_cost,
+                        /* .score          = */ score_branch(child_expected, child_route_cost, (int32_t) branch.tokens.size() + 1),
+                    });
+                }
+            }
+
+            if (expansions.empty()) {
+                break;
+            }
+
+            std::sort(expansions.begin(), expansions.end(), [](const mtp_tree_candidate & lhs, const mtp_tree_candidate & rhs) {
+                if (lhs.score != rhs.score) {
+                    return lhs.score > rhs.score;
+                }
+                return lhs.p > rhs.p;
+            });
+            if ((int32_t) expansions.size() > params.mtp_tree_width) {
+                expansions.resize(params.mtp_tree_width);
+            }
+
+            std::vector<int32_t> assigned_slot(expansions.size(), -1);
+            std::vector<bool> slot_used(params.mtp_tree_width, false);
+
+            for (int32_t i = 0; i < (int32_t) expansions.size(); ++i) {
+                const int32_t parent = expansions[i].parent;
+                GGML_ASSERT(parent >= 0 && parent < (int32_t) branches.size());
+                const int32_t parent_slot = branches[parent].branch;
+                if (parent_slot >= 0 && parent_slot < params.mtp_tree_width && !slot_used[parent_slot]) {
+                    assigned_slot[i] = parent_slot;
+                    slot_used[parent_slot] = true;
+                }
+            }
+
+            for (int32_t i = 0; i < (int32_t) expansions.size(); ++i) {
+                if (assigned_slot[i] >= 0) {
+                    continue;
+                }
+                for (int32_t slot = 0; slot < params.mtp_tree_width; ++slot) {
+                    if (!slot_used[slot]) {
+                        assigned_slot[i] = slot;
+                        slot_used[slot] = true;
+                        break;
+                    }
+                }
+                GGML_ASSERT(assigned_slot[i] >= 0);
+            }
+
+            std::vector<mtp_tree_branch> next_branches;
+            next_branches.reserve(expansions.size());
+
+            common_batch_clear(batch);
+            decode_branch_indices.clear();
+
+            for (int32_t i = 0; i < (int32_t) expansions.size(); ++i) {
+                const auto & exp = expansions[i];
+                const auto & parent = branches[exp.parent];
+                const int32_t branch_slot = assigned_slot[i];
+                const llama_seq_id dst_seq = tree_seq_id(seq_id, branch_slot);
+
+                if (dst_seq != parent.seq_id) {
+                    llama_memory_seq_rm(mem_dft, dst_seq, -1, -1);
+                    llama_memory_seq_cp(mem_dft, parent.seq_id, dst_seq, -1, -1);
+                }
+
+                auto child = make_child_branch(parent, dst_seq, branch_slot, exp);
+
+                if ((int32_t) child.tokens.size() < max_depth) {
+                    const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, exp.parent_i_batch);
+                    const llama_pos pos = is_mem_shared ? dp.n_past : dp.n_past + (llama_pos) child.tokens.size();
+                    common_batch_add(batch, child.tokens.back(), pos, { child.seq_id }, true);
+                    std::memcpy(batch.embd + (size_t) n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+                    decode_branch_indices.push_back((int32_t) next_branches.size());
+                } else {
+                    child.active = false;
+                }
+
+                next_branches.push_back(std::move(child));
+            }
+
+            if (batch.n_tokens == 0) {
+                branches = std::move(next_branches);
+                break;
+            }
+
+            const int ret = llama_decode(ctx_dft, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode tree depth %d returned %d\n", __func__, depth, ret);
+                break;
+            }
+
+            for (int32_t i = 0; i < (int32_t) decode_branch_indices.size(); ++i) {
+                next_branches[decode_branch_indices[i]].i_batch = i;
+            }
+
+            branches = std::move(next_branches);
+        }
+
+        if (branches.empty()) {
+            return;
+        }
+
+        int32_t best = 0;
+        for (int32_t i = 1; i < (int32_t) branches.size(); ++i) {
+            if (better_branch(branches[i], branches[best])) {
+                best = i;
+            }
+        }
+
+        result = branches[best].tokens;
+        LOG_DBG(" - seq_id %d, MTP tree selected branch %d, tokens=%zu, score %.6f, expected_accept %.6f, route_cost %.3f\n",
+                seq_id, branches[best].branch, result.size(), branches[best].score,
+                branches[best].expected_accept, branches[best].route_cost);
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -451,8 +1139,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
 
+        this->params.mtp_branch_k = std::max(1, this->params.mtp_branch_k);
+        this->params.mtp_tree_width = std::max(1, this->params.mtp_tree_width);
+        const int32_t n_max = std::max(0, this->params.n_max);
+        if (this->params.mtp_tree_depth <= 0) {
+            this->params.mtp_tree_depth = n_max;
+        } else {
+            this->params.mtp_tree_depth = std::min(this->params.mtp_tree_depth, n_max);
+        }
+
+        const uint32_t ctx_dft_n_seq = llama_n_seq_max(ctx_dft);
+        const uint64_t required_n_seq = (uint64_t) n_seq * (uint64_t) this->params.mtp_tree_width;
+        if (ctx_dft_n_seq < required_n_seq) {
+            throw std::runtime_error(string_format(
+                "MTP tree width requires ctx_dft n_seq_max >= %u*%d = %" PRIu64 ", got %u",
+                n_seq, this->params.mtp_tree_width, required_n_seq, ctx_dft_n_seq));
+        }
+
         LOG_INF("%s: adding speculative implementation 'draft-mtp'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        LOG_INF("%s: - mtp_branch_k=%d, mtp_tree_width=%d, mtp_tree_depth=%d, mtp_route_alpha=%.3f, mtp_token_alpha=%.3f\n", __func__,
+                this->params.mtp_branch_k, this->params.mtp_tree_width, this->params.mtp_tree_depth,
+                this->params.mtp_route_alpha, this->params.mtp_token_alpha);
+        LOG_INF("%s: - ctx_dft n_seq_max=%u, active n_seq=%u, reserved MTP branch seqs=%" PRIu64 "\n", __func__,
+                ctx_dft_n_seq, n_seq, required_n_seq);
+        if (!this->params.mtp_route_head.empty()) {
+            const llama_vocab * vocab_dft = llama_model_get_vocab(llama_get_model(ctx_dft));
+            route_head = common_speculative_load_mtp_route_head(
+                this->params.mtp_route_head,
+                n_embd,
+                llama_vocab_n_tokens(vocab_dft));
+            LOG_INF("%s: - loaded MTP route head rank=%d target=%s transform=%s from %s\n", __func__,
+                    route_head.rank,
+                    route_head.route_cost_target.c_str(),
+                    route_head.route_cost_output_transform.c_str(),
+                    this->params.mtp_route_head.c_str());
+        } else if (this->params.mtp_route_alpha > 0.0f) {
+            LOG_WRN("%s: mtp_route_alpha > 0 but no route-head manifest was provided; route cost stays zero\n", __func__);
+        }
         LOG_INF("%s: - gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n", __func__,
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -506,6 +1230,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
+
+        clear_tree_scratch();
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -529,6 +1255,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        if (has_tree_scratch()) {
+            for (int32_t branch = 1; branch < params.mtp_tree_width; ++branch) {
+                llama_memory_seq_rm(llama_get_memory(params.ctx_dft), scratch_seq_id(seq_id, branch), -1, -1);
+            }
+        }
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -647,6 +1379,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
+        std::vector<int32_t> root_i_batch(n_seq, -1);
 
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -662,6 +1395,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
+            root_i_batch[seq_id] = batch.n_tokens;
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
 
             h_row = pending_h[seq_id].data();
@@ -671,6 +1405,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+            return;
+        }
+
+        if (has_tree_scratch()) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!drafting[seq_id]) {
+                    continue;
+                }
+
+                draft_tree_for_seq(seq_id, dparams.at(seq_id), root_i_batch[seq_id]);
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+
+                if (dp.result->size() < (size_t) params.n_min) {
+                    dp.result->clear();
+                }
+
+                last_n_drafted[seq_id] = (uint16_t) dp.result->size();
+            }
+
             return;
         }
 
@@ -700,11 +1459,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                const auto choice = common_speculative_mtp_select_candidate(
+                    cur_p,
+                    route_head.loaded() ? &route_head : nullptr,
+                    h_row,
+                    n_embd,
+                    route_context,
+                    params.mtp_branch_k,
+                    params.p_min,
+                    params.mtp_route_alpha,
+                    params.mtp_token_alpha,
+                    i
+                );
+                const auto & selected = cur_p->data[choice.index];
+
+                if (choice.index != 0) {
+                    LOG_DBG(" - seq_id %d, MTP branch policy selected candidate %d, score %.6f, p %.6f, route_cost %.3f\n",
+                            seq_id, choice.index, choice.score, selected.p, choice.route_cost);
+                }
+
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id = selected.id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (selected.p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -775,6 +1553,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        if (has_tree_scratch()) {
+            for (int32_t branch = 1; branch < params.mtp_tree_width; ++branch) {
+                llama_memory_seq_rm(llama_get_memory(params.ctx_dft), scratch_seq_id(seq_id, branch), -1, -1);
+            }
+        }
     }
 
     bool need_embd() const override {

@@ -306,6 +306,15 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    int32_t mtp_branch_k = 1; // top-k draft candidates scored by the MTP branch policy
+    int32_t mtp_tree_width = 1; // draft branch sequence slots reserved per active MTP sequence
+    int32_t mtp_tree_depth = 0; // bounded MTP tree depth, 0 = use n_max
+
+    std::string mtp_route_head = ""; // exported low-rank route-cost head manifest
+
+    float mtp_route_alpha = 0.0f; // verifier route-cost penalty for MTP branch scoring
+    float mtp_token_alpha = 0.0f; // per-token cost penalty for MTP branch scoring
+
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
