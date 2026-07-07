@@ -3540,9 +3540,32 @@ enum class mul_mat_algo {
 };
 
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
-    // TODO: accuracy issues in MMQ
-    GGML_UNUSED(type);
-    return false;
+    // The DP4A-tiled MMQ GEMM (mmq.cpp) was disabled upstream with an unquantified
+    // "accuracy issues" note. Opt-in on B70 to A/B it for the large-ne11 dense path
+    // (prefill + np>8 batched decode) where a tiled GEMM beats per-column MMVQ.
+    // GGML_SYCL_ENABLE_MMQ=1 turns it on; accuracy is gated by test-backend-ops MUL_MAT.
+    static const bool enable_mmq = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MMQ");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enable_mmq) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
 }
 
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
@@ -4247,7 +4270,13 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // Workaround in https://github.com/ggml-org/llama.cpp/commit/95f84d5ce8b449a9b16009434aca800df504a02e
     use_mul_mat_q = use_mul_mat_q && (src0->type != GGML_TYPE_IQ2_XXS);
 #ifdef SYCL_USE_XMX
-    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+    // The XMX batch cap starves MMQ (MMVQ already owns ne11<=32), leaving prefill on the
+    // f16 dequant GEMM. When MMQ is explicitly enabled, drop the cap so the tiled int8 GEMM
+    // takes the large-ne11 dense path (prefill / big batch); MMVQ still wins ne11<=32 by
+    // dispatch precedence below.
+    if (!ggml_sycl_supports_mmq(src0->type)) {
+        use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+    }
 #endif // SYCL_USE_XMX
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
