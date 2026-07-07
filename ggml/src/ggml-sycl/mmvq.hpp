@@ -38,6 +38,10 @@ bool ggml_sycl_mul_mat_vec_q_id(
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
     size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
+    int                n_tokens,             // batched decode: grid dim 0, one ids row per token
+    int                ids_row_stride,       // int32 elems between tokens' ids rows
+    size_t             src1_token_stride,    // bytes between tokens in vy
+    size_t             dst_token_stride,     // bytes between tokens in dst_base
     dpct::queue_ptr    stream);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
@@ -55,6 +59,10 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     size_t             expert_weight_stride,
     size_t             dst_row_stride,
     size_t             src1_row_stride,
+    int                n_tokens,
+    int                ids_row_stride,
+    size_t             src1_token_stride,
+    size_t             dst_token_stride,
     dpct::queue_ptr    stream);
 
 #endif // GGML_SYCL_MMVQ_HPP
