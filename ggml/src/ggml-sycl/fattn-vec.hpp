@@ -48,6 +48,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                         const char* __restrict__ mask,
                         const char* __restrict__ sinks,
                         const int* __restrict__ KV_max,
+                        const int* __restrict__ kv_idxs,
                         float* __restrict__ dst,
                         sycl::float2* __restrict__ dst_meta,
                         const float scale,
@@ -84,7 +85,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     if (use_logit_softcap && !(D == 128 || D == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -144,6 +145,9 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     }
     // Column j's Q row: next token (nb01), or next head of the KV group (nb02).
     const int32_t q_col_stride = cols_are_heads ? nb02 : nb01;
+    const char * K_head_base = K;
+    const char * V_head_base = V;
+    const int * kv_idxs_seq = kv_idxs ? kv_idxs + sequence * ne11 : nullptr;
 
     const sycl::half * maskh = (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * ic0);
 
@@ -317,6 +321,13 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
              // Increment pointers after each loop:
          K += item_ct1.get_group_range(1) * nthreads * nb11, V += item_ct1.get_group_range(1) * nthreads * nb21,
              maskh += item_ct1.get_group_range(1) * nthreads) {
+        const bool use_kv_idxs = kv_idxs_seq != nullptr;
+        const int phys_first = use_kv_idxs ? kv_idxs_seq[k_VKQ_0] : 0;
+        const int phys_last  = use_kv_idxs ? kv_idxs_seq[k_VKQ_0 + nthreads - 1] : 0;
+        const bool kv_block_contiguous = !use_kv_idxs || phys_last == phys_first + nthreads - 1;
+        const char * K_block = use_kv_idxs ? K_head_base + phys_first * nb11 : K;
+        const char * V_block = use_kv_idxs ? V_head_base + phys_first * nb21 : V;
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]={}; // KQ in registers.
         float KQ_max_new[ncols]={};
@@ -334,7 +345,12 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                const char * K_row = K_block + i_KQ*nb11;
+                if (!kv_block_contiguous) {
+                    K_row = K_head_base + kv_idxs_seq[k_VKQ_0 + i_KQ] * nb11;
+                }
+
+                float sum = vec_dot_KQ(K_row, Q_reg[j], Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
@@ -406,7 +422,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 sycl::half2 tmp[V_rows_per_thread / 2];
-                dequantize_V(V + k * nb21, tmp,
+                const char * V_row = V_block + k * nb21;
+                if (!kv_block_contiguous) {
+                    V_row = V_head_base + kv_idxs_seq[k_VKQ_0 + k] * nb21;
+                }
+                dequantize_V(V_row, tmp,
                              2 * i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) :
                                                                       item_ct1.get_local_id(2) % nthreads_V) *
                                                V_rows_per_thread);
@@ -427,7 +447,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 sycl::float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                const char * V_row = V_block + k*nb21;
+                if (!kv_block_contiguous) {
+                    V_row = V_head_base + kv_idxs_seq[k_VKQ_0 + k] * nb21;
+                }
+                dequantize_V(V_row, tmp,
                     2*i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -589,7 +613,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,

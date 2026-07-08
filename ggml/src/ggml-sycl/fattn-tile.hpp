@@ -664,6 +664,7 @@ static void flash_attn_tile(const char *  Q,
                             const char *  mask,
                             const char *  sinks,
                             const int *  KV_max,
+                            const int *  kv_idxs,
                             float *  dst,
                             sycl::float2 *  dst_meta,
                             const float          scale,
@@ -699,7 +700,7 @@ static void flash_attn_tile(const char *  Q,
     // Skip unused kernel variants for faster compilation:
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     if ((use_logit_softcap && !(DV == 128 || DV == 256))) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -710,6 +711,8 @@ static void flash_attn_tile(const char *  Q,
                   nb31, nb32, nb33);
         return;
     }
+
+    GGML_UNUSED_VARS(kv_idxs);
 
     static_assert(ggml_sycl_fattn_tile_get_config(DKQ, DV, ncols1*ncols2) != 0, "kernel config not defined");
 
@@ -1056,7 +1059,7 @@ static void flash_attn_tile(const char *  Q,
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -1243,4 +1246,3 @@ extern DECL_FATTN_TILE_CASE(128, 128);
 extern DECL_FATTN_TILE_CASE(256, 256);
 extern DECL_FATTN_TILE_CASE(512, 512);
 extern DECL_FATTN_TILE_CASE(576, 512);
-

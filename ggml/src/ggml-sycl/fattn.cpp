@@ -116,6 +116,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * kv_idxs = dst->src[5];
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -189,8 +190,24 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    if (kv_idxs) {
+        if (kv_idxs->type != GGML_TYPE_I32 || kv_idxs->ne[0] != K->ne[1] || kv_idxs->ne[1] != K->ne[3]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (K->type == GGML_TYPE_F32 || V->type == GGML_TYPE_F32) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (Q->ne[1] != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    if (kv_idxs) {
+        return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+    }
 
     // Todo: Use the XMX kernel if possible:
 
@@ -218,13 +235,14 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     // to see which FA kernel serves decode vs prefill at a given KV length/quant.
     static const bool fa_debug = getenv("GGML_SYCL_FA_DEBUG") != nullptr;
     if (fa_debug) {
-        static std::set<std::tuple<int, int, int64_t>> seen;
+        static std::set<std::tuple<int, int, int64_t, bool>> seen;
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
-        if (seen.emplace((int) kernel, (int) K->type, Q->ne[1]).second) {
-            fprintf(stderr, "[fa-debug] kernel=%s Ktype=%s Qrows=%ld KVlen=%ld head=%ld\n",
+        const bool indexed = dst->src[5] != nullptr;
+        if (seen.emplace((int) kernel, (int) K->type, Q->ne[1], indexed).second) {
+            fprintf(stderr, "[fa-debug] kernel=%s Ktype=%s Qrows=%ld KVlen=%ld head=%ld indexed=%d\n",
                     kernel == BEST_FATTN_KERNEL_VEC ? "VEC" : kernel == BEST_FATTN_KERNEL_TILE ? "TILE" : "NONE",
-                    ggml_type_name(K->type), (long) Q->ne[1], (long) K->ne[1], (long) K->ne[0]);
+                    ggml_type_name(K->type), (long) Q->ne[1], (long) K->ne[1], (long) K->ne[0], indexed ? 1 : 0);
         }
     }
     switch (kernel) {

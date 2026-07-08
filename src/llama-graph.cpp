@@ -486,6 +486,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
+    if (self_attn_idxs) {
+        mctx->set_input_attn_idxs(self_attn_idxs);
+    }
+
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     if (self_k_rot) {
@@ -508,6 +512,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    const bool need_attn_idxs = mctx->get_use_compact_attn() && (!mctx->get_attn_is_dense() || mctx->get_force_indexed_fattn());
+    res &= need_attn_idxs == (self_attn_idxs != nullptr);
+    if (need_attn_idxs) {
+        res &= self_attn_idxs->ne[0] == mctx->get_n_kv();
+        res &= self_attn_idxs->ne[1] == self_kq_mask->ne[3];
+    }
 
     return res;
 }
@@ -669,6 +680,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
+    if (inp_attn->self_attn_idxs) {
+        mctx->get_attn()->set_input_attn_idxs(inp_attn->self_attn_idxs);
+    }
+
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
     if (inp_attn->self_k_rot) {
@@ -703,6 +718,14 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    const bool need_attn_idxs = mctx->get_attn()->get_use_compact_attn() &&
+        (!mctx->get_attn()->get_attn_is_dense() || mctx->get_attn()->get_force_indexed_fattn());
+    res &= need_attn_idxs == (inp_attn->self_attn_idxs != nullptr);
+    if (need_attn_idxs) {
+        res &= inp_attn->self_attn_idxs->ne[0] == mctx->get_attn()->get_n_kv();
+        res &= inp_attn->self_attn_idxs->ne[1] == inp_attn->self_kq_mask->ne[3];
+    }
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2056,7 +2079,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kv_idxs) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2092,6 +2116,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        ggml_flash_attn_ext_set_kv_idxs(cur, kv_idxs);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -2276,6 +2301,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        if (mctx_cur->get_use_compact_attn() && (!mctx_cur->get_attn_is_dense() || mctx_cur->get_force_indexed_fattn())) {
+            inp->self_attn_idxs = mctx_cur->build_input_attn_idxs(ctx0);
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2337,10 +2366,46 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k;
+    ggml_tensor * v;
+    ggml_tensor * kv_idxs = nullptr;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    if (inp->get_attn_idxs()) {
+        const int64_t n_stream = inp->get_attn_idxs()->ne[1];
+        const bool is_decode = q_cur->ne[2] == n_stream;
+        const bool attn_is_dense = mctx_cur->get_attn_is_dense();
+        const bool force_indexed_fattn = mctx_cur->get_force_indexed_fattn();
+        const bool indexed_type_ok =
+            force_indexed_fattn ||
+            mctx_cur->type_k() != GGML_TYPE_F16 ||
+            mctx_cur->type_v() != GGML_TYPE_F16;
+        const bool use_indexed_fattn =
+            mctx_cur->get_use_indexed_fattn() &&
+            cparams.flash_attn &&
+            kq_b == nullptr &&
+            mctx_cur->type_k() != GGML_TYPE_F32 &&
+            mctx_cur->type_v() != GGML_TYPE_F32 &&
+            indexed_type_ok &&
+            (!attn_is_dense || force_indexed_fattn) &&
+            is_decode;
+
+        if (attn_is_dense && !force_indexed_fattn) {
+            k = mctx_cur->get_k(ctx0, il);
+            v = mctx_cur->get_v(ctx0, il);
+        } else if (use_indexed_fattn) {
+            k = mctx_cur->get_k(ctx0, il);
+            v = mctx_cur->get_v(ctx0, il);
+            kv_idxs = inp->get_attn_idxs();
+        } else {
+            k = mctx_cur->get_k_compact(ctx0, il, inp->get_attn_idxs());
+            v = mctx_cur->get_v_compact(ctx0, il, inp->get_attn_idxs());
+        }
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, kv_idxs);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

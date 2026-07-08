@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -69,6 +70,60 @@ static ggml_tensor * ggml_mul_mat_aux(
     res = ggml_mul_mat   (ctx, rot, res);
     ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
+static constexpr uint32_t LLAMA_KV_PAGE_PROBE_SIZE = 256;
+
+struct llama_kv_page_probe_stats {
+    uint32_t size                 = 0;
+    uint32_t used                 = 0;
+    uint32_t used_min             = 0;
+    uint32_t used_max_p1          = 0;
+    uint32_t holes_below_used_max = 0;
+    uint32_t live_pages           = 0;
+    uint32_t dense_pages          = 0;
+    uint32_t largest_free_run     = 0;
+};
+
+static llama_kv_page_probe_stats llama_kv_page_probe_collect(const llama_kv_cells & cells) {
+    llama_kv_page_probe_stats res;
+
+    res.size        = cells.size();
+    res.used        = cells.get_used();
+    res.used_min    = cells.used_min();
+    res.used_max_p1 = cells.used_max_p1();
+    res.dense_pages = (res.used_max_p1 + LLAMA_KV_PAGE_PROBE_SIZE - 1) / LLAMA_KV_PAGE_PROBE_SIZE;
+
+    uint32_t free_run = 0;
+
+    for (uint32_t i = 0; i < res.used_max_p1; ++i) {
+        if (cells.is_empty(i)) {
+            ++res.holes_below_used_max;
+            ++free_run;
+            res.largest_free_run = std::max(res.largest_free_run, free_run);
+        } else {
+            free_run = 0;
+        }
+    }
+
+    for (uint32_t p = 0; p < res.dense_pages; ++p) {
+        const uint32_t p0 = p * LLAMA_KV_PAGE_PROBE_SIZE;
+        const uint32_t p1 = std::min<uint32_t>(p0 + LLAMA_KV_PAGE_PROBE_SIZE, res.used_max_p1);
+
+        bool live = false;
+        for (uint32_t i = p0; i < p1; ++i) {
+            if (!cells.is_empty(i)) {
+                live = true;
+                break;
+            }
+        }
+
+        if (live) {
+            ++res.live_pages;
+        }
+    }
 
     return res;
 }
@@ -374,6 +429,33 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    const char * LLAMA_KV_PAGE_PROBE = getenv("LLAMA_KV_PAGE_PROBE");
+    page_probe = LLAMA_KV_PAGE_PROBE ? atoi(LLAMA_KV_PAGE_PROBE) : 0;
+    if (page_probe > 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGE_PROBE = %d, page_size = %u\n", __func__, page_probe, LLAMA_KV_PAGE_PROBE_SIZE);
+    }
+
+    const char * LLAMA_KV_COMPACT_ATTN = getenv("LLAMA_KV_COMPACT_ATTN");
+    compact_attn = LLAMA_KV_COMPACT_ATTN ? atoi(LLAMA_KV_COMPACT_ATTN) : 0;
+
+    const char * LLAMA_KV_INDEXED_FATTN = getenv("LLAMA_KV_INDEXED_FATTN");
+    indexed_fattn = LLAMA_KV_INDEXED_FATTN ? atoi(LLAMA_KV_INDEXED_FATTN) : 0;
+    if (indexed_fattn > 0 && compact_attn <= 0) {
+        compact_attn = 1;
+    }
+
+    if (compact_attn > 0 && v_trans) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_COMPACT_ATTN requires non-transposed V cache; disabling compact attention\n", __func__);
+        compact_attn = 0;
+        indexed_fattn = 0;
+    }
+    if (compact_attn > 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_COMPACT_ATTN = %d, page_size = %u\n", __func__, compact_attn, LLAMA_KV_PAGE_PROBE_SIZE);
+    }
+    if (indexed_fattn > 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_INDEXED_FATTN = %d (1=auto fragmented non-f16 decode, 2=force decode)\n", __func__, indexed_fattn);
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1212,6 +1294,30 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+bool llama_kv_cache::get_use_compact_attn() const {
+    return compact_attn > 0;
+}
+
+bool llama_kv_cache::get_use_indexed_fattn() const {
+    return indexed_fattn > 0;
+}
+
+bool llama_kv_cache::get_force_indexed_fattn() const {
+    return indexed_fattn > 1;
+}
+
+bool llama_kv_cache::get_attn_is_dense(const slot_info & sinfo) const {
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+
+        if (cells.get_used() != cells.used_max_p1()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -1221,6 +1327,16 @@ ggml_type llama_kv_cache::type_v() const {
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    if (compact_attn > 0) {
+        const uint32_t result = get_n_kv_compact(sinfo);
+
+        if (page_probe > 0) {
+            page_probe_log("get_n_kv_compact", &sinfo, result);
+        }
+
+        return result;
+    }
+
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -1233,7 +1349,120 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
         result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
+    if (page_probe > 0) {
+        page_probe_log("get_n_kv", &sinfo, result);
+    }
+
     return result;
+}
+
+uint32_t llama_kv_cache::get_n_kv_compact(const slot_info & sinfo) const {
+    uint32_t result = 0;
+
+    const uint32_t n_pad_cur = std::max(n_pad, LLAMA_KV_PAGE_PROBE_SIZE);
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.get_used(), n_pad_cur))), result);
+    }
+
+    return result;
+}
+
+std::vector<uint32_t> llama_kv_cache::compact_attn_idxs(const slot_info & sinfo, uint32_t n_kv, bool invalid_pad) const {
+    const uint32_t invalid = std::numeric_limits<uint32_t>::max();
+
+    std::vector<uint32_t> res(sinfo.n_stream()*n_kv, invalid_pad ? invalid : 0);
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+
+        uint32_t n = 0;
+
+        for (uint32_t i = 0; i < cells.size() && n < n_kv; ++i) {
+            if (!cells.is_empty(i)) {
+                res[s*n_kv + n] = i;
+                ++n;
+            }
+        }
+    }
+
+    return res;
+}
+
+static void llama_kv_compact_debug_idxs(const char * tag, const std::vector<uint32_t> & idxs, uint32_t n_kv, uint32_t ns, uint32_t row_limit) {
+    uint32_t min_idx = row_limit;
+    uint32_t max_idx = 0;
+    uint32_t invalid = 0;
+    uint32_t over    = 0;
+    const uint32_t invalid_idx = std::numeric_limits<uint32_t>::max();
+
+    for (const uint32_t idx : idxs) {
+        if (idx == invalid_idx) {
+            ++invalid;
+            continue;
+        }
+        min_idx = std::min(min_idx, idx);
+        max_idx = std::max(max_idx, idx);
+        over += idx >= row_limit;
+    }
+
+    LLAMA_LOG_WARN("%s: compact-attn[%s]: n_kv=%u ns=%u row_limit=%u min_idx=%u max_idx=%u invalid=%u over=%u first=%u,%u,%u,%u\n",
+            __func__, tag, n_kv, ns, row_limit, min_idx == row_limit ? 0 : min_idx, max_idx, invalid, over,
+            idxs.size() > 0 ? idxs[0] : 0,
+            idxs.size() > 1 ? idxs[1] : 0,
+            idxs.size() > 2 ? idxs[2] : 0,
+            idxs.size() > 3 ? idxs[3] : 0);
+}
+
+void llama_kv_cache::page_probe_log(const char * tag, const slot_info * sinfo, int32_t n_kv) const {
+    if (page_probe <= 0) {
+        return;
+    }
+
+    std::set<uint32_t> streams;
+
+    if (sinfo) {
+        for (uint32_t s = 0; s < sinfo->n_stream(); ++s) {
+            streams.insert((uint32_t) sinfo->strm[s]);
+        }
+    } else {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            streams.insert(s);
+        }
+    }
+
+    for (const uint32_t stream : streams) {
+        if (stream >= v_cells.size()) {
+            continue;
+        }
+
+        const auto & cells = v_cells[stream];
+        const auto stats = llama_kv_page_probe_collect(cells);
+
+        uint32_t slot_rows = 0;
+        std::set<uint32_t> slot_pages;
+
+        if (sinfo) {
+            for (uint32_t s = 0; s < sinfo->n_stream(); ++s) {
+                if ((uint32_t) sinfo->strm[s] != stream) {
+                    continue;
+                }
+
+                slot_rows += sinfo->idxs[s].size();
+                for (const uint32_t idx : sinfo->idxs[s]) {
+                    slot_pages.insert(idx / LLAMA_KV_PAGE_PROBE_SIZE);
+                }
+            }
+        }
+
+        LLAMA_LOG_WARN(
+                "%s: kv-page-probe[%s]: stream=%u n_kv=%d size=%u used=%u used_min=%u used_max_p1=%u holes=%u live_pages=%u dense_pages=%u largest_free_run=%u head=%u slot_rows=%u slot_pages=%zu page_size=%u\n",
+                __func__, tag, stream, n_kv, stats.size, stats.used, stats.used_min, stats.used_max_p1,
+                stats.holes_below_used_max, stats.live_pages, stats.dense_pages, stats.largest_free_run,
+                stream < v_heads.size() ? v_heads[stream] : 0, slot_rows, slot_pages.size(), LLAMA_KV_PAGE_PROBE_SIZE);
+    }
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1286,6 +1515,81 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_compact(ggml_context * ctx, int32_t il, ggml_tensor * attn_idxs, const slot_info & sinfo) const {
+    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(attn_idxs);
+    GGML_ASSERT(attn_idxs->type == GGML_TYPE_I32);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * k = layers[ikv].k;
+
+    const uint64_t kv_size      = get_size();
+    const uint64_t n_embd_k_gqa = k->ne[0];
+
+    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    GGML_ASSERT(attn_idxs->ne[1] == ns);
+
+    if (compact_attn > 1) {
+        LLAMA_LOG_WARN("%s: compact-attn[k]: il=%d src_ne=%lld,%lld,%lld idx_ne=%lld,%lld sinfo_s=%u..%u\n",
+                __func__, il,
+                (long long) k->ne[0], (long long) kv_size, (long long) ns,
+                (long long) attn_idxs->ne[0], (long long) attn_idxs->ne[1],
+                sinfo.s0, sinfo.s1);
+    }
+
+    ggml_tensor * k_view = ggml_view_3d(ctx, k,
+            n_embd_k_gqa, kv_size, ns,
+            ggml_row_size(k->type, n_embd_k_gqa),
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+
+    ggml_tensor * k_rows = ggml_get_rows(ctx, k_view, attn_idxs);
+
+    return ggml_reshape_4d(ctx, k_rows,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), attn_idxs->ne[0], ns);
+}
+
+ggml_tensor * llama_kv_cache::get_v_compact(ggml_context * ctx, int32_t il, ggml_tensor * attn_idxs, const slot_info & sinfo) const {
+    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(!v_trans);
+    GGML_ASSERT(attn_idxs);
+    GGML_ASSERT(attn_idxs->type == GGML_TYPE_I32);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * v = layers[ikv].v;
+
+    const uint64_t kv_size      = get_size();
+    const uint64_t n_embd_v_gqa = v->ne[0];
+
+    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    GGML_ASSERT(attn_idxs->ne[1] == ns);
+
+    if (compact_attn > 1) {
+        LLAMA_LOG_WARN("%s: compact-attn[v]: il=%d src_ne=%lld,%lld,%lld idx_ne=%lld,%lld sinfo_s=%u..%u\n",
+                __func__, il,
+                (long long) v->ne[0], (long long) kv_size, (long long) ns,
+                (long long) attn_idxs->ne[0], (long long) attn_idxs->ne[1],
+                sinfo.s0, sinfo.s1);
+    }
+
+    ggml_tensor * v_view = ggml_view_3d(ctx, v,
+            n_embd_v_gqa, kv_size, ns,
+            ggml_row_size(v->type, n_embd_v_gqa),
+            ggml_row_size(v->type, n_embd_v_gqa*kv_size),
+            ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+
+    ggml_tensor * v_rows = ggml_get_rows(ctx, v_view, attn_idxs);
+
+    return ggml_reshape_4d(ctx, v_rows,
+            hparams.n_embd_head_v(il), hparams.n_head_kv(il), attn_idxs->ne[0], ns);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1405,6 +1709,18 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+ggml_tensor * llama_kv_cache::build_input_attn_idxs(ggml_context * ctx, uint32_t n_kv, const slot_info & sinfo) const {
+    GGML_ASSERT(compact_attn > 0);
+
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    ggml_tensor * attn_idxs = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
+    ggml_set_input(attn_idxs);
+    ggml_set_name(attn_idxs, "attn_inp_kv_idxs");
+
+    return attn_idxs;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
@@ -1495,6 +1811,28 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     }
 }
 
+void llama_kv_cache::set_input_attn_idxs(ggml_tensor * dst, const slot_info & sinfo) const {
+    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const uint32_t n_kv = dst->ne[0];
+    const uint32_t ns   = dst->ne[1];
+
+    GGML_ASSERT(ns == sinfo.s1 - sinfo.s0 + 1);
+
+    const auto idxs = compact_attn_idxs(sinfo, n_kv, false);
+
+    if (compact_attn > 1) {
+        llama_kv_compact_debug_idxs("set_input", idxs, n_kv, ns, get_size());
+    }
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        data[i] = idxs[i];
+    }
+}
+
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -1516,6 +1854,8 @@ struct args_set_input_kq_mask {
     const std::vector<llama_kv_cells> & v_cells;
     const std::vector<uint32_t>       & seq_to_stream;
 
+    const std::vector<uint32_t> * attn_idxs;
+
     uint32_t       n_swa;
     llama_swa_type swa_type;
 
@@ -1531,6 +1871,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
     const auto & v_cells       = args.v_cells;
     const auto & seq_to_stream = args.seq_to_stream;
+    const auto * attn_idxs     = args.attn_idxs;
 
     const uint32_t       n_swa    = args.n_swa;
     const llama_swa_type swa_type = args.swa_type;
@@ -1541,6 +1882,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const uint32_t invalid_idx = std::numeric_limits<uint32_t>::max();
 
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
@@ -1601,7 +1944,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
-                uint32_t j = jj;
+                uint32_t j_col = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
                 if (!alibi) {
@@ -1610,7 +1953,15 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                             break;
                         }
 
-                        j = idxs[jj];
+                        j_col = idxs[jj];
+                    }
+                }
+
+                uint32_t j = j_col;
+                if (attn_idxs) {
+                    j = (*attn_idxs)[s*n_kv + j_col];
+                    if (j == invalid_idx) {
+                        goto skip;
                     }
                 }
 
@@ -1629,7 +1980,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
                         if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(j);
+                            idxs.push_back(j_col);
                         }
                     }
                 }
@@ -1660,14 +2011,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 if (alibi) {
-                    data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                    data[idst + j_col] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
                 } else {
-                    data[idst + j] = mask_keep;
+                    data[idst + j_col] = mask_keep;
                 }
 
                 continue;
 skip:
-                data[idst + j] = mask_drop;
+                data[idst + j_col] = mask_drop;
             }
         }
     }
@@ -1712,7 +2063,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
-void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1727,11 +2078,20 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     //const int64_t t_start = ggml_time_us();
 
+    std::vector<uint32_t> attn_idxs;
+    const std::vector<uint32_t> * attn_idxs_ptr = nullptr;
+
+    if (compact_attn > 0) {
+        attn_idxs = compact_attn_idxs(sinfo, n_kv, true);
+        attn_idxs_ptr = &attn_idxs;
+    }
+
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
         /*.ubatch           =*/ ubatch,
         /*.v_cells          =*/ v_cells,
         /*.seq_to_stream    =*/ seq_to_stream,
+        /*.attn_idxs        =*/ attn_idxs_ptr,
         /*.n_swa            =*/ n_swa,
         /*.swa_type         =*/ swa_type,
         /*.n_kv             =*/ n_kv,
@@ -2563,6 +2923,22 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+bool llama_kv_cache_context::get_use_compact_attn() const {
+    return kv->get_use_compact_attn();
+}
+
+bool llama_kv_cache_context::get_use_indexed_fattn() const {
+    return kv->get_use_indexed_fattn();
+}
+
+bool llama_kv_cache_context::get_force_indexed_fattn() const {
+    return kv->get_force_indexed_fattn();
+}
+
+bool llama_kv_cache_context::get_attn_is_dense() const {
+    return kv->get_attn_is_dense(sinfos[i_cur]);
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2579,6 +2955,14 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::get_k_compact(ggml_context * ctx, int32_t il, ggml_tensor * attn_idxs) const {
+    return kv->get_k_compact(ctx, il, attn_idxs, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_compact(ggml_context * ctx, int32_t il, ggml_tensor * attn_idxs) const {
+    return kv->get_v_compact(ctx, il, attn_idxs, sinfos[i_cur]);
+}
+
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
@@ -2593,6 +2977,10 @@ ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_v_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_attn_idxs(ggml_context * ctx) const {
+    return kv->build_input_attn_idxs(ctx, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
@@ -2615,8 +3003,12 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
+void llama_kv_cache_context::set_input_attn_idxs(ggml_tensor * dst) const {
+    kv->set_input_attn_idxs(dst, sinfos[i_cur]);
+}
+
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv->set_input_kq_mask(dst, ubatch, causal_attn, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
