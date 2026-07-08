@@ -360,7 +360,7 @@ def launch_server(args: argparse.Namespace, variant: str, log_path: Path, slot_s
         "-c", str(args.ctx),
         "-np", str(args.parallel),
         "-kvu",
-        "-fa", "on",
+        "-fa", args.flash_attn,
         "-ctk", args.cache_type_k,
         "-ctv", args.cache_type_v,
         "-b", str(args.batch),
@@ -415,6 +415,7 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
         slot_save_path.mkdir(parents=True, exist_ok=True)
 
     proc = None
+    server_returncode: int | None = None
     all_results: list[RequestResult] = []
     fragmentation: dict[str, Any] = {"enabled": False}
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -441,6 +442,8 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
     finally:
         if not args.attach:
             stop_process(proc)
+            if proc is not None:
+                server_returncode = proc.returncode
             log_file = getattr(proc, "_turbo_log_file", None)
             if log_file is not None:
                 log_file.close()
@@ -461,6 +464,7 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
             "threads": args.threads,
             "cache_type_k": args.cache_type_k,
             "cache_type_v": args.cache_type_v,
+            "flash_attn": args.flash_attn,
             "waves": args.waves,
             "prompt_lens": args.prompt_lens,
             "gen_tokens": args.gen_tokens,
@@ -472,6 +476,7 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
         "request_summary": summarize_requests(all_results),
         "probe_summary": summarize_probe(probe_rows),
         "log_path": str(log_path),
+        "server_returncode": server_returncode,
         "requests": [asdict(r) for r in all_results],
     }
     return result
@@ -494,6 +499,7 @@ def main() -> int:
     parser.add_argument("--ncmoe", type=int, default=0)
     parser.add_argument("--cache-type-k", default="f16")
     parser.add_argument("--cache-type-v", default="f16")
+    parser.add_argument("--flash-attn", choices=("on", "off", "auto"), default="on")
     parser.add_argument("--waves", type=int, default=3)
     parser.add_argument("--prompt-lens", type=parse_csv_ints, default=parse_csv_ints("256,2048,8192"))
     parser.add_argument("--gen-tokens", type=int, default=96)

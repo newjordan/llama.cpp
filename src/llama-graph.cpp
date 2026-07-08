@@ -45,6 +45,10 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
+    if (!kq_mask || !mctx) {
+        return false;
+    }
+
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
@@ -506,21 +510,34 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
-
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
-  //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
-
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
-
-    const bool need_attn_idxs = mctx->get_use_compact_attn() && (!mctx->get_attn_is_dense() || mctx->get_force_indexed_fattn());
-    res &= need_attn_idxs == (self_attn_idxs != nullptr);
-    if (need_attn_idxs) {
-        res &= self_attn_idxs->ne[0] == mctx->get_n_kv();
-        res &= self_attn_idxs->ne[1] == self_kq_mask->ne[3];
+    if (!mctx || !self_k_idxs || !self_kq_mask) {
+        return false;
     }
 
-    return res;
+    if (self_k_idxs->ne[0] != params.ubatch.n_tokens) {
+        return false;
+    }
+    // TODO: move self_v_idxs shape checks to the unified cache.
+
+    if (!can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams)) {
+        return false;
+    }
+
+    const bool need_attn_idxs = mctx->get_use_compact_attn() && (!mctx->get_attn_is_dense() || mctx->get_force_indexed_fattn());
+    if (need_attn_idxs != (self_attn_idxs != nullptr)) {
+        return false;
+    }
+
+    if (need_attn_idxs) {
+        if (self_attn_idxs->ne[0] != mctx->get_n_kv()) {
+            return false;
+        }
+        if (self_attn_idxs->ne[1] != self_kq_mask->ne[3]) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
@@ -712,20 +729,35 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
-    bool res = true;
+    if (!mctx || !inp_attn || !inp_attn->self_k_idxs || !inp_attn->self_kq_mask) {
+        return false;
+    }
 
-    res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
-  //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+    if (inp_attn->self_k_idxs->ne[0] != params.ubatch.n_tokens) {
+        return false;
+    }
+    // TODO: move self_v_idxs shape checks to the unified cache.
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    if (!can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams)) {
+        return false;
+    }
 
     const bool need_attn_idxs = mctx->get_attn()->get_use_compact_attn() &&
         (!mctx->get_attn()->get_attn_is_dense() || mctx->get_attn()->get_force_indexed_fattn());
-    res &= need_attn_idxs == (inp_attn->self_attn_idxs != nullptr);
-    if (need_attn_idxs) {
-        res &= inp_attn->self_attn_idxs->ne[0] == mctx->get_attn()->get_n_kv();
-        res &= inp_attn->self_attn_idxs->ne[1] == inp_attn->self_kq_mask->ne[3];
+    if (need_attn_idxs != (inp_attn->self_attn_idxs != nullptr)) {
+        return false;
     }
+
+    if (need_attn_idxs) {
+        if (inp_attn->self_attn_idxs->ne[0] != mctx->get_attn()->get_n_kv()) {
+            return false;
+        }
+        if (inp_attn->self_attn_idxs->ne[1] != inp_attn->self_kq_mask->ne[3]) {
+            return false;
+        }
+    }
+
+    bool res = true;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 

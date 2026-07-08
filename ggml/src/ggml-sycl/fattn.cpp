@@ -204,8 +204,15 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    static const bool force_vec_kernel = []() {
+        const char * env = getenv("GGML_SYCL_FORCE_FA_VEC");
+        return env != nullptr && atoi(env) != 0;
+    }();
 
     if (kv_idxs) {
+        if (force_vec_kernel && can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
             return BEST_FATTN_KERNEL_TILE;
         }
@@ -216,6 +223,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
+        if (force_vec_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
@@ -234,15 +244,14 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
     const best_fattn_kernel kernel = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
-    // GGML_SYCL_FA_DEBUG=1: print each distinct (kernel, KV type, Q rows) dispatch once,
-    // to see which FA kernel serves decode vs prefill at a given KV length/quant.
+    // GGML_SYCL_FA_DEBUG=1: print each distinct dispatch shape once.
     static const bool fa_debug = getenv("GGML_SYCL_FA_DEBUG") != nullptr;
     if (fa_debug) {
-        static std::set<std::tuple<int, int, int64_t, bool>> seen;
+        static std::set<std::tuple<int, int, int64_t, int64_t, bool>> seen;
         const ggml_tensor * Q = dst->src[0];
         const ggml_tensor * K = dst->src[1];
         const bool indexed = dst->src[5] != nullptr;
-        if (seen.emplace((int) kernel, (int) K->type, Q->ne[1], indexed).second) {
+        if (seen.emplace((int) kernel, (int) K->type, Q->ne[1], K->ne[1], indexed).second) {
             fprintf(stderr, "[fa-debug] kernel=%s Ktype=%s Qrows=%ld KVlen=%ld head=%ld indexed=%d\n",
                     kernel == BEST_FATTN_KERNEL_VEC ? "VEC" : kernel == BEST_FATTN_KERNEL_TILE ? "TILE" : "NONE",
                     ggml_type_name(K->type), (long) Q->ne[1], (long) K->ne[1], (long) K->ne[0], indexed ? 1 : 0);
