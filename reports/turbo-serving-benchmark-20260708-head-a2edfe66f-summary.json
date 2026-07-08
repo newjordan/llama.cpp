@@ -1,0 +1,202 @@
+{
+  "generated_date": "2026-07-08",
+  "final_binary": {
+    "path": "/home/frosty40/builds/turbo-experimental-build/bin/llama-server",
+    "version": "version 61",
+    "commit": "a2edfe66f",
+    "repo_branch": "turbo-experimental",
+    "repo_status": "clean"
+  },
+  "metric": "aggregate predicted tokens per second over batch wall time",
+  "final_conclusion": {
+    "uses_head_data_only": true,
+    "statement": "On rebuilt HEAD and exact old-prompt 12-agent comparison, Turbo preserved essentially the same aggregate tok/s going from 32k ctx to 262k ctx with -kvu.",
+    "short_c32k_np12_tok_s": 178.14590511517517,
+    "long_c262k_np12_kvu_tok_s": 178.70201074044786,
+    "ratio": 1.003121630131847,
+    "short_c32k_np32_tok_s": 207.84998475247588
+  },
+  "artifacts": {
+    "old_baseline": {
+      "results": "/tmp/cd395a152-server-sweep.jsonl"
+    },
+    "head_short_c32k_oldprompt": {
+      "results": "/tmp/turbo-serving-20260708-short-c32k-head-a2edfe66f.jsonl",
+      "logs": "/tmp/turbo-serving-20260708-short-c32k-head-a2edfe66f-logs"
+    },
+    "head_long_c262k_oldprompt": {
+      "results": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-oldprompt.jsonl",
+      "logs": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-oldprompt-logs"
+    },
+    "head_long_c262k_ablate": {
+      "results": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-ablate/results.jsonl",
+      "logs": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-ablate"
+    },
+    "head_live_c262k_np12_single_oldprompt": {
+      "results": "/tmp/turbo-serving-20260708-head-live-8093-single-oldprompt.jsonl"
+    },
+    "superseded_stale_version_59": {
+      "version": "version 59",
+      "commit": "8b785c42a",
+      "results": [
+        "/tmp/turbo-serving-20260708-short-c32k-current.jsonl",
+        "/tmp/turbo-serving-20260708-short-c32k-current-np12-rerun.jsonl",
+        "/tmp/turbo-serving-20260708-long-c262k-current-oldprompt.jsonl",
+        "/tmp/turbo-serving-20260708-long-c262k-current-ablate/results.jsonl"
+      ]
+    }
+  },
+  "benchmarks": [
+    {
+      "id": "old_cd395a_c32k_np16",
+      "artifact": "/tmp/cd395a152-server-sweep.jsonl",
+      "context_tokens": 32768,
+      "parallel": 16,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "aggregate_tok_s": 200.15883668007032,
+      "mean_slot_tok_s": 14.037132398930973
+    },
+    {
+      "id": "old_cd395a_c32k_np32",
+      "artifact": "/tmp/cd395a152-server-sweep.jsonl",
+      "context_tokens": 32768,
+      "parallel": 32,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "aggregate_tok_s": 213.56110053505984,
+      "mean_slot_tok_s": 7.358903064050297
+    },
+    {
+      "id": "head_a2edfe66f_c32k_np12",
+      "artifact": "/tmp/turbo-serving-20260708-short-c32k-head-a2edfe66f.jsonl",
+      "context_tokens_requested": 32768,
+      "context_tokens_effective_total": 33792,
+      "slot_context_tokens": 2816,
+      "parallel": 12,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "aggregate_tok_s": 178.14590511517517,
+      "mean_slot_tok_s": 16.770118328306587
+    },
+    {
+      "id": "head_a2edfe66f_c32k_np16",
+      "artifact": "/tmp/turbo-serving-20260708-short-c32k-head-a2edfe66f.jsonl",
+      "context_tokens_requested": 32768,
+      "slot_context_tokens": 2048,
+      "parallel": 16,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "aggregate_tok_s": 189.55775386647895,
+      "mean_slot_tok_s": 13.300159301371988
+    },
+    {
+      "id": "head_a2edfe66f_c32k_np32",
+      "artifact": "/tmp/turbo-serving-20260708-short-c32k-head-a2edfe66f.jsonl",
+      "context_tokens_requested": 32768,
+      "slot_context_tokens": 1024,
+      "parallel": 32,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "aggregate_tok_s": 207.84998475247588,
+      "mean_slot_tok_s": 7.163220842231921
+    },
+    {
+      "id": "head_a2edfe66f_c262k_np12_kvu_oldprompt",
+      "artifact": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-oldprompt.jsonl",
+      "context_tokens": 262144,
+      "kvu": true,
+      "ubatch": 1024,
+      "parallel": 12,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "aggregate_tok_s": 178.70201074044786,
+      "mean_slot_tok_s": 16.675769880029037
+    },
+    {
+      "id": "head_a2edfe66f_live_c262k_np12_single_oldprompt",
+      "artifact": "/tmp/turbo-serving-20260708-head-live-8093-single-oldprompt.jsonl",
+      "context_tokens": 262144,
+      "kvu": true,
+      "server_parallel": 12,
+      "active_requests": 1,
+      "n_predict": 256,
+      "prompt_tokens": 34,
+      "predicted_tok_s": 79.61015900263398,
+      "prompt_tok_s": 327.7961493593514,
+      "client_wall_s": 3.367637287999969
+    },
+    {
+      "id": "head_a2edfe66f_c262k_np12_ablate_baseline",
+      "artifact": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-ablate/results.jsonl",
+      "context_tokens": 262144,
+      "parallel": 12,
+      "n_predict": 256,
+      "aggregate_tok_s": 179.7588566744086,
+      "mean_slot_tok_s": 16.558335703105662,
+      "variant": "baseline",
+      "ok_requests": 12,
+      "failed_requests": 0,
+      "fragmentation_enabled": false
+    },
+    {
+      "id": "head_a2edfe66f_c262k_np12_ablate_indexed",
+      "artifact": "/tmp/turbo-serving-20260708-long-c262k-head-a2edfe66f-ablate/results.jsonl",
+      "context_tokens": 262144,
+      "parallel": 12,
+      "n_predict": 256,
+      "aggregate_tok_s": 178.92234881662495,
+      "mean_slot_tok_s": 16.472512039609853,
+      "variant": "indexed",
+      "ok_requests": 12,
+      "failed_requests": 0,
+      "fragmentation_enabled": false,
+      "indexed_fattn_exercised": false,
+      "indexed_log_caveat": "indexed-run0.log shows Qrows=12 with indexed=0 because clean contiguous KV did not need kv_idxs."
+    }
+  ],
+  "comparisons": [
+    {
+      "id": "head_long_c262k_np12_vs_head_short_c32k_np12",
+      "numerator_id": "head_a2edfe66f_c262k_np12_kvu_oldprompt",
+      "denominator_id": "head_a2edfe66f_c32k_np12",
+      "ratio": 1.003121630131847,
+      "percent": 100.3121630131847,
+      "delta_tok_s": 0.5561056252726928
+    },
+    {
+      "id": "head_short_c32k_np16_vs_old_cd395a_np16",
+      "numerator_id": "head_a2edfe66f_c32k_np16",
+      "denominator_id": "old_cd395a_c32k_np16",
+      "ratio": 0.9470366485465944,
+      "percent": 94.70366485465944,
+      "delta_tok_s": -10.601082813591375
+    },
+    {
+      "id": "head_short_c32k_np32_vs_old_cd395a_np32",
+      "numerator_id": "head_a2edfe66f_c32k_np32",
+      "denominator_id": "old_cd395a_c32k_np32",
+      "ratio": 0.9732576964237625,
+      "percent": 97.32576964237624,
+      "delta_tok_s": -5.71111578258396
+    },
+    {
+      "id": "head_ablate_indexed_vs_baseline",
+      "numerator_id": "head_a2edfe66f_c262k_np12_ablate_indexed",
+      "denominator_id": "head_a2edfe66f_c262k_np12_ablate_baseline",
+      "ratio": 0.995346499898479,
+      "percent": 99.5346499898479,
+      "delta_tok_s": -0.8365078577836584,
+      "claim": "No indexed-FATTN speedup claim from this clean 35B run."
+    }
+  ],
+  "validation_and_caveats": [
+    "All HEAD benchmark requests completed successfully.",
+    "Run validation reported no reset, coredump, or segfault matches in journalctl -k after 2026-07-08 16:15:00.",
+    "One GPU engine reset occurred at 2026-07-08 16:05 before the rebuilt HEAD reruns and is not part of the final HEAD window.",
+    "Logs contain the common_fit_params warning from -ngl 99; it did not abort runs.",
+    "Clean 35B ablation used contiguous KV. indexed-run0.log shows Qrows=12 but indexed=0 because clean contiguous KV did not need kv_idxs.",
+    "Do not claim indexed-FATTN speedup from this clean 35B run.",
+    "Stale pre-rebuild version 59 artifacts are superseded and excluded from the final conclusion."
+  ]
+}
