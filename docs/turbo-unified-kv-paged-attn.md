@@ -12,11 +12,11 @@ Current state:
   active physical KV rows into compact K/V tensors before attention.
 - `LLAMA_KV_COMPACT_ATTN=2` additionally logs compact row bounds for debugging.
 - `LLAMA_KV_INDEXED_FATTN=1` implies compact row maps and enables an opt-in
-  SYCL vector flash-attention decode path that reads physical K/V rows directly
-  through the row map when the live rows are fragmented and K/V is not f16.
-  Dense-prefix decode bypasses both compact gather and row indexing. Fragmented
-  f16 decode keeps compact gather + TILE until there is an indexed TILE path.
-  `LLAMA_KV_INDEXED_FATTN=2` forces indexed decode for kernel smoke.
+  SYCL flash-attention decode path that reads physical K/V rows directly
+  through the row map when the live rows are fragmented. F16 K/V uses indexed
+  TILE; quantized K/V uses indexed VEC. Dense-prefix decode bypasses both
+  compact gather and row indexing. `LLAMA_KV_INDEXED_FATTN=2` forces indexed
+  decode for kernel smoke.
 - `scripts/turbo-kv-page-ablate.py` can run baseline/probe/compact/indexed
   ablations and parse KV geometry from server logs.
 
@@ -198,8 +198,8 @@ Current Turbo branch state:
 
 - Option 3 exists as `LLAMA_KV_COMPACT_ATTN=1`.
 - A narrow option 2 exists as `LLAMA_KV_INDEXED_FATTN=1`: `GGML_OP_FLASH_ATTN_EXT`
-  carries an optional I32 row-index source at `src[5]`, and the SYCL vector
-  kernel uses it for fragmented non-f16 decode K/V loads.
+  carries an optional I32 row-index source at `src[5]`, and the SYCL TILE/VEC
+  kernels use it for fragmented decode K/V loads.
   `LLAMA_KV_INDEXED_FATTN=2` force-enables the same kernel path for validation
   on f16 and dense smoke cases.
 - The row index is physical-row based, not a page table. It is a stepping stone
@@ -289,7 +289,7 @@ gather.
 Mode details:
 
 ```text
-LLAMA_KV_INDEXED_FATTN=1: auto, only fragmented non-f16 decode uses row indexing
+LLAMA_KV_INDEXED_FATTN=1: auto, only fragmented decode uses row indexing
 LLAMA_KV_INDEXED_FATTN=2: force indexed decode for kernel validation
 ```
 

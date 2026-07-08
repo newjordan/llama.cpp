@@ -454,7 +454,7 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_WARN("%s: LLAMA_KV_COMPACT_ATTN = %d, page_size = %u\n", __func__, compact_attn, LLAMA_KV_PAGE_PROBE_SIZE);
     }
     if (indexed_fattn > 0) {
-        LLAMA_LOG_WARN("%s: LLAMA_KV_INDEXED_FATTN = %d (1=auto fragmented non-f16 decode, 2=force decode)\n", __func__, indexed_fattn);
+        LLAMA_LOG_WARN("%s: LLAMA_KV_INDEXED_FATTN = %d (1=auto fragmented decode, 2=force decode)\n", __func__, indexed_fattn);
     }
 }
 

@@ -206,6 +206,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if (kv_idxs) {
+        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
         return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
     }
 

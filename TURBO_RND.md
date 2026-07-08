@@ -33,11 +33,10 @@ Status:
   tensors before attention and reuses the existing attention path. It is not a
   fused paged-attention kernel.
 - `LLAMA_KV_INDEXED_FATTN=1` implies compact row maps and, for fragmented
-  non-f16 decode only, passes those row maps into the SYCL vector
-  flash-attention kernel so K/V loads read physical cache rows directly instead
-  of materializing compact K/V first. Dense-prefix decode bypasses both compact
-  gather and row indexing. Fragmented f16 decode keeps compact gather + TILE
-  until we have an indexed TILE path. `LLAMA_KV_INDEXED_FATTN=2` forces indexed
-  decode for kernel smoke.
+  decode, passes those row maps into SYCL flash-attention so K/V loads read
+  physical cache rows directly instead of materializing compact K/V first. F16
+  K/V uses indexed TILE; quantized K/V uses indexed VEC. Dense-prefix decode
+  bypasses both compact gather and row indexing. `LLAMA_KV_INDEXED_FATTN=2`
+  forces indexed decode for kernel smoke.
 - `scripts/turbo-kv-page-ablate.py` is the ablation harness for proving whether
   the dense-prefix / fragmentation premise is real on this rig.

@@ -2375,17 +2375,12 @@ ggml_tensor * llm_graph_context::build_attn(
         const bool is_decode = q_cur->ne[2] == n_stream;
         const bool attn_is_dense = mctx_cur->get_attn_is_dense();
         const bool force_indexed_fattn = mctx_cur->get_force_indexed_fattn();
-        const bool indexed_type_ok =
-            force_indexed_fattn ||
-            mctx_cur->type_k() != GGML_TYPE_F16 ||
-            mctx_cur->type_v() != GGML_TYPE_F16;
         const bool use_indexed_fattn =
             mctx_cur->get_use_indexed_fattn() &&
             cparams.flash_attn &&
             kq_b == nullptr &&
             mctx_cur->type_k() != GGML_TYPE_F32 &&
             mctx_cur->type_v() != GGML_TYPE_F32 &&
-            indexed_type_ok &&
             (!attn_is_dense || force_indexed_fattn) &&
             is_decode;
 
