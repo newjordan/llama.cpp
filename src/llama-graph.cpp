@@ -2403,8 +2403,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kv_idxs = nullptr;
 
     if (inp->get_attn_idxs()) {
-        const int64_t n_stream = inp->get_attn_idxs()->ne[1];
-        const bool is_decode = q_cur->ne[2] == n_stream;
+        const bool is_decode = ubatch.n_tokens == ubatch.n_seqs_unq;
         const bool attn_is_dense = mctx_cur->get_attn_is_dense();
         const bool force_indexed_fattn = mctx_cur->get_force_indexed_fattn();
         const bool use_indexed_fattn =

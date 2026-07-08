@@ -197,7 +197,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         if (K->type == GGML_TYPE_F32 || V->type == GGML_TYPE_F32) {
             return BEST_FATTN_KERNEL_NONE;
         }
-        if (Q->ne[1] != 1) {
+        if (Q->ne[1] != 1 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
@@ -210,13 +210,13 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     }();
 
     if (kv_idxs) {
-        if (force_vec_kernel && can_use_vector_kernel) {
+        if (Q->ne[1] == 1 && force_vec_kernel && can_use_vector_kernel) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
             return BEST_FATTN_KERNEL_TILE;
         }
-        return can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+        return Q->ne[1] == 1 && can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
     }
 
     // Todo: Use the XMX kernel if possible:
