@@ -216,12 +216,16 @@ def prepare_fragmented_slots(args: argparse.Namespace) -> dict[str, Any]:
 
     survivor_slots = [slot_id for slot_id in range(n_slots) if slot_id not in erased_slots]
     survivor_slots = [slot_id for slot_id in survivor_slots if slot_id != 0] or survivor_slots
+    fill_cache_tokens = sum(r.prompt_tokens + r.predicted_tokens for r in fill_results if r.ok)
 
     return {
         "enabled": True,
         "n_slots": n_slots,
         "erased_slots": erased_slots,
         "survivor_slots": survivor_slots,
+        "fill_cache_tokens": fill_cache_tokens,
+        "fill_context_pressure": fill_cache_tokens / args.ctx if args.ctx else None,
+        "fill_exceeds_context": fill_cache_tokens > args.ctx,
         "fill_specs": {str(k): {"label": v[0], "prompt_tokens": v[1]} for k, v in fill_specs.items()},
         "fill_summary": summarize_requests(fill_results),
     }
