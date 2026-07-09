@@ -3,9 +3,14 @@
 ## Current State
 
 The optimized objective fast path is the current valid benchmark for
-single-agent multipass over 12 slots.
+single-agent multipass over 12 slots. It is functional for the current
+objective-core mandate: preserve deterministic accuracy gain while reducing
+wall time versus the full verifier/recombine path.
 
-Fresh passing artifact:
+It is not yet product-value proof. The suite is still small, deterministic, and
+validator-backed.
+
+Best patched benchmark artifact:
 
 ```text
 /tmp/turbo-speculative-breakout-objective-core-fast-current2/20260709T024357Z-2058197.suite.json
@@ -22,6 +27,30 @@ Result:
 - Branch fanout predicted throughput: 86.48 tok/s.
 - Verifier/recombine fallback requests in the passing run: 0.
 - Objective repairs accepted: 2.
+
+Post-push validation artifact:
+
+```text
+/tmp/turbo-speculative-breakout-objective-core-postpush/20260709T025829Z-2074949.suite.json
+```
+
+Post-push result:
+
+- Baseline: 5/11 deterministic passes.
+- Initial multipass: 9/11 deterministic passes.
+- Final multipass: 11/11 deterministic passes.
+- Objective losses: 0.
+- Mean deterministic score delta: +35.91.
+- Mean multipass-core wall time: 8.36s.
+- Mean multipass-with-baseline wall time: 10.22s.
+- Multipass-core predicted throughput: 77.72 tok/s.
+- Branch fanout predicted throughput: 81.55 tok/s.
+- Fallback verifier/recombine: 1/1 accepted, on `matrix-json`.
+
+Interpretation: the path is fully functional on the current deterministic
+suite. Runtime has some sampled variance because branch outputs vary. The
+matrix case may either repair directly or escalate to fallback; both observed
+post-fix paths ended with a valid final answer.
 
 ## What Changed
 
@@ -58,6 +87,13 @@ Focused matrix retest passed:
 /tmp/turbo-speculative-breakout-matrix-fast-current/20260709T024331Z-2057692.json
 ```
 
+The post-push full benchmark later exercised the fallback route for the same
+case and also passed:
+
+```text
+/tmp/turbo-speculative-breakout-objective-core-postpush/20260709T025829Z-2074949.task007.json
+```
+
 ## Reproduce
 
 ```bash
@@ -76,16 +112,17 @@ python3 scripts/turbo-speculative-breakout.py \
   --repair-rounds 0 \
   --objective-repair-rounds 1 \
   --objective-fast-path \
-  --out-dir /tmp/turbo-speculative-breakout-objective-core-fast-current2
+  --out-dir /tmp/turbo-speculative-breakout-objective-core-postpush
 ```
 
 ## Validation Run
 
 - `python3 -m py_compile scripts/turbo-speculative-breakout.py`
 - `python3 scripts/turbo-speculative-breakout.py --help`
-- Full 11-case objective-core benchmark above.
-- Artifact assertions: 11/11 final passes, zero losses, zero fallback
-  recombines, mean core wall under 8s.
+- Full 11-case objective-core benchmark above, run after the commit and push.
+- Artifact assertions: 11/11 final passes, zero losses, mean core wall 8.36s.
+- Earlier patched benchmark artifact remains the best observed wall-time run at
+  7.29s mean core wall with zero fallback recombines.
 - `git diff --check`
 
 ## Next Optimization Targets
