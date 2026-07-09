@@ -129,7 +129,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
-        if (idle_sleep_ms < 0) {
+        if (idle_sleep_ms < 0 || !queue_tasks_deferred.empty()) {
             return false;
         }
         int64_t now = ggml_time_ms();

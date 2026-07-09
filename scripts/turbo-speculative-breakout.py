@@ -26,6 +26,7 @@ DEFAULT_BIN = "/home/frosty40/builds/turbo-experimental-build/bin/llama-server"
 DEFAULT_MODEL = "/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf"
 DEFAULT_OUT_DIR = "/tmp/turbo-speculative-breakout"
 DEFAULT_SLOT_SAVE_PATH = "/tmp/turbo-speculative-breakout-slots"
+RESULT_SCHEMA_VERSION = 3
 DEFAULT_STOPS = [
     "</think>",
     "\n\n<task>",
@@ -265,6 +266,11 @@ class RequestResult:
     predicted_tokens: int
     prompt_tps: float | None
     predicted_tps: float | None
+    cache_tokens: int | None = None
+    tokens: list[int] | None = None
+    raw_content_sha256: str | None = None
+    content_sha256: str | None = None
+    tokens_sha256: str | None = None
     error: str | None = None
 
 
@@ -476,6 +482,8 @@ def completion(
     seed: int,
     timeout: float,
     stop: list[str] | None = None,
+    ignore_eos: bool = False,
+    use_stop_strings: bool = True,
 ) -> RequestResult:
     payload: dict[str, Any] = {
         "prompt": prompt,
@@ -485,9 +493,11 @@ def completion(
         "top_p": top_p,
         "seed": seed,
         "cache_prompt": cache_prompt,
+        "ignore_eos": ignore_eos,
         "stream": False,
+        "return_tokens": True,
     }
-    payload["stop"] = DEFAULT_STOPS if stop is None else stop
+    payload["stop"] = (DEFAULT_STOPS if stop is None else stop) if use_stop_strings else []
     if id_slot is not None:
         payload["id_slot"] = id_slot
 
@@ -495,9 +505,28 @@ def completion(
     try:
         data = http_json("POST", f"http://127.0.0.1:{port}/completion", payload, timeout=timeout)
         end = time.perf_counter()
-        timings = data.get("timings", {}) if isinstance(data, dict) else {}
-        raw_content = str(data.get("content", "") if isinstance(data, dict) else "")
+        if not isinstance(data, dict):
+            raise ValueError("completion response must be a JSON object")
+        raw_content = data.get("content")
+        tokens = data.get("tokens")
+        if not isinstance(raw_content, str):
+            raise ValueError("completion response content must be a string")
+        if not isinstance(tokens, list) or any(type(token) is not int for token in tokens):
+            raise ValueError("completion response tokens must be a list of integers")
+        if id_slot is not None and data.get("id_slot") != id_slot:
+            raise ValueError(
+                f"completion response slot mismatch: requested {id_slot}, got {data.get('id_slot')!r}"
+            )
+        timings = data.get("timings", {})
+        if not isinstance(timings, dict):
+            raise ValueError("completion response timings must be a JSON object")
+        predicted_tokens = int(timings.get("predicted_n") or 0)
+        if len(tokens) != predicted_tokens:
+            raise ValueError(
+                f"completion token count mismatch: got {len(tokens)}, timings predicted_n={predicted_tokens}"
+            )
         content = clean_content(raw_content)
+        encoded_tokens = json.dumps(tokens, separators=(",", ":")).encode("ascii")
         return RequestResult(
             ok=True,
             label=label,
@@ -508,9 +537,14 @@ def completion(
             raw_content=raw_content,
             content=content,
             prompt_tokens=int(timings.get("prompt_n") or 0),
-            predicted_tokens=int(timings.get("predicted_n") or 0),
+            predicted_tokens=predicted_tokens,
             prompt_tps=float(timings["prompt_per_second"]) if timings.get("prompt_per_second") is not None else None,
             predicted_tps=float(timings["predicted_per_second"]) if timings.get("predicted_per_second") is not None else None,
+            cache_tokens=int(timings.get("cache_n") or 0),
+            tokens=tokens,
+            raw_content_sha256=hashlib.sha256(raw_content.encode("utf-8")).hexdigest(),
+            content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            tokens_sha256=hashlib.sha256(encoded_tokens).hexdigest(),
         )
     except Exception as exc:  # noqa: BLE001
         end = time.perf_counter()
@@ -537,6 +571,50 @@ def slot_action(port: int, slot_id: int, action: str, filename: str | None = Non
         payload["filename"] = filename
     result = http_json("POST", f"http://127.0.0.1:{port}/slots/{slot_id}?action={action}", payload, timeout=timeout)
     return result if isinstance(result, dict) else {}
+
+
+def slot_fork(port: int, source_id: int, destinations: list[int], timeout: float = 300.0) -> dict[str, Any]:
+    result = http_json(
+        "POST",
+        f"http://127.0.0.1:{port}/slots/{source_id}?action=fork",
+        {"destinations": destinations},
+        timeout=timeout,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("slot fork returned a non-object response")
+    if result.get("id_slot") != source_id or result.get("destinations") != destinations:
+        raise RuntimeError("slot fork response does not match the requested source and destinations")
+    return result
+
+
+def cleanup_fork_reservations(
+    port: int,
+    slots: list[int],
+    source_id: int,
+    timeout: float,
+) -> list[str]:
+    try:
+        slot_rows = http_json("GET", f"http://127.0.0.1:{port}/slots", timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        return [f"failed to inspect fork reservations: {exc}"]
+    if not isinstance(slot_rows, list):
+        return ["slots endpoint returned a non-array response during fork cleanup"]
+
+    reserved = {
+        int(row["id"])
+        for row in slot_rows
+        if isinstance(row, dict) and row.get("is_reserved") and isinstance(row.get("id"), int)
+    }
+    cleanup_order = [slot_id for slot_id in slots if slot_id != source_id] + [source_id]
+    errors = []
+    for slot_id in cleanup_order:
+        if slot_id not in reserved:
+            continue
+        try:
+            slot_action(port, slot_id, "erase", timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"slot {slot_id}: {exc}")
+    return errors
 
 
 def stop_process(proc: subprocess.Popen[Any] | None) -> None:
@@ -583,6 +661,8 @@ def launch_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[
     ]
     if args.kvu:
         server_cmd.insert(server_cmd.index("-fa"), "-kvu")
+    if args.prefix_clone and args.prefix_clone_backend == "fork":
+        server_cmd.append("--slots")
     if args.extra_server_args:
         server_cmd.extend(shlex.split(args.extra_server_args))
 
@@ -900,6 +980,25 @@ def parse_json_output(text: str) -> Any:
     return json.loads(extract_json_text(text))
 
 
+def parse_strict_json_output(text: str) -> Any:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"nonstandard JSON constant: {value}")
+
+    return json.loads(
+        text.strip(),
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=reject_nonstandard_constant,
+    )
+
+
 def score_from_checks(checks: dict[str, bool]) -> int:
     if not checks:
         return 0
@@ -942,25 +1041,42 @@ def json_leaf_paths(value: Any, prefix: str = "root") -> dict[str, Any]:
     return {prefix: value}
 
 
+def json_exact_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            json_exact_equal(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            json_exact_equal(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    return actual == expected
+
+
 def validate_json_exact(case: dict[str, Any], text: str) -> dict[str, Any]:
     checks = {"has_expected": "expected" in case, "json_value": False, "type_match": False, "exact_match": False}
     if "expected" not in case:
         return objective_result(0, checks, ["case is missing expected"])
     expected = case["expected"]
     try:
-        data = parse_json_output(text)
+        data = parse_strict_json_output(text)
     except Exception as exc:  # noqa: BLE001
         return objective_result(0, checks, [str(exc)])
 
     checks["json_value"] = True
     checks["type_match"] = type(data) is type(expected)  # noqa: E721
-    checks["exact_match"] = data == expected
+    checks["exact_match"] = json_exact_equal(data, expected)
 
     expected_paths = json_leaf_paths(expected)
     actual_paths = json_leaf_paths(data)
     checks["no_extra_paths"] = set(actual_paths) == set(expected_paths)
     for path, expected_value in expected_paths.items():
-        checks[f"path_{check_key(path)}"] = actual_paths.get(path) == expected_value
+        checks[f"path_{check_key(path)}"] = (
+            path in actual_paths and json_exact_equal(actual_paths[path], expected_value)
+        )
     return objective_result(score_from_checks(checks), checks)
 
 
@@ -1119,6 +1235,9 @@ OBJECTIVE_CASE_VALIDATORS = {
     "lines_exact": validate_lines_exact,
 }
 
+TERMINAL_OBJECTIVE_VALIDATORS = {"json_exact", "lines_exact"}
+STRICT_JSON_VALIDATORS = {"json_exact"}
+
 
 def validate_objective(case: dict[str, Any], text: str) -> dict[str, Any]:
     validator_name = str(case.get("validator") or "")
@@ -1129,6 +1248,28 @@ def validate_objective(case: dict[str, Any], text: str) -> dict[str, Any]:
     result = case_validator(case, text) if case_validator is not None else validator(text)
     result["validator"] = validator_name
     return result
+
+
+def is_terminal_objective_pass(
+    case: dict[str, Any],
+    text: str,
+    validation: dict[str, Any] | None = None,
+) -> bool:
+    validation = validation or validate_objective(case, text)
+    if not validation.get("passed") or int(validation.get("score") or 0) != 100:
+        return False
+
+    validator_name = str(case.get("validator") or "")
+    if validator_name not in TERMINAL_OBJECTIVE_VALIDATORS:
+        return False
+
+    if validator_name in STRICT_JSON_VALIDATORS:
+        try:
+            parse_strict_json_output(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    return True
 
 
 def summarize_requests(results: list[RequestResult]) -> dict[str, Any]:
@@ -1191,13 +1332,20 @@ def summarize_suite(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 def summarize_objective_benchmarks(results: list[dict[str, Any]]) -> dict[str, Any]:
     objective_rows = [r.get("objective_benchmark") or {} for r in results]
+    escalated_rows = [
+        row
+        for result, row in zip(results, objective_rows)
+        if result.get("decision", {}).get("short_circuit_phase") is None
+    ]
+    initial_rows = [row for row in escalated_rows if row.get("initial_breakout")]
     baseline_scores = [int(row["baseline"]["score"]) for row in objective_rows if row.get("baseline")]
     initial_breakout_scores = [
         int(row["initial_breakout"]["score"])
         for row in objective_rows
         if row.get("initial_breakout")
     ]
-    breakout_scores = [int(row["breakout"]["score"]) for row in objective_rows if row.get("breakout")]
+    breakout_scores = [int(row["breakout"]["score"]) for row in escalated_rows if row.get("breakout")]
+    final_answer_scores = [int(row["breakout"]["score"]) for row in objective_rows if row.get("breakout")]
     initial_deltas = [
         int(row["initial_score_delta"])
         for row in objective_rows
@@ -1205,8 +1353,13 @@ def summarize_objective_benchmarks(results: list[dict[str, Any]]) -> dict[str, A
     ]
     deltas = [int(row["score_delta"]) for row in objective_rows if row.get("score_delta") is not None]
     baseline_passes = sum(1 for row in objective_rows if row.get("baseline", {}).get("passed"))
-    initial_breakout_passes = sum(1 for row in objective_rows if row.get("initial_breakout", {}).get("passed"))
-    breakout_passes = sum(1 for row in objective_rows if row.get("breakout", {}).get("passed"))
+    initial_baseline_passes = sum(1 for row in initial_rows if row.get("baseline", {}).get("passed"))
+    initial_breakout_passes = sum(1 for row in initial_rows if row.get("initial_breakout", {}).get("passed"))
+    breakout_passes = sum(1 for row in escalated_rows if row.get("breakout", {}).get("passed"))
+    final_answer_passes = sum(1 for row in objective_rows if row.get("breakout", {}).get("passed"))
+    baseline_short_circuits = sum(
+        1 for result in results if result.get("decision", {}).get("short_circuit_phase") == "baseline"
+    )
     wins = sum(1 for delta in deltas if delta > 0)
     ties = sum(1 for delta in deltas if delta == 0)
     losses = sum(1 for delta in deltas if delta < 0)
@@ -1220,11 +1373,17 @@ def summarize_objective_benchmarks(results: list[dict[str, Any]]) -> dict[str, A
         "tasks": len(results),
         "validated_tasks": len(deltas),
         "baseline_passes": baseline_passes,
+        "baseline_short_circuits": baseline_short_circuits,
+        "escalated_tasks": len(escalated_rows),
         "initial_breakout_passes": initial_breakout_passes,
         "breakout_passes": breakout_passes,
-        "all_breakout_passed": len(results) > 0 and breakout_passes == len(results),
-        "initial_pass_delta": initial_breakout_passes - baseline_passes,
-        "pass_delta": breakout_passes - baseline_passes,
+        "final_answer_passes": final_answer_passes,
+        "all_breakout_passed": (
+            breakout_passes == len(escalated_rows) if escalated_rows else None
+        ),
+        "all_final_answers_passed": len(results) > 0 and final_answer_passes == len(results),
+        "initial_pass_delta": initial_breakout_passes - initial_baseline_passes,
+        "pass_delta": final_answer_passes - baseline_passes,
         "wins": wins,
         "ties": ties,
         "losses": losses,
@@ -1232,6 +1391,7 @@ def summarize_objective_benchmarks(results: list[dict[str, Any]]) -> dict[str, A
         "mean_baseline_score": statistics.mean(baseline_scores) if baseline_scores else None,
         "mean_initial_breakout_score": statistics.mean(initial_breakout_scores) if initial_breakout_scores else None,
         "mean_breakout_score": statistics.mean(breakout_scores) if breakout_scores else None,
+        "mean_final_answer_score": statistics.mean(final_answer_scores) if final_answer_scores else None,
         "mean_initial_score_delta": statistics.mean(initial_deltas) if initial_deltas else None,
         "mean_score_delta": statistics.mean(deltas) if deltas else None,
         "median_score_delta": statistics.median(deltas) if deltas else None,
@@ -1280,6 +1440,8 @@ def summarize_phase(results: list[dict[str, Any]], phase: str) -> dict[str, Any]
 
 def summarize_phase_group(results: list[dict[str, Any]], phases: list[str]) -> dict[str, Any]:
     per_task_walls = []
+    escalated_task_walls = []
+    all_task_walls = []
     total_predicted = 0
     total_prompt = 0
     total_wall = 0.0
@@ -1302,9 +1464,13 @@ def summarize_phase_group(results: list[dict[str, Any]], phases: list[str]) -> d
             ok_requests += int(summary.get("ok_requests") or 0)
         if task_has_phase:
             per_task_walls.append(task_wall)
+        if result.get("decision", {}).get("short_circuit_phase") is None:
+            escalated_task_walls.append(task_wall)
+        all_task_walls.append(task_wall)
     return {
         "phases": phases,
         "tasks_with_any_phase": len(per_task_walls),
+        "escalated_tasks": len(escalated_task_walls),
         "requests": requests,
         "ok_requests": ok_requests,
         "total_prompt_tokens": total_prompt,
@@ -1312,6 +1478,10 @@ def summarize_phase_group(results: list[dict[str, Any]], phases: list[str]) -> d
         "total_wall_s": total_wall,
         "mean_task_wall_s": statistics.mean(per_task_walls) if per_task_walls else None,
         "median_task_wall_s": statistics.median(per_task_walls) if per_task_walls else None,
+        "mean_escalated_task_wall_s": statistics.mean(escalated_task_walls) if escalated_task_walls else None,
+        "median_escalated_task_wall_s": statistics.median(escalated_task_walls) if escalated_task_walls else None,
+        "mean_all_tasks_wall_s": statistics.mean(all_task_walls) if all_task_walls else None,
+        "median_all_tasks_wall_s": statistics.median(all_task_walls) if all_task_walls else None,
         "aggregate_predicted_tps": total_predicted / total_wall if total_wall else None,
         "aggregate_prompt_tps": total_prompt / total_wall if total_wall else None,
     }
@@ -1320,21 +1490,34 @@ def summarize_phase_group(results: list[dict[str, Any]], phases: list[str]) -> d
 def summarize_accuracy_and_throughput(results: list[dict[str, Any]]) -> dict[str, Any]:
     objective_summary = summarize_objective_benchmarks(results)
     tasks = max(1, len(results))
+    escalated_tasks = int(objective_summary["escalated_tasks"])
     multipass_phases = ["branches", "verifiers", "final", "objective_repairs"]
     multipass_with_baseline_phases = ["baseline", *multipass_phases]
     return {
         "accuracy": {
             "tasks": len(results),
             "baseline_pass_rate": objective_summary["baseline_passes"] / tasks,
-            "initial_multipass_pass_rate": objective_summary["initial_breakout_passes"] / tasks,
-            "final_multipass_pass_rate": objective_summary["breakout_passes"] / tasks,
+            "initial_multipass_pass_rate": (
+                objective_summary["initial_breakout_passes"] / escalated_tasks
+                if escalated_tasks
+                else None
+            ),
+            "final_multipass_pass_rate": (
+                objective_summary["breakout_passes"] / escalated_tasks
+                if escalated_tasks
+                else None
+            ),
+            "final_system_pass_rate": objective_summary["final_answer_passes"] / tasks,
             "pass_rate_delta": objective_summary["pass_delta"] / tasks,
             "wins": objective_summary["wins"],
             "ties": objective_summary["ties"],
             "losses": objective_summary["losses"],
             "mean_score_delta": objective_summary["mean_score_delta"],
-            "all_final_passed": objective_summary["all_breakout_passed"],
+            "all_multipass_passed": objective_summary["all_breakout_passed"],
+            "all_final_passed": objective_summary["all_final_answers_passed"],
             "no_objective_losses": objective_summary["no_objective_losses"],
+            "baseline_short_circuits": objective_summary["baseline_short_circuits"],
+            "escalated_tasks": escalated_tasks,
         },
         "throughput": {
             "baseline_single_pass": summarize_phase(results, "baseline"),
@@ -1345,6 +1528,172 @@ def summarize_accuracy_and_throughput(results: list[dict[str, Any]]) -> dict[str
             "multipass_core": summarize_phase_group(results, multipass_phases),
             "multipass_with_baseline": summarize_phase_group(results, multipass_with_baseline_phases),
         },
+    }
+
+
+def summarize_decisions(results: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "tasks": len(results),
+        "baseline_short_circuits": sum(
+            1 for result in results if result.get("decision", {}).get("short_circuit_phase") == "baseline"
+        ),
+        "escalated_tasks": sum(
+            1 for result in results if result.get("decision", {}).get("short_circuit_phase") is None
+        ),
+        "branches_launched": sum(
+            int(result.get("decision", {}).get("branches_launched") or 0) for result in results
+        ),
+        "fanout_waves": sum(
+            int(result.get("decision", {}).get("fanout_waves") or 0) for result in results
+        ),
+    }
+
+
+def breakout_run_config(
+    args: argparse.Namespace,
+    slots: list[int],
+    effective_verifier_mode: str,
+) -> dict[str, Any]:
+    return {
+        "port": args.port,
+        "attach": args.attach,
+        "prefix_clone": args.prefix_clone,
+        "prefix_clone_backend": args.prefix_clone_backend,
+        "branch_slots": slots,
+        "prefix_slot": args.prefix_slot,
+        "final_slot": args.final_slot,
+        "score_slot": args.score_slot,
+        "branch_tokens": args.branch_tokens,
+        "baseline_tokens": args.baseline_tokens,
+        "verify_tokens": args.verify_tokens,
+        "final_tokens": args.final_tokens,
+        "score_tokens": args.score_tokens,
+        "ignore_eos": args.ignore_eos,
+        "stop_strings": args.stop_strings,
+        "repair_rounds": args.repair_rounds,
+        "objective_repair_rounds": args.objective_repair_rounds,
+        "run_baseline": args.run_baseline,
+        "score_final": args.score_final,
+        "verifier_mode": args.verifier_mode,
+        "effective_verifier_mode": effective_verifier_mode,
+        "objective_fast_path": args.objective_fast_path,
+        "objective_baseline_short_circuit": args.objective_baseline_short_circuit,
+        "objective_fast_fallback_recombine": args.objective_fast_fallback_recombine,
+        "objective_fast_fallback_model_verifier": args.objective_fast_fallback_model_verifier,
+        "objective_fast_fallback_repair_rounds": args.objective_fast_fallback_repair_rounds,
+        "accept_score": args.accept_score,
+        "verify_prefix_chars": args.verify_prefix_chars,
+    }
+
+
+def baseline_terminal_result(
+    args: argparse.Namespace,
+    task: str,
+    out_dir: Path,
+    log_path: Path,
+    props: dict[str, Any],
+    slots: list[int],
+    objective_case: dict[str, Any],
+    baseline_result: RequestResult,
+    baseline_validation: dict[str, Any],
+) -> dict[str, Any]:
+    empty_summary = summarize_requests([])
+    objective_version = {
+        "label": "baseline-terminal",
+        "accepted": True,
+        "validation": baseline_validation,
+    }
+    objective_benchmark = {
+        "id": objective_case.get("id"),
+        "validator": objective_case.get("validator"),
+        "baseline": baseline_validation,
+        "initial_breakout": None,
+        "breakout": baseline_validation,
+        "initial_score_delta": None,
+        "score_delta": 0,
+        "initial_pass_delta": None,
+        "pass_delta": 0,
+        "objective_repair_rounds": args.objective_repair_rounds,
+        "objective_repairs_attempted": 0,
+        "objective_repairs_accepted": 0,
+        "objective_fallback_recombine_attempted": 0,
+        "objective_fallback_recombine_accepted": 0,
+        "objective_fallback_repair_attempted": 0,
+        "objective_fallback_repair_accepted": 0,
+        "versions": [objective_version],
+    }
+    request = asdict(baseline_result)
+
+    return {
+        "kind": "turbo-speculative-breakout",
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "started": args.started,
+        "task": task,
+        "config": breakout_run_config(args, slots, "objective"),
+        "server_props": props,
+        "decision": {
+            "short_circuit_phase": "baseline",
+            "decision_reason": "baseline_terminal_objective_pass",
+            "terminal_validation_surface": "cleaned_content",
+            "branches_launched": 0,
+            "fanout_waves": 0,
+        },
+        "prefix": {
+            "backend": None,
+            "result": None,
+            "clone_wall_s": None,
+            "fork": None,
+            "save": None,
+            "restore": [],
+            "clone_filename": None,
+            "cleanup_errors": [],
+        },
+        "summaries": {
+            "baseline": summarize_requests([baseline_result]),
+            "branches": empty_summary,
+            "verifiers": empty_summary,
+            "final": None,
+            "scores": None,
+            "objective_repairs": None,
+        },
+        "baseline": request,
+        "final_scores": {},
+        "final_versions": [
+            {
+                "label": "baseline-terminal",
+                "score": None,
+                "score_report": "",
+                "request": request,
+                "objective_validation": baseline_validation,
+                "accepted": True,
+            }
+        ],
+        "score_delta": None,
+        "objective_benchmark": objective_benchmark,
+        "selected": {
+            "source": "baseline",
+            "index": None,
+            "slot": args.final_slot,
+            "score": None,
+            "prefix_ok": None,
+            "objective_score": int(baseline_validation["score"]),
+            "objective_passed": True,
+            "objective_failed_checks": [],
+            "model_accepted": False,
+            "accepted": True,
+        },
+        "packets": [],
+        "requests": {
+            "baseline": request,
+            "branches": [],
+            "verifiers": [],
+            "final": None,
+            "scores": {},
+            "objective_repairs": [],
+        },
+        "final_answer": baseline_result.content,
+        "log_path": str(log_path),
+        "out_dir": str(out_dir),
     }
 
 
@@ -1369,6 +1718,8 @@ def fanout(
             top_p,
             seed,
             args.request_timeout,
+            ignore_eos=args.ignore_eos,
+            use_stop_strings=args.stop_strings,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as ex:
@@ -1410,13 +1761,43 @@ def run_breakout(
             1.0,
             args.seed + 500,
             args.request_timeout,
+            ignore_eos=args.ignore_eos,
+            use_stop_strings=args.stop_strings,
         )
         if not baseline_result.ok:
             raise RuntimeError(f"baseline generation failed: {baseline_result.error}")
 
+    baseline_gate_reason = "baseline_short_circuit_not_applicable"
+    if args.objective_fast_path and objective_case is not None and baseline_result is not None:
+        if not args.objective_baseline_short_circuit:
+            baseline_gate_reason = "baseline_short_circuit_disabled"
+        elif args.score_final:
+            baseline_gate_reason = "model_scoring_requested"
+        else:
+            baseline_validation = validate_objective(objective_case, baseline_result.content)
+            if is_terminal_objective_pass(objective_case, baseline_result.content, baseline_validation):
+                return baseline_terminal_result(
+                    args,
+                    task,
+                    out_dir,
+                    log_path,
+                    props,
+                    slots,
+                    objective_case,
+                    baseline_result,
+                    baseline_validation,
+                )
+            baseline_gate_reason = (
+                "baseline_nonterminal_output"
+                if baseline_validation.get("passed")
+                else "baseline_objective_not_passed"
+            )
+
     prefix_result: RequestResult | None = None
     save_result: dict[str, Any] | None = None
     restore_results: list[dict[str, Any]] = []
+    fork_result: dict[str, Any] | None = None
+    clone_wall_s: float | None = None
     clone_filename = f"breakout-prefix-{utc_stamp()}-{os.getpid()}.bin"
 
     if args.prefix_clone:
@@ -1432,19 +1813,37 @@ def run_breakout(
             1.0,
             args.seed,
             args.request_timeout,
+            ignore_eos=args.ignore_eos,
+            use_stop_strings=args.stop_strings,
         )
         if not prefix_result.ok:
             raise RuntimeError(f"prefix evaluation failed: {prefix_result.error}")
-        try:
-            save_result = slot_action(args.port, args.prefix_slot, "save", clone_filename, timeout=args.request_timeout)
-            for slot_id in slots:
-                if slot_id == args.prefix_slot:
-                    continue
-                restore_results.append(slot_action(args.port, slot_id, "restore", clone_filename, timeout=args.request_timeout))
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                "prefix clone failed; start the server with --slot-save-path or rerun with --no-prefix-clone"
-            ) from exc
+        destinations = [slot_id for slot_id in slots if slot_id != args.prefix_slot]
+        clone_start = time.perf_counter()
+        if args.prefix_clone_backend == "fork":
+            if destinations:
+                try:
+                    fork_result = slot_fork(
+                        args.port,
+                        args.prefix_slot,
+                        destinations,
+                        timeout=args.request_timeout,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise RuntimeError(
+                        "prefix fork failed; use a unified-KV server with slot-fork support, "
+                        "select --prefix-clone-backend file, or rerun with --no-prefix-clone"
+                    ) from exc
+        else:
+            try:
+                save_result = slot_action(args.port, args.prefix_slot, "save", clone_filename, timeout=args.request_timeout)
+                for slot_id in destinations:
+                    restore_results.append(slot_action(args.port, slot_id, "restore", clone_filename, timeout=args.request_timeout))
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "prefix clone failed; start the server with --slot-save-path or rerun with --no-prefix-clone"
+                ) from exc
+        clone_wall_s = time.perf_counter() - clone_start
 
     n_branches = len(slots)
     branch_prompts: list[tuple[str, str, int, bool, float, int, float, int, int]] = []
@@ -1464,7 +1863,9 @@ def run_breakout(
             )
         )
 
+    fanout_waves = 0
     branch_results = fanout(args, branch_prompts)
+    fanout_waves += 1
     if not any(r.ok for r in branch_results):
         raise RuntimeError(f"all branch requests failed: {summarize_requests(branch_results)['errors']}")
 
@@ -1493,6 +1894,7 @@ def run_breakout(
                 )
             )
         verifier_results = fanout(args, verifier_prompts)
+        fanout_waves += 1
 
     packets: list[dict[str, Any]] = []
     for index, (slot_id, branch) in enumerate(zip(slots, branch_results)):
@@ -1585,6 +1987,8 @@ def run_breakout(
             1.0,
             args.seed + 3000,
             args.request_timeout,
+            ignore_eos=args.ignore_eos,
+            use_stop_strings=args.stop_strings,
         )
         final_request_result = final_result
         if not final_result.ok:
@@ -1617,6 +2021,8 @@ def run_breakout(
             1.0,
             args.seed + seed_offset,
             args.request_timeout,
+            ignore_eos=args.ignore_eos,
+            use_stop_strings=args.stop_strings,
         )
         return score_result, parse_score(score_result.content) if score_result.ok else None
 
@@ -1676,6 +2082,8 @@ def run_breakout(
                 1.0,
                 args.seed + 5000 + repair_index,
                 args.request_timeout,
+                ignore_eos=args.ignore_eos,
+                use_stop_strings=args.stop_strings,
             )
             if not repair_result.ok:
                 final_versions.append(
@@ -1773,6 +2181,8 @@ def run_breakout(
                 args.seed + 6000 + suite_index * 100 + objective_repair_index,
                 args.request_timeout,
                 OBJECTIVE_REPAIR_STOPS,
+                ignore_eos=args.ignore_eos,
+                use_stop_strings=args.stop_strings,
             )
             objective_repair_results.append(repair_result)
             repair_label = f"objective-repair-{objective_repair_index}"
@@ -1864,6 +2274,7 @@ def run_breakout(
                         )
                     )
                 verifier_results = fanout(args, fallback_verifier_prompts)
+                fanout_waves += 1
                 for packet, verifier in zip(packets, verifier_results):
                     report = verifier.content if verifier.ok else f"VERIFIER FAILED: {verifier.error}"
                     packet["verifier_report"] = report
@@ -1891,6 +2302,8 @@ def run_breakout(
                 1.0,
                 args.seed + 7000 + suite_index,
                 args.request_timeout,
+                ignore_eos=args.ignore_eos,
+                use_stop_strings=args.stop_strings,
             )
             final_request_result = fallback_result
             fallback_validation = validate_objective(objective_case, fallback_result.content) if fallback_result.ok else None
@@ -1971,6 +2384,8 @@ def run_breakout(
                         args.seed + 9000 + suite_index * 100 + fallback_repair_index,
                         args.request_timeout,
                         OBJECTIVE_REPAIR_STOPS,
+                        ignore_eos=args.ignore_eos,
+                        use_stop_strings=args.stop_strings,
                     )
                     objective_repair_results.append(fallback_repair_result)
                     fallback_repair_label = f"objective-fallback-repair-{fallback_repair_index}"
@@ -2075,38 +2490,27 @@ def run_breakout(
 
     return {
         "kind": "turbo-speculative-breakout",
+        "schema_version": RESULT_SCHEMA_VERSION,
         "started": args.started,
         "task": task,
-        "config": {
-            "port": args.port,
-            "attach": args.attach,
-            "prefix_clone": args.prefix_clone,
-            "branch_slots": slots,
-            "prefix_slot": args.prefix_slot,
-            "final_slot": args.final_slot,
-            "score_slot": args.score_slot,
-            "branch_tokens": args.branch_tokens,
-            "baseline_tokens": args.baseline_tokens,
-            "verify_tokens": args.verify_tokens,
-            "final_tokens": args.final_tokens,
-            "score_tokens": args.score_tokens,
-            "repair_rounds": args.repair_rounds,
-            "objective_repair_rounds": args.objective_repair_rounds,
-            "verifier_mode": args.verifier_mode,
-            "effective_verifier_mode": effective_verifier_mode,
-            "objective_fast_path": args.objective_fast_path,
-            "objective_fast_fallback_recombine": args.objective_fast_fallback_recombine,
-            "objective_fast_fallback_model_verifier": args.objective_fast_fallback_model_verifier,
-            "objective_fast_fallback_repair_rounds": args.objective_fast_fallback_repair_rounds,
-            "accept_score": args.accept_score,
-            "verify_prefix_chars": args.verify_prefix_chars,
-        },
+        "config": breakout_run_config(args, slots, effective_verifier_mode),
         "server_props": props,
+        "decision": {
+            "short_circuit_phase": None,
+            "decision_reason": baseline_gate_reason,
+            "terminal_validation_surface": "cleaned_content",
+            "branches_launched": len(branch_results),
+            "fanout_waves": fanout_waves,
+        },
         "prefix": {
+            "backend": args.prefix_clone_backend if args.prefix_clone else None,
             "result": asdict(prefix_result) if prefix_result else None,
+            "clone_wall_s": clone_wall_s,
+            "fork": fork_result,
             "save": save_result,
             "restore": restore_results,
-            "clone_filename": clone_filename if args.prefix_clone else None,
+            "clone_filename": clone_filename if args.prefix_clone and args.prefix_clone_backend == "file" else None,
+            "cleanup_errors": [],
         },
         "summaries": {
             "baseline": summarize_requests([baseline_result]) if baseline_result else None,
@@ -2140,6 +2544,7 @@ def run_breakout(
         "score_delta": score_delta,
         "objective_benchmark": objective_benchmark,
         "selected": {
+            "source": "branch",
             "index": selected["index"],
             "slot": selected["slot"],
             "score": selected["score"],
@@ -2194,10 +2599,12 @@ def main() -> int:
     parser.add_argument("--final-slot", type=int, default=0)
     parser.add_argument("--score-slot", type=int, default=0)
     parser.add_argument("--prefix-clone", action=argparse.BooleanOptionalAction, default=True, help="Save a pure prompt prefix and restore it into all branch slots")
+    parser.add_argument("--prefix-clone-backend", choices=("file", "fork"), default="file", help="Clone the shared prefix through slot files or in-memory unified-KV sequence sharing")
     parser.add_argument("--run-baseline", action=argparse.BooleanOptionalAction, default=True, help="Generate a single-pass baseline answer before branch fanout")
     parser.add_argument("--score-final", action=argparse.BooleanOptionalAction, default=True, help="Score baseline and breakout answers with the same rubric")
     parser.add_argument("--verifier-mode", choices=("model", "objective", "none"), default="model", help="Verifier source for branch selection")
     parser.add_argument("--objective-fast-path", action=argparse.BooleanOptionalAction, default=False, help="In objective benchmark mode, use deterministic branch validation and skip recombine when possible")
+    parser.add_argument("--objective-baseline-short-circuit", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path without model scoring, return a terminal-valid baseline before branch fanout")
     parser.add_argument("--objective-fast-fallback-recombine", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path, run recombine only if direct branch/repair still fails validation")
     parser.add_argument("--objective-fast-fallback-model-verifier", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path, run model verifier fanout only before fallback recombine")
     parser.add_argument("--objective-fast-fallback-repair-rounds", type=int, default=1, help="Verifier-informed objective repair rounds after fallback recombine fails")
@@ -2206,6 +2613,8 @@ def main() -> int:
     parser.add_argument("--verify-tokens", type=int, default=192)
     parser.add_argument("--final-tokens", type=int, default=512)
     parser.add_argument("--score-tokens", type=int, default=160)
+    parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=False, help="Forward ignore_eos to every completion request for forced-length throughput measurements")
+    parser.add_argument("--stop-strings", action=argparse.BooleanOptionalAction, default=True, help="Use harness stop strings; disable with --no-stop-strings for forced-length throughput measurements")
     parser.add_argument("--repair-rounds", type=int, default=1, help="Repair the final answer if breakout does not beat the baseline score")
     parser.add_argument("--objective-repair-rounds", type=int, default=1, help="Repair benchmark answers using deterministic validator feedback")
     parser.add_argument("--score-answer-max-chars", type=int, default=6000)
@@ -2256,11 +2665,34 @@ def main() -> int:
             proc = launch_server(args, log_path)
             wait_healthy(args.port, proc, args.startup_timeout)
 
+        use_fork_backend = args.prefix_clone and args.prefix_clone_backend == "fork"
+        cleanup_slots = parse_slot_list(args.branch_slots)
+        if use_fork_backend:
+            cleanup_errors = cleanup_fork_reservations(
+                args.port,
+                cleanup_slots,
+                args.prefix_slot,
+                args.request_timeout,
+            )
+            if cleanup_errors:
+                raise RuntimeError("failed to clear stale fork reservations: " + "; ".join(cleanup_errors))
+
         results = []
         with jsonl_path.open("a", encoding="utf-8") as out:
             for index, task in enumerate(tasks):
                 case = benchmark_cases[index] if benchmark_cases else None
-                result = run_breakout(args, task, out_dir, log_path, case, index)
+                cleanup_errors = []
+                try:
+                    result = run_breakout(args, task, out_dir, log_path, case, index)
+                finally:
+                    if use_fork_backend:
+                        cleanup_errors = cleanup_fork_reservations(
+                            args.port,
+                            cleanup_slots,
+                            args.prefix_slot,
+                            args.request_timeout,
+                        )
+                result["prefix"]["cleanup_errors"] = cleanup_errors
                 result["suite_index"] = index
                 results.append(result)
                 task_json_path = out_dir / f"{run_id}.task{index:03d}.json"
@@ -2268,6 +2700,8 @@ def main() -> int:
                 task_json_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 out.write(json.dumps(result, sort_keys=True) + "\n")
                 out.flush()
+                if cleanup_errors:
+                    raise RuntimeError("failed to release fork reservations: " + "; ".join(cleanup_errors))
 
         if len(results) == 1:
             result = results[0]
@@ -2282,8 +2716,11 @@ def main() -> int:
                 model_score_summary = None
             suite = {
                 "kind": "turbo-speculative-breakout-objective-benchmark" if benchmark_cases else "turbo-speculative-breakout-suite",
+                "schema_version": RESULT_SCHEMA_VERSION,
                 "started": args.started,
                 "tasks": len(results),
+                "config": results[0].get("config") if results else None,
+                "decision_summary": summarize_decisions(results),
                 "summary": objective_summary or summarize_suite(results),
                 "accuracy_throughput_summary": accuracy_throughput_summary,
                 "model_score_summary": model_score_summary,

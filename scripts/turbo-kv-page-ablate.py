@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -22,8 +23,11 @@ from typing import Any
 
 DEFAULT_BIN = "/home/frosty40/builds/turbo-experimental-build/bin/llama-server"
 DEFAULT_MODEL = "/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf"
+RESULT_SCHEMA_VERSION = 2
 VALID_VARIANTS = {
+    "attached",
     "baseline",
+    "control",
     "probe",
     "compact",
     "compact-probe",
@@ -61,6 +65,10 @@ class RequestResult:
     predicted_tokens: int
     prompt_tps: float | None
     predicted_tps: float | None
+    content: str | None = None
+    tokens: list[int] | None = None
+    content_sha256: str | None = None
+    tokens_sha256: str | None = None
     error: str | None = None
 
 
@@ -69,6 +77,165 @@ def parse_csv_ints(value: str) -> list[int]:
     if not out:
         raise argparse.ArgumentTypeError("expected at least one integer")
     return out
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("expected an integer greater than zero")
+    return parsed
+
+
+def resolve_variants(value: str, attach: bool, fragment_slots: int) -> list[str]:
+    variants = [variant.strip() for variant in value.split(",") if variant.strip()]
+    if not variants:
+        raise ValueError("expected at least one variant")
+    if len(set(variants)) != len(variants):
+        raise ValueError("duplicate variants are not allowed")
+
+    unknown = sorted(set(variants) - VALID_VARIANTS)
+    if unknown:
+        raise ValueError(f"unknown variants: {', '.join(unknown)}")
+
+    if attach:
+        if variants != ["attached"]:
+            raise ValueError(
+                "--attach cannot perform controlled ablations; use --variants attached for one "
+                "unlabelled measurement, or let the harness launch managed variant servers"
+            )
+        if fragment_slots > 0:
+            raise ValueError("--attach cannot prepare fragmented slots because that erases live slot state")
+        return variants
+
+    if "attached" in variants:
+        raise ValueError("the attached variant requires --attach")
+    if len(variants) > 1 and "baseline" not in variants:
+        raise ValueError("multi-variant ablations require baseline")
+    if "baseline" in variants:
+        variants.remove("baseline")
+        variants.insert(0, "baseline")
+    if "control" in variants:
+        variants.remove("control")
+        variants.insert(1 if variants and variants[0] == "baseline" else 0, "control")
+    return variants
+
+
+def hash_content(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def hash_tokens(tokens: list[int]) -> str:
+    encoded = json.dumps(tokens, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compare_request_outputs(
+    reference: list[dict[str, Any]],
+    candidate: list[dict[str, Any]],
+    max_mismatches: int = 20,
+) -> dict[str, Any]:
+    mismatch_count = 0
+    exact_token_matches = 0
+    exact_content_matches = 0
+    mismatches: list[dict[str, Any]] = []
+
+    for index in range(max(len(reference), len(candidate))):
+        ref = reference[index] if index < len(reference) else None
+        cur = candidate[index] if index < len(candidate) else None
+        reasons: list[str] = []
+
+        if ref is None or cur is None:
+            reasons.append("request_count")
+        else:
+            if ref.get("label") != cur.get("label"):
+                reasons.append("label")
+            if not ref.get("ok") or not cur.get("ok"):
+                reasons.append("request_error")
+
+            ref_tokens = ref.get("tokens")
+            cur_tokens = cur.get("tokens")
+            ref_content = ref.get("content")
+            cur_content = cur.get("content")
+            if ref_tokens is None or cur_tokens is None or ref_content is None or cur_content is None:
+                reasons.append("missing_output")
+            else:
+                if ref_tokens == cur_tokens:
+                    exact_token_matches += 1
+                else:
+                    reasons.append("tokens")
+                if ref_content == cur_content:
+                    exact_content_matches += 1
+                else:
+                    reasons.append("content")
+
+        if reasons:
+            mismatch_count += 1
+            if len(mismatches) < max_mismatches:
+                mismatches.append(
+                    {
+                        "request_index": index,
+                        "reference_label": ref.get("label") if ref else None,
+                        "candidate_label": cur.get("label") if cur else None,
+                        "reasons": reasons,
+                        "reference_tokens_sha256": ref.get("tokens_sha256") if ref else None,
+                        "candidate_tokens_sha256": cur.get("tokens_sha256") if cur else None,
+                        "reference_content_sha256": ref.get("content_sha256") if ref else None,
+                        "candidate_content_sha256": cur.get("content_sha256") if cur else None,
+                    }
+                )
+
+    return {
+        "reference_requests": len(reference),
+        "candidate_requests": len(candidate),
+        "exact_token_matches": exact_token_matches,
+        "exact_content_matches": exact_content_matches,
+        "mismatch_count": mismatch_count,
+        "passed": mismatch_count == 0,
+        "mismatches": mismatches,
+    }
+
+
+def compare_output_parity(reference: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    phases = {
+        "warmup": compare_request_outputs(
+            [reference["warmup_request"]] if reference.get("warmup_request") else [],
+            [candidate["warmup_request"]] if candidate.get("warmup_request") else [],
+        ),
+        "fragment_fill": compare_request_outputs(
+            reference.get("fragmentation", {}).get("fill_requests", []),
+            candidate.get("fragmentation", {}).get("fill_requests", []),
+        ),
+        "measured": compare_request_outputs(reference.get("requests", []), candidate.get("requests", [])),
+    }
+    passed = all(phase["passed"] for phase in phases.values())
+    return {
+        "status": "matched" if passed else "mismatched",
+        "scope": "top1_sequence",
+        "reference_variant": str(reference.get("variant") or "baseline"),
+        "passed": passed,
+        "phases": phases,
+    }
+
+
+def reference_output_parity(result: dict[str, Any]) -> dict[str, Any]:
+    phases = {
+        "warmup": compare_request_outputs(
+            [result["warmup_request"]] if result.get("warmup_request") else [],
+            [result["warmup_request"]] if result.get("warmup_request") else [],
+        ),
+        "fragment_fill": compare_request_outputs(
+            result.get("fragmentation", {}).get("fill_requests", []),
+            result.get("fragmentation", {}).get("fill_requests", []),
+        ),
+        "measured": compare_request_outputs(result.get("requests", []), result.get("requests", [])),
+    }
+    return {
+        "status": "reference",
+        "scope": "top1_sequence",
+        "reference_variant": str(result.get("variant") or "baseline"),
+        "passed": all(phase["passed"] for phase in phases.values()),
+        "phases": phases,
+    }
 
 
 def http_json(method: str, url: str, payload: dict[str, Any] | None = None, timeout: float = 60.0) -> Any:
@@ -135,6 +302,7 @@ def send_completion(
         "seed": seed,
         "cache_prompt": cache_prompt,
         "stream": False,
+        "return_tokens": True,
     }
     if id_slot is not None:
         payload["id_slot"] = id_slot
@@ -143,6 +311,14 @@ def send_completion(
     try:
         data = http_json("POST", f"http://127.0.0.1:{port}/completion", payload, timeout=900.0)
         wall_s = time.perf_counter() - t0
+        if not isinstance(data, dict):
+            raise ValueError("completion response is not a JSON object")
+        content = data.get("content")
+        tokens = data.get("tokens")
+        if not isinstance(content, str):
+            raise ValueError("completion response is missing string content")
+        if not isinstance(tokens, list) or any(type(token) is not int for token in tokens):
+            raise ValueError("completion response is missing integer-list tokens")
         timings = data.get("timings", {}) if isinstance(data, dict) else {}
         return RequestResult(
             ok=True,
@@ -152,6 +328,10 @@ def send_completion(
             predicted_tokens=int(timings.get("predicted_n") or 0),
             prompt_tps=float(timings["prompt_per_second"]) if timings.get("prompt_per_second") is not None else None,
             predicted_tps=float(timings["predicted_per_second"]) if timings.get("predicted_per_second") is not None else None,
+            content=content,
+            tokens=tokens,
+            content_sha256=hash_content(content),
+            tokens_sha256=hash_tokens(tokens),
         )
     except Exception as exc:  # noqa: BLE001 - result JSON should capture request failures
         return RequestResult(
@@ -173,7 +353,14 @@ def run_wave(port: int, wave: int, concurrency: int, prompt_lens: list[int], gen
         barrier.wait()
         prompt_tokens = prompt_lens[(wave * concurrency + i) % len(prompt_lens)]
         label = f"w{wave:03d}-r{i:03d}-p{prompt_tokens}"
-        return send_completion(port, label, prompt_tokens, gen_tokens, seed=17_000 + wave * 1000 + i)
+        return send_completion(
+            port,
+            label,
+            prompt_tokens,
+            gen_tokens,
+            seed=17_000 + wave * 1000 + i,
+            id_slot=i,
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         return list(ex.map(one, range(concurrency)))
@@ -228,6 +415,7 @@ def prepare_fragmented_slots(args: argparse.Namespace) -> dict[str, Any]:
         "fill_exceeds_context": fill_cache_tokens > args.ctx,
         "fill_specs": {str(k): {"label": v[0], "prompt_tokens": v[1]} for k, v in fill_specs.items()},
         "fill_summary": summarize_requests(fill_results),
+        "fill_requests": [asdict(result) for result in fill_results],
     }
 
 
@@ -421,6 +609,7 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
     proc = None
     server_returncode: int | None = None
     all_results: list[RequestResult] = []
+    warmup_result: RequestResult | None = None
     fragmentation: dict[str, Any] = {"enabled": False}
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     try:
@@ -430,8 +619,22 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
         else:
             wait_healthy(args.port, None, args.startup_timeout)
 
+        props = http_json("GET", f"http://127.0.0.1:{args.port}/props", timeout=30.0)
+        total_slots = int(props.get("total_slots") or 0) if isinstance(props, dict) else 0
+        if total_slots and args.parallel > total_slots:
+            raise RuntimeError(
+                f"--parallel requests {args.parallel} fixed slots, but the server reports {total_slots}"
+            )
+
         if args.warmup:
-            send_completion(args.port, f"{variant}-warmup", min(args.prompt_lens), min(16, args.gen_tokens), seed=1)
+            warmup_result = send_completion(
+                args.port,
+                "warmup",
+                min(args.prompt_lens),
+                min(16, args.gen_tokens),
+                seed=1,
+                id_slot=0,
+            )
 
         if args.fragment_slots > 0:
             fragmentation = prepare_fragmented_slots(args)
@@ -455,6 +658,7 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
     probe_rows = parse_probe_log(log_path) if variant in {"probe", "compact-probe", "indexed-probe", "indexed-force-probe"} else []
     result = {
         "kind": "turbo-kv-page-ablation",
+        "schema_version": RESULT_SCHEMA_VERSION,
         "started": started,
         "variant": variant,
         "run_id": run_id,
@@ -475,8 +679,10 @@ def run_variant(args: argparse.Namespace, variant: str, run_id: int, out_dir: Pa
             "fragment_slots": args.fragment_slots,
             "fragment_prompt_lens": args.fragment_prompt_lens,
             "fragment_gen_tokens": args.fragment_gen_tokens,
+            "attach": args.attach,
         },
         "fragmentation": fragmentation,
+        "warmup_request": asdict(warmup_result) if warmup_result else None,
         "request_summary": summarize_requests(all_results),
         "probe_summary": summarize_probe(probe_rows),
         "log_path": str(log_path),
@@ -495,7 +701,7 @@ def main() -> int:
     parser.add_argument("--out-dir", default="/tmp/turbo-kv-page-ablate", help="Directory for logs and JSONL")
     parser.add_argument("--port", type=int, default=8097)
     parser.add_argument("--ctx", type=int, default=262144)
-    parser.add_argument("--parallel", type=int, default=12)
+    parser.add_argument("--parallel", type=positive_int, default=12)
     parser.add_argument("--batch", type=int, default=8192)
     parser.add_argument("--ubatch", type=int, default=1024)
     parser.add_argument("--threads", type=int, default=16)
@@ -504,49 +710,87 @@ def main() -> int:
     parser.add_argument("--cache-type-k", default="f16")
     parser.add_argument("--cache-type-v", default="f16")
     parser.add_argument("--flash-attn", choices=("on", "off", "auto"), default="on")
-    parser.add_argument("--waves", type=int, default=3)
+    parser.add_argument("--waves", type=positive_int, default=3)
     parser.add_argument("--prompt-lens", type=parse_csv_ints, default=parse_csv_ints("256,2048,8192"))
-    parser.add_argument("--gen-tokens", type=int, default=96)
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--variants", default="baseline,probe", help="Comma-separated: baseline,probe,compact,compact-probe,indexed,indexed-probe,indexed-force,indexed-force-probe")
+    parser.add_argument("--gen-tokens", type=positive_int, default=96)
+    parser.add_argument("--repeats", type=positive_int, default=3)
+    parser.add_argument("--variants", default="baseline,probe", help="Comma-separated managed variants (control repeats baseline settings), or attached with --attach")
     parser.add_argument("--fragment-slots", type=int, default=0, help="Fill this many explicit slots, erase odd slots, then measure surviving slots")
     parser.add_argument("--fragment-prompt-lens", type=parse_csv_ints, default=parse_csv_ints("128,256,384,512"), help="Prompt lengths used to prefill fragment slots")
-    parser.add_argument("--fragment-gen-tokens", type=int, default=2, help="Generation tokens used during fragment-slot prefill")
+    parser.add_argument("--fragment-gen-tokens", type=positive_int, default=2, help="Generation tokens used during fragment-slot prefill")
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wave-pause-s", type=float, default=0.25)
     parser.add_argument("--startup-timeout", type=float, default=900.0)
     parser.add_argument("--attach", action="store_true", help="Use an already-running server on --port")
+    parser.add_argument("--fail-on-output-mismatch", action=argparse.BooleanOptionalAction, default=True, help="Return nonzero when a managed variant differs from its same-run baseline")
     parser.add_argument("--source-oneapi", action=argparse.BooleanOptionalAction, default=True, help="Source oneAPI before launching llama-server")
     args = parser.parse_args()
 
-    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-    unknown = sorted(set(variants) - VALID_VARIANTS)
-    if unknown:
-        raise SystemExit(f"unknown variants: {', '.join(unknown)}")
+    try:
+        variants = resolve_variants(args.variants, args.attach, args.fragment_slots)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "results.jsonl"
 
+    parity_failed = False
+    measurement_failed = False
     with out_path.open("a", encoding="utf-8") as out:
         for run_id in range(args.repeats):
+            reference: dict[str, Any] | None = None
+            control_stable: bool | None = None
             for variant in variants:
                 print(f"run {run_id} variant {variant}", file=sys.stderr, flush=True)
                 result = run_variant(args, variant, run_id, out_dir)
+
+                if variant == "baseline":
+                    reference = result
+                    result["output_parity"] = reference_output_parity(result)
+                elif reference is None:
+                    result["output_parity"] = {
+                        "status": "not_compared",
+                        "scope": "top1_sequence",
+                        "reference_variant": None,
+                        "passed": None,
+                        "phases": {},
+                    }
+                else:
+                    result["output_parity"] = compare_output_parity(reference, result)
+
+                if variant == "control":
+                    control_stable = bool(result["output_parity"]["passed"])
+                elif reference is not None and variant != "baseline":
+                    result["output_parity"]["control_status"] = (
+                        "stable" if control_stable else "unstable"
+                    ) if control_stable is not None else "not_run"
+                    result["output_parity"]["variant_attribution_valid"] = control_stable
+
+                if result["output_parity"]["passed"] is False:
+                    parity_failed = True
+                measurement_failed = measurement_failed or bool(
+                    result.get("request_summary", {}).get("failed_requests")
+                )
+                measurement_failed = measurement_failed or bool(
+                    result.get("warmup_request") and not result["warmup_request"].get("ok")
+                )
+
                 out.write(json.dumps(result) + "\n")
                 out.flush()
                 summary = {
-                    "variant": variant,
+                    "variant": result["variant"],
                     "run_id": run_id,
                     "request_summary": result["request_summary"],
                     "probe_summary": result["probe_summary"],
+                    "output_parity": result["output_parity"],
                     "log_path": result["log_path"],
                 }
                 print(json.dumps(summary, indent=2), flush=True)
 
     print(f"results: {out_path}")
     print(f"logs: {out_dir}")
-    return 0
+    return 1 if measurement_failed or (parity_failed and args.fail_on_output_mismatch) else 0
 
 
 if __name__ == "__main__":

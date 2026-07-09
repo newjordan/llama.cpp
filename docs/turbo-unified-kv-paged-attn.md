@@ -18,7 +18,12 @@ Current state:
   compact gather and row indexing. `LLAMA_KV_INDEXED_FATTN=2` forces indexed
   decode for kernel smoke.
 - `scripts/turbo-kv-page-ablate.py` can run baseline/probe/compact/indexed
-  ablations and parse KV geometry from server logs.
+  ablations, parse KV geometry from server logs, and record exact generated
+  token sequences for same-run parity checks.
+- `POST /slots/{source}?action=fork` can share one evaluated sequence with
+  multiple reserved destination slots through existing unified-KV sequence
+  ownership metadata. This is the first server-native branch primitive; it is
+  not a page-table implementation.
 
 Not done:
 
@@ -132,7 +137,51 @@ Best use:
 - Fragmented multi-agent service.
 - Prefix reuse.
 - Long-running server where `used_max_p1()` drifts high while active pages are
-  sparse.
+sparse.
+
+## Server-Native Prefix Fork
+
+The current full-sequence API is:
+
+```http
+POST /slots/0?action=fork
+Content-Type: application/json
+
+{"destinations":[1,2,3]}
+```
+
+It returns the source, destinations, logical token count, and `fork_ms`.
+Destination IDs are strict and canonical; they do not inherit the server's
+normal modulo slot lookup. The action validates the entire list before changing
+any destination.
+
+Initial constraints:
+
+- Unified KV only.
+- Full logical sequence only.
+- No multimodal context, speculative/draft context, or LoRA adapters.
+- Source and destinations must be idle, unreserved, in range, and distinct.
+- Automatic scheduling, idle cache clearing, and KV-pressure clearing skip
+  reserved slots; explicit `id_slot` requests may use them.
+- Context shift and `n_cache_reuse` position shifts are disabled while shared.
+- `action=erase` and restore release a reservation and wake deferred work.
+- Erase and successful restore clear prompt checkpoint/data metadata; `/slots`
+  exposes `n_prompt_checkpoints` so controlled resets can prove this state is
+  empty.
+- Idle sleep is suppressed while requests are deferred behind reservations.
+- Prometheus exposes `requests_idle` and `requests_reserved`.
+
+Fork copies prompt-token metadata on the CPU but shares K/V state through
+sequence ownership. It clears inherited checkpoints, then allows each branch
+to create sequence-local checkpoints after divergence. This preserves repeated
+prefix reuse on the Qwen hybrid/recurrent memory path without restoring one
+branch's checkpoint into a sibling.
+
+The clean 35B/B70 gate passed 18/18 reset and clone contracts. Mean clone wall
+fell from 200.398 ms for file save/restore to 6.926 ms for fork, while forced
+12-way decode stayed effectively flat at 158.05 versus 158.48 predicted tok/s.
+Complete forced-flow wall improved 2.17%. See
+`reports/turbo-slot-fork-20260709.md`; this is still R&D evidence, not a rollout.
 
 ### Path B: True Paged SYCL Flash Attention
 
@@ -331,6 +380,7 @@ Required variants:
 
 ```text
 baseline: same binary, LLAMA_KV_PAGE_PROBE unset
+control:  second launch with the baseline environment, used to detect run noise
 probe:    same binary, LLAMA_KV_PAGE_PROBE=1
 compact:  same binary, LLAMA_KV_COMPACT_ATTN=1
 compact-probe: same binary, LLAMA_KV_COMPACT_ATTN=1, LLAMA_KV_PAGE_PROBE=1
@@ -359,6 +409,17 @@ waves:          at least 3
 repeats:        at least 5 for any claim
 ```
 
+Schema-v2 result rows include full generated content and token IDs, hashes,
+fragment-fill outputs, and `output_parity` against the same-run baseline. This
+is exact top-1 sequence parity, not logit or numerical parity. Non-fragmented
+waves pin request `i` to slot `i`; include `control` before candidate variants
+when making a kernel claim. A control mismatch invalidates attribution to the
+candidate even if the candidate also differs.
+
+Managed variants launch their own servers. `--attach` accepts only
+`--variants attached` and cannot prepare fragmented slots because that would
+erase state on a live service.
+
 First harness:
 
 ```bash
@@ -372,9 +433,16 @@ python3 scripts/turbo-kv-page-ablate.py \
   --ubatch 1024 \
   --waves 3 \
   --repeats 5 \
+  --variants baseline,control,probe,indexed \
   --prompt-lens 256,2048,8192 \
   --gen-tokens 96 \
   --out-dir /tmp/turbo-kv-page-ablate
+```
+
+Focused harness regression tests:
+
+```bash
+python3 tests/test_turbo_kv_page_ablate.py
 ```
 
 The probe is useful only if it shows persistent waste such as:
@@ -390,6 +458,10 @@ Acceptance bar for moving to Phase 2:
 
 - The probe overhead itself is measured by baseline vs probe and is small enough
   to trust the geometry.
+- The same-kernel control has exact top-1 sequence parity with baseline in each
+  run used for attribution.
+- Every candidate has exact top-1 sequence parity with its same-run baseline;
+  use a separate logit comparison if numerical equivalence is required.
 - Fragmentation/dense-prefix waste repeats across at least five runs.
 - The worst-case service shape is the real target shape: `np=12`, `ctx=262144`,
   `-kvu`, f16 K/V.

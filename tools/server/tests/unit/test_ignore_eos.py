@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from utils import *
 
@@ -8,6 +10,12 @@ server = ServerPreset.tinyllama2()
 def create_server():
     global server
     server = ServerPreset.tinyllama2()
+    if model_file := os.environ.get("LLAMA_SERVER_TEST_MODEL"):
+        server.model_hf_repo = None
+        server.model_file = model_file
+        server.offline = True
+    yield
+    server.stop()
 
 
 def test_ignore_eos_populates_logit_bias():
@@ -41,3 +49,26 @@ def test_ignore_eos_false_no_logit_bias():
     assert res.status_code == 200
     logit_bias = res.body["generation_settings"]["logit_bias"]
     assert len(logit_bias) == 0
+
+
+def test_explicit_empty_stop_disables_server_reverse_prompt():
+    global server
+    server.reverse_prompts = ["CLI-STOP"]
+    server.start()
+
+    inherited = server.make_request("POST", "/completion", data={
+        "n_predict": 1,
+        "prompt": "Once upon a time",
+        "temperature": 0.0,
+    })
+    assert inherited.status_code == 200
+    assert inherited.body["generation_settings"]["stop"] == ["CLI-STOP"]
+
+    disabled = server.make_request("POST", "/completion", data={
+        "n_predict": 1,
+        "prompt": "Once upon a time",
+        "stop": [],
+        "temperature": 0.0,
+    })
+    assert disabled.status_code == 200
+    assert disabled.body["generation_settings"]["stop"] == []

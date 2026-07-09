@@ -29,6 +29,7 @@
 #include <utility>
 #include <fstream>
 #include <limits>
+#include <unordered_set>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -136,7 +137,18 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // A forked prompt remains idle but is unavailable to automatic scheduling.
+    int fork_source_id = -1;
+
     server_prompt prompt;
+
+    void prompt_metadata_clear() {
+        prompt.tokens.clear();
+        prompt.data.main.clear();
+        prompt.data.drft.clear();
+        prompt.checkpoints.clear();
+        fork_source_id = -1;
+    }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -175,7 +187,7 @@ struct server_slot {
         return res;
     }
 
-    void prompt_clear(bool allow_processing) {
+    bool prompt_clear(bool allow_processing) {
         if (!allow_processing) {
             GGML_ASSERT(!is_processing());
         }
@@ -187,7 +199,9 @@ struct server_slot {
             common_context_seq_rm(ctx_dft, id, -1, -1);
         }
 
-        prompt.tokens.clear();
+        const bool was_fork_reserved = is_fork_reserved();
+        prompt_metadata_clear();
+        return was_fork_reserved;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -322,6 +336,14 @@ struct server_slot {
 
     bool is_processing() const {
         return state != SLOT_STATE_IDLE;
+    }
+
+    bool is_fork_reserved() const {
+        return fork_source_id >= 0;
+    }
+
+    bool is_available() const {
+        return !is_processing() && !is_fork_reserved();
     }
 
     bool can_speculate() const {
@@ -537,6 +559,9 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"is_reserved",   is_fork_reserved()},
+            {"fork_source_id", fork_source_id},
+            {"n_prompt_checkpoints", prompt.checkpoints.size()},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -1312,7 +1337,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (!slot.is_available()) {
                     continue;
                 }
 
@@ -1353,7 +1378,7 @@ private:
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
-                if (slot.is_processing()) {
+                if (!slot.is_available()) {
                     continue;
                 }
 
@@ -1410,7 +1435,7 @@ private:
         }
 
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (!slot.is_available()) {
                 continue;
             }
 
@@ -1993,7 +2018,7 @@ private:
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
         std::vector<server_slot *> free_slots;
         for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+            if (slot.is_available() && slot.id != exclude_id_slot) {
                 free_slots.push_back(&slot);
             }
             if (free_slots.size() >= n_slots_needed) {
@@ -2131,7 +2156,7 @@ private:
 
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
+                            if (slot.is_available()) {
                                 SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
 
                                 if (slot.prompt_save(*prompt_cache)) {
@@ -2198,12 +2223,15 @@ private:
 
                     int n_idle_slots       = 0;
                     int n_processing_slots = 0;
+                    int n_reserved_slots   = 0;
 
                     for (server_slot & slot : slots) {
                         json slot_data = slot.to_json(slots_debug == 0);
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
+                        } else if (slot.is_fork_reserved()) {
+                            n_reserved_slots++;
                         } else {
                             n_idle_slots++;
                         }
@@ -2217,6 +2245,7 @@ private:
                     res->slots_data          = std::move(slots_data);
                     res->n_idle_slots        = n_idle_slots;
                     res->n_processing_slots  = n_processing_slots;
+                    res->n_reserved_slots    = n_reserved_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->t_start             = metrics.t_start;
 
@@ -2307,12 +2336,16 @@ private:
                     size_t token_count = 0;
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        slot->prompt.tokens.clear(); // KV may already been invalidated?
+                        const bool released_fork = slot->prompt_clear(false);
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                        if (released_fork) {
+                            slot->callback_on_release(slot->id);
+                        }
                         break;
                     }
+                    const bool released_fork = slot->is_fork_reserved();
                     tokens.resize(token_count);
-                    slot->prompt.tokens.clear();
+                    slot->prompt_metadata_clear();
                     slot->prompt.tokens.insert(tokens);
 
                     const int64_t t_end = ggml_time_us();
@@ -2327,6 +2360,9 @@ private:
                     res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
+                    if (released_fork) {
+                        slot->callback_on_release(slot->id);
+                    }
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
@@ -2349,12 +2385,129 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    slot->prompt_clear(false);
+                    const bool released_fork = slot->prompt_clear(false);
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                    if (released_fork) {
+                        slot->callback_on_release(slot->id);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SLOT_FORK:
+                {
+                    if (!params_base.kv_unified) {
+                        send_error(task, "Slot fork requires a unified KV cache", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    if (ctx_dft || spec) {
+                        send_error(task, "Slot fork is not supported with speculative decoding", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!params_base.lora_adapters.empty()) {
+                        send_error(task, "Slot fork is not supported with LoRA adapters", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    const int id_slot = task.slot_action.id_slot;
+                    if (id_slot < 0 || (size_t) id_slot >= slots.size()) {
+                        send_error(task, "Invalid source slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    server_slot * source = get_slot_by_id(id_slot);
+                    GGML_ASSERT(source != nullptr);
+                    if (source->is_processing() || source->is_fork_reserved()) {
+                        send_error(task, "Source slot is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (source->prompt.tokens.empty()) {
+                        send_error(task, "Source slot has no cached prompt", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!source->lora.empty()) {
+                        send_error(task, "Slot fork is not supported with LoRA adapters", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (task.slot_action.destinations.empty()) {
+                        send_error(task, "Slot fork requires at least one destination", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    std::unordered_set<int> destination_ids;
+                    std::vector<server_slot *> destinations;
+                    destinations.reserve(task.slot_action.destinations.size());
+
+                    bool valid = true;
+                    for (const int destination_id : task.slot_action.destinations) {
+                        if (destination_id < 0 || (size_t) destination_id >= slots.size()) {
+                            send_error(task, "Invalid destination slot ID", ERROR_TYPE_INVALID_REQUEST);
+                            valid = false;
+                            break;
+                        }
+                        if (destination_id == id_slot || !destination_ids.insert(destination_id).second) {
+                            send_error(task, "Slot fork destinations must be unique and exclude the source",
+                                    ERROR_TYPE_INVALID_REQUEST);
+                            valid = false;
+                            break;
+                        }
+
+                        server_slot * destination = get_slot_by_id(destination_id);
+                        GGML_ASSERT(destination != nullptr);
+                        if (!destination->is_available()) {
+                            send_error(task, "Destination slot is unavailable", ERROR_TYPE_UNAVAILABLE);
+                            valid = false;
+                            break;
+                        }
+
+                        destinations.push_back(destination);
+                    }
+                    if (!valid) {
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+                    std::vector<server_tokens> prompt_copies;
+                    try {
+                        prompt_copies.reserve(destinations.size());
+                        for (size_t i = 0; i < destinations.size(); ++i) {
+                            prompt_copies.push_back(source->prompt.tokens.clone());
+                        }
+                    } catch (const std::exception & e) {
+                        send_error(task, std::string("Failed to clone slot prompt: ") + e.what(), ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    for (size_t i = 0; i < destinations.size(); ++i) {
+                        server_slot * destination = destinations[i];
+
+                        destination->prompt_clear(false);
+                        common_context_seq_cp(ctx_tgt, id_slot, destination->id, -1, -1);
+
+                        server_prompt prompt;
+                        prompt.tokens = std::move(prompt_copies[i]);
+                        destination->prompt = std::move(prompt);
+                        destination->task_prev.reset();
+                    }
+
+                    source->prompt.checkpoints.clear();
+                    for (server_slot * destination : destinations) {
+                        destination->fork_source_id = id_slot;
+                    }
+                    source->fork_source_id = id_slot;
+
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_slot_fork>();
+                    res->id           = task.id;
+                    res->id_slot      = id_slot;
+                    res->destinations = task.slot_action.destinations;
+                    res->n_tokens     = source->prompt.tokens.size();
+                    res->t_ms         = (t_end - t_start) / 1000.0;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -2444,7 +2597,7 @@ private:
                     GGML_ABORT("not supported by multimodal");
                 }
 
-                if (slot.task->is_parent() || slot.task->is_child()) {
+                if (slot.task->is_parent() || slot.task->is_child() || slot.is_fork_reserved()) {
                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
                     slot.release();
                     continue;
@@ -2744,7 +2897,8 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !slot.is_fork_reserved();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -4080,6 +4234,14 @@ void server_routes::init_routes() {
                     {"help",  "Number of requests processing."},
                     {"value",  (uint64_t) res_task->n_processing_slots}
             },{
+                    {"name",  "requests_idle"},
+                    {"help",  "Number of slots available for automatic requests."},
+                    {"value",  (uint64_t) res_task->n_idle_slots}
+            },{
+                    {"name",  "requests_reserved"},
+                    {"help",  "Number of idle slots reserved by shared-prefix forks."},
+                    {"value",  (uint64_t) res_task->n_reserved_slots}
+            },{
                     {"name",  "requests_deferred"},
                     {"help",  "Number of requests deferred."},
                     {"value",  (uint64_t) res_task->n_tasks_deferred}
@@ -4159,22 +4321,38 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
         int id_slot;
         try {
-            id_slot = std::stoi(id_slot_str);
+            size_t parsed = 0;
+            id_slot = std::stoi(id_slot_str, &parsed);
+            if (parsed != id_slot_str.size()) {
+                throw std::invalid_argument("trailing slot ID characters");
+            }
         } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (id_slot < 0 || id_slot >= params.n_parallel) {
             res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
 
         std::string action = req.get_param("action");
+
+        if (action == "fork") {
+            return handle_slots_fork(req, id_slot);
+        }
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
 
         if (action == "save") {
             return handle_slots_save(req, id_slot);
@@ -4182,10 +4360,6 @@ void server_routes::init_routes() {
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
         }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
-        }
-
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         return res;
     };
@@ -4864,6 +5038,65 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    std::vector<int> destinations;
+    try {
+        const json request_data = json::parse(req.body);
+        if (!request_data.is_object() ||
+                !request_data.contains("destinations") ||
+                !request_data.at("destinations").is_array()) {
+            res->error(format_error_response(
+                    "Slot fork requires a destinations array", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        for (const auto & destination : request_data.at("destinations")) {
+            if (!destination.is_number_integer()) {
+                res->error(format_error_response(
+                        "Slot fork destinations must be integers", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            destinations.push_back(destination.get<int>());
+        }
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid slot fork request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (destinations.empty()) {
+        res->error(format_error_response(
+                "Slot fork requires at least one destination", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_FORK);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.destinations = std::move(destinations);
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_fork *>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

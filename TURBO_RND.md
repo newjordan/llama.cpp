@@ -58,3 +58,13 @@ Status:
   path
   (`/tmp/turbo-speculative-breakout-objective-core-fast-current2/20260709T024357Z-2058197.suite.json`).
   This validates faster harness mechanics, not product value.
+- A queued in-memory slot-fork API now provides atomic full-sequence sharing
+  for unified KV. Forked slots are reserved from automatic scheduling, expose
+  reservation metrics, retain sequence-local post-divergence checkpoints, and
+  can be selected by `--prefix-clone-backend fork`. A controlled 35B/B70 gate
+  exposed stale prompt checkpoints surviving erase and file restore; that bug
+  is fixed and exposed as `n_prompt_checkpoints`. The clean rerun passed all 18
+  reset/clone contracts, cut mean clone wall from 200.398 ms to 6.926 ms, kept
+  forced 12-way decode flat at 158.05 versus 158.48 predicted tok/s, and reduced
+  full-flow wall by 2.17%. Branch self-controls remain non-bit-reproducible, so
+  no rollout yet; see `reports/turbo-slot-fork-20260709.md`.

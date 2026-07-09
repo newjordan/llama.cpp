@@ -464,6 +464,7 @@ By default, this value is set to `0`, meaning no tokens are kept. Use `-1` to re
 
 `stop`: Specify a JSON array of stopping strings.
 These words will not be included in the completion, so make sure to add them to the prompt for the next iteration. Default: `[]`
+An explicit empty array disables any reverse prompts configured on the server command line for that request.
 
 `typical_p`: Enable locally typical sampling with parameter p. Default: `1.0`, which is disabled.
 

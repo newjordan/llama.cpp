@@ -595,8 +595,9 @@ task_params server_task::params_from_json_cmpl(
                 }
             }
         }
-        // set reverse prompt from cli args if not set in the request
-        if (params.antiprompt.empty()) {
+        // Use CLI reverse prompts only when the request does not specify stop.
+        // An explicit empty array disables the defaults for this request.
+        if (stop == data.end()) {
             params.antiprompt = defaults.antiprompt;
         }
     }
@@ -1891,6 +1892,7 @@ json server_task_result_metrics::to_json() {
     return json {
         { "idle",                            n_idle_slots },
         { "processing",                      n_processing_slots },
+        { "reserved",                        n_reserved_slots },
         { "deferred",                        n_tasks_deferred },
         { "t_start",                         t_start },
 
@@ -1947,6 +1949,21 @@ json server_task_result_slot_erase::to_json() {
     return json {
         { "id_slot",  id_slot },
         { "n_erased", n_erased },
+    };
+}
+
+//
+// server_task_result_slot_fork
+//
+json server_task_result_slot_fork::to_json() {
+    return json {
+        { "id_slot",        id_slot },
+        { "destinations",   destinations },
+        { "n_destinations", destinations.size() },
+        { "n_tokens",       n_tokens },
+        { "timings", {
+            { "fork_ms", t_ms },
+        }},
     };
 }
 
