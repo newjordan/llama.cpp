@@ -28,6 +28,8 @@ Active experiment:
   recombine harness over 12 serving slots.
 - `docs/turbo-speculative-breakout-value-benchmark.md`: product-value benchmark
   criteria for moving beyond deterministic harness tests.
+- `reports/turbo-speculative-breakout-handoff-20260709.md`: latest handoff note
+  for the optimized objective fast-path benchmark.
 
 Status:
 
@@ -48,9 +50,11 @@ Status:
   measuring whether 12-slot branch fanout can improve one answer. It records
   verifier scores, prefix checks, deterministic objective benchmark results,
   and validator-feedback repair attempts, but the acceptance problem remains
-  open. Latest objective core run: 11 tasks, baseline 4/11 pass, breakout 11/11
-  pass, zero objective losses, one accepted objective repair, mean deterministic
-  score delta +45, branch fanout 85.88 predicted tok/s, multipass core 68.58
-  predicted tok/s
-  (`/tmp/turbo-speculative-breakout-objective-core/20260709T013917Z-1985364.suite.json`).
-  This validates harness mechanics, not product value.
+  open. Latest optimized objective core run: 11 tasks, baseline 5/11 pass,
+  breakout 11/11 pass, zero objective losses, two accepted objective repairs,
+  zero fallback recombines, mean deterministic score delta +35.91,
+  branch fanout 86.48 predicted tok/s, multipass core 82.84 predicted tok/s,
+  and mean multipass-core wall time 7.29s, down from 21.30s on the full-verifier
+  path
+  (`/tmp/turbo-speculative-breakout-objective-core-fast-current2/20260709T024357Z-2058197.suite.json`).
+  This validates faster harness mechanics, not product value.

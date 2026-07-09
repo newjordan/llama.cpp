@@ -50,8 +50,6 @@ OBJECTIVE_REPAIR_STOPS = [
     "\n\nCurrent answer:",
     "\n\nFailed checks:",
     "\n\nHint:",
-    "\n\nCorrected answer:",
-    "\n\nCorrected JSON:",
     "\n\nExplanation:",
     "\n\nNotes:",
     "\n\n<task>",
@@ -197,7 +195,7 @@ DEFAULT_BENCHMARK_SUITES["objective-core"] = [
             "anti_diag": 11,
             "diag_delta": 5,
         },
-        "repair_hint": "For columns, add vertically. The main diagonal is top-left to bottom-right; anti diagonal is top-right to bottom-left.",
+        "repair_hint": "For columns, add vertically. The main diagonal is top-left to bottom-right. For anti_diag, add the top-right cell 5, center cell 2, and bottom-left cell 4; do not reuse a row or column total.",
         "task": (
             "Return only a compact JSON object, no markdown. Matrix rows are [3,8,5], "
             "[13,2,7], [4,6,11]. Output keys exactly row_sums, col_sums, "
@@ -456,6 +454,9 @@ def clean_content(text: str) -> str:
     for marker in ("</task>", "<task>"):
         if cleaned.startswith(marker):
             cleaned = cleaned[len(marker) :].strip()
+    for label in ("Corrected answer:", "Corrected JSON:", "Answer:"):
+        if cleaned.lower().startswith(label.lower()):
+            cleaned = cleaned[len(label) :].strip()
     cut_points = [cleaned.find(marker) for marker in DEFAULT_STOPS if cleaned.find(marker) > 0]
     if cut_points:
         cleaned = cleaned[: min(cut_points)].rstrip()
@@ -789,6 +790,42 @@ def failed_checks(validation: dict[str, Any]) -> list[str]:
     return [key for key, ok in validation.get("checks", {}).items() if not ok]
 
 
+def objective_repair_feedback(case: dict[str, Any], current_answer: str, current_validation: dict[str, Any]) -> str:
+    checks = current_validation.get("checks", {})
+    if not isinstance(checks, dict):
+        return ""
+
+    lines: list[str] = []
+    if case.get("validator") == "json_exact" and "expected" in case:
+        try:
+            actual = parse_json_output(current_answer)
+        except Exception:  # noqa: BLE001
+            return ""
+        expected_paths = json_leaf_paths(case["expected"])
+        actual_paths = json_leaf_paths(actual)
+        failed_path_lines: list[str] = []
+        for path in sorted(expected_paths):
+            check_name = f"path_{check_key(path)}"
+            if checks.get(check_name) is not False:
+                continue
+            if path in actual_paths:
+                current_value = json.dumps(actual_paths[path], sort_keys=True, separators=(",", ":"))
+                failed_path_lines.append(
+                    f"- {path}: current value {current_value} failed validation; recompute it and do not repeat this value."
+                )
+            else:
+                failed_path_lines.append(f"- {path}: missing from current answer; add the recomputed value.")
+        if failed_path_lines:
+            lines.append("Failed exact JSON fields; current values below are wrong, not expected values:")
+            lines.extend(failed_path_lines)
+        if checks.get("no_extra_paths") is False:
+            extra_paths = sorted(set(actual_paths) - set(expected_paths))
+            if extra_paths:
+                lines.append(f"Remove unexpected JSON paths: {', '.join(extra_paths)}.")
+
+    return "\n".join(lines)
+
+
 def objective_repair_prompt(
     task: str,
     case: dict[str, Any],
@@ -796,12 +833,16 @@ def objective_repair_prompt(
     current_answer: str,
     baseline_validation: dict[str, Any],
     current_validation: dict[str, Any],
+    extra_context: str = "",
 ) -> str:
     hint = str(case.get("repair_hint") or "").strip()
     hint_block = f"Hint: {hint}\n" if hint else ""
+    feedback = objective_repair_feedback(case, current_answer, current_validation)
+    feedback_block = f"Repair feedback:\n{feedback}\n" if feedback else ""
     baseline_block = ""
     if baseline_answer.strip() and int(baseline_validation.get("score") or 0) > int(current_validation.get("score") or 0):
         baseline_block = f"Higher-scoring baseline: {baseline_answer}\n"
+    extra_block = f"Additional audit context:\n{extra_context.strip()}\n" if extra_context.strip() else ""
     return (
         "Fix this answer for a deterministic benchmark.\n"
         "Return only the corrected final answer in the exact format requested. No markdown, notes, or thinking tags.\n\n"
@@ -811,7 +852,9 @@ def objective_repair_prompt(
         f"Current answer: {current_answer}\n"
         f"Failed checks: {', '.join(failed_checks(current_validation)) or 'none'}\n"
         f"Validation errors: {json.dumps(current_validation.get('errors', []), sort_keys=True)}\n"
+        f"{feedback_block}"
         "Do not repeat values or structure associated with failed checks unless the task proves them correct.\n"
+        f"{extra_block}"
         f"{hint_block}\n"
         "Corrected answer:\n"
     )
@@ -1169,6 +1212,10 @@ def summarize_objective_benchmarks(results: list[dict[str, Any]]) -> dict[str, A
     losses = sum(1 for delta in deltas if delta < 0)
     repair_attempts = sum(int(row.get("objective_repairs_attempted") or 0) for row in objective_rows)
     repair_accepts = sum(int(row.get("objective_repairs_accepted") or 0) for row in objective_rows)
+    fallback_attempts = sum(int(row.get("objective_fallback_recombine_attempted") or 0) for row in objective_rows)
+    fallback_accepts = sum(int(row.get("objective_fallback_recombine_accepted") or 0) for row in objective_rows)
+    fallback_repair_attempts = sum(int(row.get("objective_fallback_repair_attempted") or 0) for row in objective_rows)
+    fallback_repair_accepts = sum(int(row.get("objective_fallback_repair_accepted") or 0) for row in objective_rows)
     return {
         "tasks": len(results),
         "validated_tasks": len(deltas),
@@ -1192,6 +1239,10 @@ def summarize_objective_benchmarks(results: list[dict[str, Any]]) -> dict[str, A
         "max_score_delta": max(deltas) if deltas else None,
         "objective_repair_attempts": repair_attempts,
         "objective_repair_accepts": repair_accepts,
+        "objective_fallback_recombine_attempts": fallback_attempts,
+        "objective_fallback_recombine_accepts": fallback_accepts,
+        "objective_fallback_repair_attempts": fallback_repair_attempts,
+        "objective_fallback_repair_accepts": fallback_repair_accepts,
         "all_positive": bool(deltas) and all(delta > 0 for delta in deltas),
         "non_negative": bool(deltas) and all(delta >= 0 for delta in deltas),
     }
@@ -1417,27 +1468,53 @@ def run_breakout(
     if not any(r.ok for r in branch_results):
         raise RuntimeError(f"all branch requests failed: {summarize_requests(branch_results)['errors']}")
 
-    verifier_prompts: list[tuple[str, str, int, bool, float, int, float, int, int]] = []
-    for index, (slot_id, branch) in enumerate(zip(slots, branch_results)):
-        candidate = branch.content if branch.ok else f"BRANCH FAILED: {branch.error}"
-        verifier_prompts.append(
-            (
-                f"verify-{index:02d}-slot-{slot_id}",
-                verifier_prompt(task, index, candidate, args.verify_prefix_chars),
-                slot_id,
-                False,
-                0.0,
-                1,
-                1.0,
-                args.seed + 2000 + index,
-                args.verify_tokens,
+    effective_verifier_mode = args.verifier_mode
+    if args.objective_fast_path and objective_case is not None:
+        effective_verifier_mode = "objective"
+    if effective_verifier_mode == "objective" and objective_case is None:
+        raise SystemExit("--verifier-mode objective requires --benchmark-suite or --benchmark-suite-file")
+
+    verifier_results: list[RequestResult] = []
+    if effective_verifier_mode == "model":
+        verifier_prompts: list[tuple[str, str, int, bool, float, int, float, int, int]] = []
+        for index, (slot_id, branch) in enumerate(zip(slots, branch_results)):
+            candidate = branch.content if branch.ok else f"BRANCH FAILED: {branch.error}"
+            verifier_prompts.append(
+                (
+                    f"verify-{index:02d}-slot-{slot_id}",
+                    verifier_prompt(task, index, candidate, args.verify_prefix_chars),
+                    slot_id,
+                    False,
+                    0.0,
+                    1,
+                    1.0,
+                    args.seed + 2000 + index,
+                    args.verify_tokens,
+                )
             )
-        )
-    verifier_results = fanout(args, verifier_prompts)
+        verifier_results = fanout(args, verifier_prompts)
 
     packets: list[dict[str, Any]] = []
-    for index, (slot_id, branch, verifier) in enumerate(zip(slots, branch_results, verifier_results)):
-        report = verifier.content if verifier.ok else f"VERIFIER FAILED: {verifier.error}"
+    for index, (slot_id, branch) in enumerate(zip(slots, branch_results)):
+        if effective_verifier_mode == "model":
+            verifier = verifier_results[index]
+            report = verifier.content if verifier.ok else f"VERIFIER FAILED: {verifier.error}"
+            verifier_ok = verifier.ok
+            verifier_error = verifier.error
+            parsed_score = parse_score(report)
+            prefix_ok = parse_prefix_ok(report)
+        elif effective_verifier_mode == "objective":
+            report = "OBJECTIVE VERIFIER: deterministic validator result is recorded in objective_validation."
+            verifier_ok = True
+            verifier_error = None
+            parsed_score = None
+            prefix_ok = None
+        else:
+            report = "VERIFIER SKIPPED"
+            verifier_ok = True
+            verifier_error = None
+            parsed_score = None
+            prefix_ok = None
         packets.append(
             {
                 "index": index,
@@ -1446,10 +1523,10 @@ def run_breakout(
                 "branch_ok": branch.ok,
                 "branch_error": branch.error,
                 "verifier_report": report,
-                "verifier_ok": verifier.ok,
-                "verifier_error": verifier.error,
-                "score": parse_score(report),
-                "prefix_ok": parse_prefix_ok(report),
+                "verifier_ok": verifier_ok,
+                "verifier_error": verifier_error,
+                "score": parsed_score,
+                "prefix_ok": prefix_ok,
             }
         )
 
@@ -1459,6 +1536,14 @@ def run_breakout(
             packet["objective_validation"] = objective_validation
             packet["objective_score"] = int(objective_validation["score"])
             packet["objective_passed"] = bool(objective_validation["passed"])
+            if effective_verifier_mode == "objective":
+                packet["score"] = int(objective_validation["score"])
+                packet["prefix_ok"] = bool(objective_validation["passed"])
+                packet["verifier_report"] = (
+                    f"objective_score: {objective_validation['score']}, "
+                    f"objective_passed: {objective_validation['passed']}, "
+                    f"failed_checks: {failed_checks(objective_validation)}"
+                )
 
     def packet_key(packet: dict[str, Any]) -> tuple[int, int, int, int, int]:
         if objective_case is not None:
@@ -1473,36 +1558,44 @@ def run_breakout(
         return (objective_pass_bonus, objective_score, score, prefix_bonus, branch_bonus)
 
     selected = max(packets, key=packet_key)
-    final_prompt = recombine_prompt(
-        task,
-        packets,
-        args.accept_score,
-        args.candidate_max_chars,
-        args.verifier_max_chars,
-        baseline_result.content if baseline_result else None,
-    )
-    final_result = completion(
-        args.port,
-        "recombine-final",
-        final_prompt,
-        args.final_tokens,
-        args.final_slot,
-        False,
-        0.0,
-        1,
-        1.0,
-        args.seed + 3000,
-        args.request_timeout,
-    )
-    if not final_result.ok:
-        raise RuntimeError(f"final recombine failed: {final_result.error}")
+    selected_branch_result = branch_results[int(selected["index"])]
+    final_request_result: RequestResult | None = None
+    final_version_label = "initial"
+    if args.objective_fast_path and objective_case is not None and selected_branch_result.ok:
+        final_result = selected_branch_result
+        final_version_label = "objective-fast-selected" if selected.get("objective_passed") else "objective-fast-repair-seed"
+    else:
+        final_prompt = recombine_prompt(
+            task,
+            packets,
+            args.accept_score,
+            args.candidate_max_chars,
+            args.verifier_max_chars,
+            baseline_result.content if baseline_result else None,
+        )
+        final_result = completion(
+            args.port,
+            "recombine-final",
+            final_prompt,
+            args.final_tokens,
+            args.final_slot,
+            False,
+            0.0,
+            1,
+            1.0,
+            args.seed + 3000,
+            args.request_timeout,
+        )
+        final_request_result = final_result
+        if not final_result.ok:
+            raise RuntimeError(f"final recombine failed: {final_result.error}")
 
     score_results: dict[str, RequestResult] = {}
     parsed_scores: dict[str, int | None] = {}
     score_delta: int | None = None
     final_versions: list[dict[str, Any]] = [
         {
-            "label": "initial",
+            "label": final_version_label,
             "result": final_result,
             "score": None,
             "score_report": "",
@@ -1747,6 +1840,197 @@ def run_breakout(
             if not accepted:
                 break
 
+        if (
+            args.objective_fast_path
+            and args.objective_fast_fallback_recombine
+            and final_request_result is None
+            and not current_validation.get("passed")
+        ):
+            if args.objective_fast_fallback_model_verifier and not verifier_results:
+                fallback_verifier_prompts: list[tuple[str, str, int, bool, float, int, float, int, int]] = []
+                for index, (slot_id, branch) in enumerate(zip(slots, branch_results)):
+                    candidate = branch.content if branch.ok else f"BRANCH FAILED: {branch.error}"
+                    fallback_verifier_prompts.append(
+                        (
+                            f"fallback-verify-{index:02d}-slot-{slot_id}",
+                            verifier_prompt(task, index, candidate, args.verify_prefix_chars),
+                            slot_id,
+                            False,
+                            0.0,
+                            1,
+                            1.0,
+                            args.seed + 8000 + suite_index * 100 + index,
+                            args.verify_tokens,
+                        )
+                    )
+                verifier_results = fanout(args, fallback_verifier_prompts)
+                for packet, verifier in zip(packets, verifier_results):
+                    report = verifier.content if verifier.ok else f"VERIFIER FAILED: {verifier.error}"
+                    packet["verifier_report"] = report
+                    packet["verifier_ok"] = verifier.ok
+                    packet["verifier_error"] = verifier.error
+                    packet["score"] = parse_score(report)
+                    packet["prefix_ok"] = parse_prefix_ok(report)
+
+            fallback_result = completion(
+                args.port,
+                "objective-fallback-recombine",
+                recombine_prompt(
+                    task,
+                    packets,
+                    args.accept_score,
+                    args.candidate_max_chars,
+                    args.verifier_max_chars,
+                    baseline_result.content if baseline_result else None,
+                ),
+                args.final_tokens,
+                args.final_slot,
+                False,
+                0.0,
+                1,
+                1.0,
+                args.seed + 7000 + suite_index,
+                args.request_timeout,
+            )
+            final_request_result = fallback_result
+            fallback_validation = validate_objective(objective_case, fallback_result.content) if fallback_result.ok else None
+            fallback_accepted = (
+                fallback_validation is not None
+                and int(fallback_validation["score"]) > int(current_validation["score"])
+            )
+            objective_versions.append(
+                {
+                    "label": "objective-fallback-recombine",
+                    "accepted": fallback_accepted,
+                    "validation": fallback_validation,
+                    "error": fallback_result.error,
+                }
+            )
+            final_versions.append(
+                {
+                    "label": "objective-fallback-recombine",
+                    "result": fallback_result,
+                    "score": None,
+                    "score_report": "",
+                    "objective_validation": fallback_validation,
+                    "accepted": fallback_accepted,
+                }
+            )
+            if fallback_accepted and fallback_validation is not None:
+                final_result = fallback_result
+                current_validation = fallback_validation
+                if args.score_final:
+                    score_results["objective-fallback-recombine"], parsed_scores["objective-fallback-recombine"] = run_score(
+                        "objective-fallback-recombine",
+                        final_result.content,
+                        4300 + suite_index,
+                    )
+                    fallback_model_score = parsed_scores.get("objective-fallback-recombine")
+                    if fallback_model_score is not None:
+                        parsed_scores["breakout"] = fallback_model_score
+                        score_results["breakout"] = score_results["objective-fallback-recombine"]
+                        baseline_score = parsed_scores.get("baseline")
+                        if baseline_score is not None:
+                            score_delta = int(fallback_model_score) - int(baseline_score)
+
+            if (
+                fallback_validation is not None
+                and not current_validation.get("passed")
+                and args.objective_fast_fallback_repair_rounds > 0
+                and verifier_results
+            ):
+                fallback_repair_answer = final_result.content if fallback_accepted else fallback_result.content
+                fallback_repair_validation_seed = current_validation if fallback_accepted else fallback_validation
+                verifier_context = "\n".join(
+                    (
+                        f"branch {packet['index']} verifier: "
+                        f"{str(packet.get('verifier_report') or '')[:args.verifier_max_chars]}"
+                    )
+                    for packet in packets
+                    if packet.get("verifier_report")
+                )
+                for fallback_repair_index in range(args.objective_fast_fallback_repair_rounds):
+                    fallback_repair_result = completion(
+                        args.port,
+                        f"objective-fallback-repair-{fallback_repair_index}",
+                        objective_repair_prompt(
+                            task,
+                            objective_case,
+                            baseline_text,
+                            fallback_repair_answer,
+                            baseline_validation,
+                            fallback_repair_validation_seed,
+                            verifier_context,
+                        ),
+                        args.final_tokens,
+                        args.final_slot,
+                        False,
+                        0.0,
+                        1,
+                        1.0,
+                        args.seed + 9000 + suite_index * 100 + fallback_repair_index,
+                        args.request_timeout,
+                        OBJECTIVE_REPAIR_STOPS,
+                    )
+                    objective_repair_results.append(fallback_repair_result)
+                    fallback_repair_label = f"objective-fallback-repair-{fallback_repair_index}"
+                    if not fallback_repair_result.ok:
+                        objective_versions.append(
+                            {
+                                "label": fallback_repair_label,
+                                "accepted": False,
+                                "validation": None,
+                                "error": fallback_repair_result.error,
+                            }
+                        )
+                        final_versions.append(
+                            {
+                                "label": fallback_repair_label,
+                                "result": fallback_repair_result,
+                                "score": None,
+                                "score_report": "",
+                                "objective_validation": None,
+                                "accepted": False,
+                            }
+                        )
+                        break
+                    fallback_repair_validation = validate_objective(objective_case, fallback_repair_result.content)
+                    fallback_repair_accepted = int(fallback_repair_validation["score"]) > int(current_validation["score"])
+                    objective_versions.append(
+                        {
+                            "label": fallback_repair_label,
+                            "accepted": fallback_repair_accepted,
+                            "validation": fallback_repair_validation,
+                        }
+                    )
+                    final_versions.append(
+                        {
+                            "label": fallback_repair_label,
+                            "result": fallback_repair_result,
+                            "score": None,
+                            "score_report": "",
+                            "objective_validation": fallback_repair_validation,
+                            "accepted": fallback_repair_accepted,
+                        }
+                    )
+                    if fallback_repair_accepted:
+                        final_result = fallback_repair_result
+                        current_validation = fallback_repair_validation
+                        if args.score_final:
+                            score_results[fallback_repair_label], parsed_scores[fallback_repair_label] = run_score(
+                                fallback_repair_label,
+                                final_result.content,
+                                4400 + suite_index * 100 + fallback_repair_index,
+                            )
+                            fallback_repair_model_score = parsed_scores.get(fallback_repair_label)
+                            if fallback_repair_model_score is not None:
+                                parsed_scores["breakout"] = fallback_repair_model_score
+                                score_results["breakout"] = score_results[fallback_repair_label]
+                                baseline_score = parsed_scores.get("baseline")
+                                if baseline_score is not None:
+                                    score_delta = int(fallback_repair_model_score) - int(baseline_score)
+                        break
+
         objective_benchmark = {
             "id": objective_case.get("id"),
             "validator": objective_case.get("validator"),
@@ -1758,11 +2042,33 @@ def run_breakout(
             "initial_pass_delta": int(bool(initial_breakout_validation["passed"])) - int(bool(baseline_validation["passed"])),
             "pass_delta": int(bool(current_validation["passed"])) - int(bool(baseline_validation["passed"])),
             "objective_repair_rounds": args.objective_repair_rounds,
-            "objective_repairs_attempted": len(objective_repair_results),
+            "objective_repairs_attempted": sum(
+                1
+                for version in objective_versions
+                if str(version.get("label", "")).startswith("objective-repair-")
+            ),
             "objective_repairs_accepted": sum(
                 1
                 for version in objective_versions
                 if str(version.get("label", "")).startswith("objective-repair-") and version.get("accepted")
+            ),
+            "objective_fallback_recombine_attempted": sum(
+                1 for version in objective_versions if version.get("label") == "objective-fallback-recombine"
+            ),
+            "objective_fallback_recombine_accepted": sum(
+                1
+                for version in objective_versions
+                if version.get("label") == "objective-fallback-recombine" and version.get("accepted")
+            ),
+            "objective_fallback_repair_attempted": sum(
+                1
+                for version in objective_versions
+                if str(version.get("label", "")).startswith("objective-fallback-repair-")
+            ),
+            "objective_fallback_repair_accepted": sum(
+                1
+                for version in objective_versions
+                if str(version.get("label", "")).startswith("objective-fallback-repair-") and version.get("accepted")
             ),
             "versions": objective_versions,
         }
@@ -1786,6 +2092,12 @@ def run_breakout(
             "score_tokens": args.score_tokens,
             "repair_rounds": args.repair_rounds,
             "objective_repair_rounds": args.objective_repair_rounds,
+            "verifier_mode": args.verifier_mode,
+            "effective_verifier_mode": effective_verifier_mode,
+            "objective_fast_path": args.objective_fast_path,
+            "objective_fast_fallback_recombine": args.objective_fast_fallback_recombine,
+            "objective_fast_fallback_model_verifier": args.objective_fast_fallback_model_verifier,
+            "objective_fast_fallback_repair_rounds": args.objective_fast_fallback_repair_rounds,
             "accept_score": args.accept_score,
             "verify_prefix_chars": args.verify_prefix_chars,
         },
@@ -1800,7 +2112,7 @@ def run_breakout(
             "baseline": summarize_requests([baseline_result]) if baseline_result else None,
             "branches": summarize_requests(branch_results),
             "verifiers": summarize_requests(verifier_results),
-            "final": summarize_requests([final_result]),
+            "final": summarize_requests([final_request_result]) if final_request_result else None,
             "scores": summarize_requests(list(score_results.values())) if score_results else None,
             "objective_repairs": summarize_requests(objective_repair_results) if objective_repair_results else None,
         },
@@ -1851,7 +2163,7 @@ def run_breakout(
             "baseline": asdict(baseline_result) if baseline_result else None,
             "branches": [asdict(r) for r in branch_results],
             "verifiers": [asdict(r) for r in verifier_results],
-            "final": asdict(final_result),
+            "final": asdict(final_request_result) if final_request_result else None,
             "scores": {label: asdict(result) for label, result in score_results.items()},
             "objective_repairs": [asdict(result) for result in objective_repair_results],
         },
@@ -1884,6 +2196,11 @@ def main() -> int:
     parser.add_argument("--prefix-clone", action=argparse.BooleanOptionalAction, default=True, help="Save a pure prompt prefix and restore it into all branch slots")
     parser.add_argument("--run-baseline", action=argparse.BooleanOptionalAction, default=True, help="Generate a single-pass baseline answer before branch fanout")
     parser.add_argument("--score-final", action=argparse.BooleanOptionalAction, default=True, help="Score baseline and breakout answers with the same rubric")
+    parser.add_argument("--verifier-mode", choices=("model", "objective", "none"), default="model", help="Verifier source for branch selection")
+    parser.add_argument("--objective-fast-path", action=argparse.BooleanOptionalAction, default=False, help="In objective benchmark mode, use deterministic branch validation and skip recombine when possible")
+    parser.add_argument("--objective-fast-fallback-recombine", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path, run recombine only if direct branch/repair still fails validation")
+    parser.add_argument("--objective-fast-fallback-model-verifier", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path, run model verifier fanout only before fallback recombine")
+    parser.add_argument("--objective-fast-fallback-repair-rounds", type=int, default=1, help="Verifier-informed objective repair rounds after fallback recombine fails")
     parser.add_argument("--baseline-tokens", type=int, default=512)
     parser.add_argument("--branch-tokens", type=int, default=384)
     parser.add_argument("--verify-tokens", type=int, default=192)

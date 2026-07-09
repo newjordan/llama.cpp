@@ -42,6 +42,9 @@ The script uses multi-slot serving throughput to work on one user task:
 11. In objective benchmark mode, validate each branch before recombination and
     prefer validator-passing branches over branches that only have high model
     verifier scores.
+12. With `--objective-fast-path`, skip model verifier and recombination when a
+    deterministic branch passes, then escalate to verifier plus recombine only
+    for unresolved validator failures.
 
 The result JSON records branch outputs, verifier reports, parsed scores,
 `prefix_ok` decisions, selected branch metadata, timings, the final answer,
@@ -94,7 +97,8 @@ python3 scripts/turbo-speculative-breakout.py \
   --no-prefix-clone \
   --benchmark-suite objective-core \
   --branch-slots 0-11 \
-  --no-score-final
+  --no-score-final \
+  --objective-fast-path
 ```
 
 Custom objective suites can be supplied as JSON or JSONL:
@@ -151,15 +155,18 @@ caught it, and the hint-aware objective repair corrected the final answer. This
 is an improvement to benchmark-mode acceptance and repair; it is not evidence
 that branch fanout alone solves arithmetic errors.
 
-The current stronger artifact is the 11-case `objective-core` run:
+The current stronger artifact is the optimized 11-case `objective-core` run:
 
 ```text
-/tmp/turbo-speculative-breakout-objective-core/20260709T013917Z-1985364.suite.json
+/tmp/turbo-speculative-breakout-objective-core-fast-current2/20260709T024357Z-2058197.suite.json
 ```
 
-It has baseline 4/11 pass, final breakout 11/11 pass, zero objective losses,
-mean deterministic score delta +45, branch fanout 85.88 predicted tok/s, and
-multipass core 68.58 predicted tok/s.
+It has baseline 5/11 pass, final breakout 11/11 pass, zero objective losses,
+mean deterministic score delta +35.91, branch fanout 86.48 predicted tok/s,
+multipass core 82.84 predicted tok/s, and mean multipass core wall time 7.29s.
+The previous full-verifier path also reached 11/11, but took 21.30s mean
+multipass-core wall time; the fast path is a 65.77% wall-time reduction while
+preserving final deterministic accuracy on this suite.
 
 This is still harness evidence, not product-value evidence. The product-value
 benchmark requirements are tracked separately in:
