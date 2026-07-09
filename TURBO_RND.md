@@ -24,6 +24,10 @@ Active experiment:
 
 - `docs/turbo-unified-kv-paged-attn.md`: unified-KV paged attention for
   `-kvu`, targeting the 12-slot 262144-token serving shape.
+- `docs/turbo-speculative-breakout.md`: single-answer branch, verify, and
+  recombine harness over 12 serving slots.
+- `docs/turbo-speculative-breakout-value-benchmark.md`: product-value benchmark
+  criteria for moving beyond deterministic harness tests.
 
 Status:
 
@@ -40,3 +44,13 @@ Status:
   forces indexed decode for kernel smoke.
 - `scripts/turbo-kv-page-ablate.py` is the ablation harness for proving whether
   the dense-prefix / fragmentation premise is real on this rig.
+- `scripts/turbo-speculative-breakout.py` is an orchestration harness for
+  measuring whether 12-slot branch fanout can improve one answer. It records
+  verifier scores, prefix checks, deterministic objective benchmark results,
+  and validator-feedback repair attempts, but the acceptance problem remains
+  open. Latest objective core run: 11 tasks, baseline 4/11 pass, breakout 11/11
+  pass, zero objective losses, one accepted objective repair, mean deterministic
+  score delta +45, branch fanout 85.88 predicted tok/s, multipass core 68.58
+  predicted tok/s
+  (`/tmp/turbo-speculative-breakout-objective-core/20260709T013917Z-1985364.suite.json`).
+  This validates harness mechanics, not product value.
