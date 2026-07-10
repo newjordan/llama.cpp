@@ -1,5 +1,9 @@
 # Turbo R&D Handoff - 2026-07-09
 
+For the next StateTree architecture leg, start with
+`reports/turbo-statetree-next-leg-handoff-20260710.md`. This note remains the
+historical handoff for the accepted first transaction slice.
+
 ## Read This First
 
 This is the minimal handoff for a fresh primary agent. Do not reconstruct the

@@ -2,7 +2,7 @@
 
 This worktree is the local Turbo experimental lane.
 
-- Branch: `turbo-experimental`
+- Branch: `turbo-combined`
 - Purpose: B70/Qwen serving and kernel R&D
 - Upstream PR lane: keep separate
 - Rule: do not base llama.cpp upstream review work on this branch
@@ -34,6 +34,8 @@ Active experiment:
   and memory gate for every major StateTree architecture leg.
 - `reports/turbo-statetree-b70-benchmark-20260709.md`: matched 35B/B70
   production-size acceptance evidence for the first transaction slice.
+- `reports/turbo-statetree-next-leg-handoff-20260710.md`: fresh-session entry
+  point for bounded leases and the retained-state byte-budget leg.
 - `reports/turbo-speculative-breakout-handoff-20260709.md`: latest handoff note
   for the optimized objective fast-path benchmark.
 
