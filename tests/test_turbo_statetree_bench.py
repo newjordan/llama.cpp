@@ -122,6 +122,23 @@ garbage
             {"kv_cache_usage_ratio": 0.25, "requests_processing": 3.0},
         )
 
+    def test_drm_fdinfo_parser_normalizes_xe_vram_bytes(self) -> None:
+        parsed = bench.parse_drm_fdinfo("""
+drm-driver:\txe
+drm-client-id:\t11773
+drm-total-vram0:\t100 KiB
+drm-resident-vram0:\t80 KiB
+""")
+        self.assertEqual(
+            parsed,
+            {
+                "driver": "xe",
+                "client_id": "11773",
+                "total_vram0_bytes": 100 * 1024,
+                "resident_vram0_bytes": 80 * 1024,
+            },
+        )
+
     def test_shared_kv_estimate_counts_prefix_once_and_suffixes_per_branch(self) -> None:
         snapshot = {
             "all_slots": {
@@ -250,7 +267,7 @@ class SummaryAndComparisonTests(unittest.TestCase):
     def test_comparison_applies_latency_throughput_and_rss_gates(self) -> None:
         baseline = result("base", 1.0, 100.0, 1000.0, 8.0)
         candidate = result("candidate", 1.1, 98.0, 1200.0, 4.0)
-        comparison = bench.compare_results(baseline, candidate, 0.95, 1.10, 0.25, 1.0)
+        comparison = bench.compare_results(baseline, candidate, 0.95, 1.10, 0.25, 1.0, 64.0)
 
         self.assertTrue(comparison["passed"])
         self.assertEqual(comparison["commit_vs_manual"][0]["speedup"], 2.0)
@@ -258,7 +275,7 @@ class SummaryAndComparisonTests(unittest.TestCase):
         candidate["summary"]["groups"]["p128:manual"]["metrics"][
             "branch_aggregate_predicted_tps"
         ] = metric(80.0)
-        regression = bench.compare_results(baseline, candidate, 0.95, 1.10, 0.25, 1.0)
+        regression = bench.compare_results(baseline, candidate, 0.95, 1.10, 0.25, 1.0, 64.0)
         self.assertFalse(regression["passed"])
 
 
@@ -280,6 +297,17 @@ class SafetyTests(unittest.TestCase):
             allow_production_port=False,
         )
         with self.assertRaisesRegex(SystemExit, "production port"):
+            bench.run_benchmark(args)
+
+    def test_persistent_fragmentation_requires_fragmented_layout(self) -> None:
+        args = argparse.Namespace(
+            attach=False,
+            allow_destructive_attach=False,
+            port=8098,
+            persistent_fragmentation=True,
+            layout="dense",
+        )
+        with self.assertRaisesRegex(SystemExit, "requires --layout fragmented"):
             bench.run_benchmark(args)
 
 

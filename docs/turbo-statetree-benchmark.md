@@ -30,6 +30,7 @@ Each result contains:
 - Concurrent branch wall time and aggregate predicted tokens per second.
 - Cache reuse for every branch.
 - Process RSS and high-water memory.
+- Per-process DRM total and resident VRAM when Linux `fdinfo` exposes it.
 - Exact recurrent prompt-data, checkpoint, and combined state bytes per slot.
 - Expected shared-KV cells for the known benchmark topology.
 - Reservation, generation, winner-preservation, and loser-reclamation checks.
@@ -37,6 +38,8 @@ Each result contains:
 Physical KV cells, holes, and page fragmentation on B70 remain the job of
 `scripts/turbo-kv-page-ablate.py` and its server-side page probe. The StateTree
 harness does not relabel a topology estimate as physical allocator evidence.
+DRM clients are deduplicated by `drm-client-id`; unavailable VRAM telemetry is
+reported as unknown rather than zero.
 
 ## Safety
 
@@ -107,6 +110,8 @@ The default fast regression thresholds are:
 - Branch aggregate throughput at least 95% of parent.
 - Fork server p50 no greater than `1.10 * parent + 0.25 ms`.
 - Process RSS before cleanup no greater than parent plus 64 MiB.
+- DRM total VRAM before cleanup no greater than parent plus 64 MiB, when
+  available on both servers.
 - Zero benchmark contract failures.
 
 These tolerances catch large regressions on a noisy development host. They are
@@ -128,7 +133,8 @@ python3 scripts/turbo-statetree-bench.py run \
   --parallel 8 \
   --fanout 3 \
   --layout fragmented \
-  --fragment-fill-tokens 128 \
+  --fragment-fill-tokens 1024 \
+  --persistent-fragmentation \
   --prefix-tokens 1024,8192 \
   --repeats 5 \
   --modes manual,commit \
@@ -137,7 +143,10 @@ python3 scripts/turbo-statetree-bench.py run \
 ```
 
 For this shape, slots `0/2/4/6` retain independent prompt state while the fork
-family uses `1/3/5/7`.
+family uses `1/3/5/7`. Persistent fragmentation fills the survivor topology
+once per managed-server run, preserves it between samples, and erases every
+slot before shutdown. This makes a deep fragmented lane practical without
+rebuilding unrelated KV state for every sample.
 
 ## B70 Gate
 
@@ -145,7 +154,7 @@ Before a major leg is accepted for canary work, rerun with:
 
 - Qwen3.6-35B-A3B Q5_K_XL.
 - Intel Arc Pro B70.
-- `-kvu -np 12 -c 262144 -ub 1024 -fa on -ctk f16 -ctv f16`.
+- `-kvu -np 12 -c 262144 -ngl 99 -ncmoe 0 -ub 1024 -fa on -ctk f16 -ctv f16`.
 - Shared prefixes of 1K, 8K, and at least 32K tokens.
 - Dense and fragmented layouts.
 - At least five order-balanced parent/candidate pairs.

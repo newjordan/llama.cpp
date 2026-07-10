@@ -11,6 +11,7 @@ import signal
 import socket
 import statistics
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -22,7 +23,7 @@ from typing import Any
 DEFAULT_BIN = "/home/frosty40/turbo/turbo-combined/build/bin/llama-server"
 DEFAULT_MODEL = "/home/frosty40/models/Qwen3.5-0.8B-draft/Qwen3.5-0.8B-Q8_0.gguf"
 DEFAULT_OUT_DIR = "/tmp/turbo-statetree-bench"
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 
 
 class HttpStatusError(RuntimeError):
@@ -191,6 +192,7 @@ def launch_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[
         args.bin,
         "-m", args.model,
         "-ngl", str(args.ngl),
+        "-ncmoe", str(args.ncmoe),
         "--no-op-offload",
         "-c", str(args.ctx),
         "-np", str(args.parallel),
@@ -219,8 +221,10 @@ def launch_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[
             "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec " + shlex.join(command),
         ]
 
+    env = os.environ.copy()
+    env["GGML_SYCL_ENABLE_FUSION"] = "1"
     log_file = log_path.open("w", encoding="utf-8")
-    proc = subprocess.Popen(launch_command, stdout=log_file, stderr=subprocess.STDOUT, env=os.environ.copy())
+    proc = subprocess.Popen(launch_command, stdout=log_file, stderr=subprocess.STDOUT, env=env)
     proc._turbo_log_file = log_file  # type: ignore[attr-defined]
     return proc
 
@@ -246,6 +250,71 @@ def read_process_memory(pid: int | None) -> dict[str, int] | None:
         if parts:
             result[wanted[key]] = int(parts[0]) * 1024
     return result
+
+
+def parse_drm_fdinfo(body: str) -> dict[str, Any] | None:
+    values: dict[str, Any] = {}
+    for line in body.splitlines():
+        key, separator, raw_value = line.partition(":")
+        if not separator or not key.startswith("drm-"):
+            continue
+        raw_value = raw_value.strip()
+        if key in {"drm-driver", "drm-pdev", "drm-client-id"}:
+            values[key.removeprefix("drm-").replace("-", "_")] = raw_value
+            continue
+        parts = raw_value.split()
+        if not parts:
+            continue
+        try:
+            value = int(parts[0])
+        except ValueError:
+            continue
+        if len(parts) > 1 and parts[1] == "KiB":
+            value *= 1024
+        values[key.removeprefix("drm-").replace("-", "_") + "_bytes"] = value
+    return values or None
+
+
+def read_drm_memory(pid: int | None) -> dict[str, Any] | None:
+    if pid is None:
+        return None
+    fd_dir = Path(f"/proc/{pid}/fd")
+    fdinfo_dir = Path(f"/proc/{pid}/fdinfo")
+    if not fd_dir.exists() or not fdinfo_dir.exists():
+        return None
+
+    clients: dict[str, dict[str, Any]] = {}
+    try:
+        fds = list(fd_dir.iterdir())
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if not target.startswith("/dev/dri/"):
+            continue
+        try:
+            parsed = parse_drm_fdinfo((fdinfo_dir / fd.name).read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if not parsed:
+            continue
+        client_id = str(parsed.get("client_id") or fd.name)
+        clients.setdefault(client_id, parsed)
+
+    if not clients:
+        return None
+    totals: dict[str, int] = {}
+    for client in clients.values():
+        for key, value in client.items():
+            if key.endswith("_bytes") and isinstance(value, int):
+                totals[key] = totals.get(key, 0) + value
+    return {
+        "clients": list(clients.values()),
+        "totals": totals,
+    }
 
 
 def parse_prometheus(body: str) -> dict[str, float]:
@@ -315,6 +384,7 @@ def capture_snapshot(port: int, pid: int | None, family_ids: list[int]) -> dict[
         "all_slots": summarize_slots(rows),
         "family_slots": summarize_slots(family),
         "process": read_process_memory(pid),
+        "gpu": read_drm_memory(pid),
         "server_metrics": {
             key: metrics.get(key)
             for key in (
@@ -593,26 +663,31 @@ def run_sample(
         "family_ids": family_ids,
         "winner_id": winner_id,
         "layout": args.layout,
+        "persistent_fragmentation": args.persistent_fragmentation,
         "supported": True,
         "snapshots": {},
     }
 
-    erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+    persistent_fragmentation = args.layout == "fragmented" and args.persistent_fragmentation
+    reset_ids = family_ids if persistent_fragmentation else list(range(args.parallel))
+    erase_slots(args.port, reset_ids, args.request_timeout)
     try:
         if args.layout == "fragmented":
             fill_requests = []
-            for slot_id in range(args.parallel):
-                fill_requests.append(completion(
-                    args.port,
-                    filler_prompts[slot_id],
-                    slot_id,
-                    0,
-                    args.seed + repeat * 1000 + 500 + slot_id,
-                    args.request_timeout,
-                ))
-            erase_slots(args.port, family_ids, args.request_timeout)
+            if not persistent_fragmentation:
+                for slot_id in range(args.parallel):
+                    fill_requests.append(completion(
+                        args.port,
+                        filler_prompts[slot_id],
+                        slot_id,
+                        0,
+                        args.seed + repeat * 1000 + 500 + slot_id,
+                        args.request_timeout,
+                    ))
+                erase_slots(args.port, family_ids, args.request_timeout)
             sample["fragmentation"] = {
                 "fill_tokens": args.fragment_fill_tokens,
+                "persistent": persistent_fragmentation,
                 "survivor_slots": [slot_id for slot_id in range(args.parallel) if slot_id not in family_ids],
                 "fill_requests": fill_requests,
             }
@@ -713,7 +788,7 @@ def run_sample(
         sample["failures"] = validate_sample(sample)
         return sample
     finally:
-        erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+        erase_slots(args.port, reset_ids, args.request_timeout)
 
 
 def nested_value(value: dict[str, Any], path: str) -> Any:
@@ -739,6 +814,10 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "refork_server_ms": "refork.server_ms",
         "rss_before_cleanup_bytes": "snapshots.before_cleanup.process.rss_bytes",
         "rss_after_cleanup_bytes": "snapshots.after_cleanup.process.rss_bytes",
+        "gpu_total_vram_before_cleanup_bytes": "snapshots.before_cleanup.gpu.totals.total_vram0_bytes",
+        "gpu_total_vram_after_cleanup_bytes": "snapshots.after_cleanup.gpu.totals.total_vram0_bytes",
+        "gpu_resident_vram_before_cleanup_bytes": "snapshots.before_cleanup.gpu.totals.resident_vram0_bytes",
+        "gpu_resident_vram_after_cleanup_bytes": "snapshots.after_cleanup.gpu.totals.resident_vram0_bytes",
         "state_before_cleanup_bytes": "snapshots.before_cleanup.family_slots.prompt_state_bytes",
         "state_after_cleanup_bytes": "snapshots.after_cleanup.family_slots.prompt_state_bytes",
         "checkpoint_before_cleanup_bytes": "snapshots.before_cleanup.family_slots.prompt_checkpoint_bytes",
@@ -792,6 +871,7 @@ def compare_results(
     latency_ratio: float,
     latency_slack_ms: float,
     rss_slack_mib: float,
+    vram_slack_mib: float,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     baseline_groups = baseline.get("summary", {}).get("groups", {})
@@ -839,6 +919,19 @@ def compare_results(
                 "passed": cand_rss <= limit,
             })
 
+        base_vram = metric_p50(baseline, group, "gpu_total_vram_before_cleanup_bytes")
+        cand_vram = metric_p50(candidate, group, "gpu_total_vram_before_cleanup_bytes")
+        if base_vram is not None and cand_vram is not None:
+            limit = base_vram + vram_slack_mib * 1024.0 * 1024.0
+            checks.append({
+                "group": group,
+                "metric": "gpu_total_vram_before_cleanup_bytes",
+                "baseline": base_vram,
+                "candidate": cand_vram,
+                "limit": limit,
+                "passed": cand_vram <= limit,
+            })
+
     commit_deltas: list[dict[str, Any]] = []
     for group in sorted(candidate_groups):
         if not group.endswith(":commit"):
@@ -870,6 +963,7 @@ def compare_results(
             "latency_ratio": latency_ratio,
             "latency_slack_ms": latency_slack_ms,
             "rss_slack_mib": rss_slack_mib,
+            "vram_slack_mib": vram_slack_mib,
         },
         "checks": checks,
         "commit_vs_manual": commit_deltas,
@@ -903,6 +997,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
         raise SystemExit("--attach erases slot state; add --allow-destructive-attach for an isolated server")
     if args.port == 8093:
         raise SystemExit("refusing production port 8093; use an isolated managed server")
+    if args.persistent_fragmentation and args.layout != "fragmented":
+        raise SystemExit("--persistent-fragmentation requires --layout fragmented")
     try:
         family_ids = resolve_family_ids(args.parallel, args.fanout, args.layout)
     except ValueError as exc:
@@ -922,6 +1018,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
     result_path = out_dir / f"{args.label}.result.json"
     proc: subprocess.Popen[Any] | None = None
     samples: list[dict[str, Any]] = []
+    server_ready = False
+    persistent_setup: dict[str, Any] | None = None
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
     try:
@@ -932,6 +1030,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             proc = launch_server(args, log_path)
             wait_healthy(args.port, proc, args.startup_timeout)
             pid = proc.pid
+        server_ready = True
 
         erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
         warmup_tokens = exact_tokens(args.port, min(32, min(args.prefix_tokens)), "warmup")
@@ -948,6 +1047,28 @@ def run_benchmark(args: argparse.Namespace) -> int:
             slot_id: exact_tokens(args.port, args.fragment_fill_tokens, f"filler-{slot_id}")
             for slot_id in range(args.parallel)
         } if args.layout == "fragmented" else {}
+
+        if args.layout == "fragmented" and args.persistent_fragmentation:
+            erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+            fill_requests = []
+            for slot_id in range(args.parallel):
+                fill_requests.append(completion(
+                    args.port,
+                    filler_prompts[slot_id],
+                    slot_id,
+                    0,
+                    args.seed + 500 + slot_id,
+                    args.request_timeout,
+                ))
+            erase_slots(args.port, family_ids, args.request_timeout)
+            persistent_setup = {
+                "fill_tokens": args.fragment_fill_tokens,
+                "survivor_slots": [
+                    slot_id for slot_id in range(args.parallel) if slot_id not in family_ids
+                ],
+                "fill_requests": fill_requests,
+                "snapshot": capture_snapshot(args.port, pid, family_ids),
+            }
 
         with samples_path.open("w", encoding="utf-8") as sample_file:
             for repeat in range(args.repeats):
@@ -984,6 +1105,11 @@ def run_benchmark(args: argparse.Namespace) -> int:
                         sample_file.write(json.dumps(sample, sort_keys=True) + "\n")
                         sample_file.flush()
     finally:
+        if server_ready:
+            try:
+                erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+            except Exception as exc:  # noqa: BLE001
+                print(f"warning: final slot cleanup failed: {exc}", file=sys.stderr, flush=True)
         if not args.attach:
             stop_process(proc)
             log_file = getattr(proc, "_turbo_log_file", None)
@@ -1006,12 +1132,14 @@ def run_benchmark(args: argparse.Namespace) -> int:
             "family_ids": family_ids,
             "layout": args.layout,
             "fragment_fill_tokens": args.fragment_fill_tokens,
+            "persistent_fragmentation": args.persistent_fragmentation,
             "prefix_tokens": args.prefix_tokens,
             "branch_suffix_tokens": args.branch_suffix_tokens,
             "branch_tokens": args.branch_tokens,
             "repeats": args.repeats,
             "modes": args.modes,
             "ngl": args.ngl,
+            "ncmoe": args.ncmoe,
             "attach": args.attach,
         },
         "server": {
@@ -1019,6 +1147,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
             "commit": args.commit,
             "log_path": str(log_path) if not args.attach else None,
         },
+        "persistent_fragmentation_setup": persistent_setup,
         "summary": summary,
         "samples": samples,
     }
@@ -1042,6 +1171,7 @@ def compare_benchmarks(args: argparse.Namespace) -> int:
         args.latency_ratio,
         args.latency_slack_ms,
         args.rss_slack_mib,
+        args.vram_slack_mib,
     )
     if args.out:
         Path(args.out).write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1065,6 +1195,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--fanout", type=positive_int, default=3)
     run.add_argument("--layout", choices=("dense", "fragmented"), default="dense")
     run.add_argument("--fragment-fill-tokens", type=positive_int, default=128)
+    run.add_argument("--persistent-fragmentation", action=argparse.BooleanOptionalAction, default=False)
     run.add_argument("--prefix-tokens", type=parse_csv_ints, default=parse_csv_ints("128,1024,8192"))
     run.add_argument("--branch-suffix-tokens", type=non_negative_int, default=8)
     run.add_argument("--branch-tokens", type=positive_int, default=8)
@@ -1075,6 +1206,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--ubatch", type=positive_int, default=512)
     run.add_argument("--threads", type=positive_int, default=16)
     run.add_argument("--ngl", type=non_negative_int, default=0)
+    run.add_argument("--ncmoe", type=non_negative_int, default=0)
     run.add_argument("--cache-type-k", default="f16")
     run.add_argument("--cache-type-v", default="f16")
     run.add_argument("--flash-attn", choices=("on", "off", "auto"), default="auto")
@@ -1097,6 +1229,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--latency-ratio", type=float, default=1.10)
     compare.add_argument("--latency-slack-ms", type=float, default=0.25)
     compare.add_argument("--rss-slack-mib", type=float, default=64.0)
+    compare.add_argument("--vram-slack-mib", type=float, default=64.0)
     compare.add_argument("--fail-on-regression", action=argparse.BooleanOptionalAction, default=True)
     compare.set_defaults(func=compare_benchmarks)
     return parser
