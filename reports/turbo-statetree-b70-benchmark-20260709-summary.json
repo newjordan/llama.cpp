@@ -1,0 +1,154 @@
+{
+  "kind": "turbo-statetree-b70-benchmark-summary",
+  "schema_version": 1,
+  "status": "passed",
+  "started": "2026-07-09T23:08:59-05:00",
+  "completed": "2026-07-10T00:14:41-05:00",
+  "accepted_samples": 96,
+  "discarded_parent_samples": 30,
+  "contract_failures": 0,
+  "regression_checks": {
+    "passed": 24,
+    "failed": 0,
+    "dense_passed": true,
+    "fragmented_passed": true
+  },
+  "revisions": {
+    "parent": "8acb67d399318ee0525b1385625c1101090dd1d3",
+    "candidate": "35a439d2c0cc282085a8d0de2f832166c47ab5f1",
+    "transaction_implementation": "9a37cb8fd88a737a34d03aebc0d5575976805c59"
+  },
+  "build": {
+    "compiler": "IntelLLVM 2026.0.0",
+    "build_type": "Release",
+    "ggml_sycl": true,
+    "ggml_sycl_dnn": true,
+    "ggml_sycl_f16": true,
+    "ggml_sycl_graph": true,
+    "ggml_sycl_host_mem_fallback": true,
+    "initial_parent_discard_reason": "GGML_SYCL_F16 was OFF while candidate was ON"
+  },
+  "workload": {
+    "model": "/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf",
+    "context_cells": 262144,
+    "parallel_slots": 12,
+    "matched_family_slots": 6,
+    "prefix_tokens": [1024, 8192, 32768],
+    "branch_suffix_tokens": 8,
+    "branch_tokens": 32,
+    "repeats": 5,
+    "fragment_survivor_tokens": 4096,
+    "full_width_repeats": 3
+  },
+  "dense": [
+    {
+      "prefix_tokens": 1024,
+      "parent_fork_server_ms": 5.825,
+      "candidate_fork_server_ms": 5.344,
+      "fork_delta_pct": -8.2575,
+      "parent_branch_tps": 131.9997,
+      "candidate_branch_tps": 131.8584,
+      "branch_delta_pct": -0.1071,
+      "rss_delta_mib": 24.2539,
+      "vram_delta_mib": -0.0078,
+      "manual_commit_speedup": 1.0965
+    },
+    {
+      "prefix_tokens": 8192,
+      "parent_fork_server_ms": 12.072,
+      "candidate_fork_server_ms": 11.880,
+      "fork_delta_pct": -1.5905,
+      "parent_branch_tps": 120.9638,
+      "candidate_branch_tps": 120.8483,
+      "branch_delta_pct": -0.0955,
+      "rss_delta_mib": 23.5195,
+      "vram_delta_mib": -0.0078,
+      "manual_commit_speedup": 1.0457
+    },
+    {
+      "prefix_tokens": 32768,
+      "parent_fork_server_ms": 21.685,
+      "candidate_fork_server_ms": 21.568,
+      "fork_delta_pct": -0.5395,
+      "parent_branch_tps": 94.9709,
+      "candidate_branch_tps": 94.8982,
+      "branch_delta_pct": -0.0765,
+      "rss_delta_mib": 20.6484,
+      "vram_delta_mib": -0.0078,
+      "manual_commit_speedup": 0.9912
+    }
+  ],
+  "fragmented": [
+    {
+      "prefix_tokens": 1024,
+      "parent_fork_server_ms": 5.738,
+      "candidate_fork_server_ms": 5.352,
+      "fork_delta_pct": -6.7271,
+      "parent_branch_tps": 89.5718,
+      "candidate_branch_tps": 89.3106,
+      "branch_delta_pct": -0.2917,
+      "rss_delta_mib": 9.5039,
+      "vram_delta_mib": -0.0078,
+      "manual_commit_speedup": 1.0837
+    },
+    {
+      "prefix_tokens": 8192,
+      "parent_fork_server_ms": 12.547,
+      "candidate_fork_server_ms": 12.138,
+      "fork_delta_pct": -3.2597,
+      "parent_branch_tps": 88.1048,
+      "candidate_branch_tps": 88.5167,
+      "branch_delta_pct": 0.4675,
+      "rss_delta_mib": 9.9219,
+      "vram_delta_mib": -0.0078,
+      "manual_commit_speedup": 1.1345
+    },
+    {
+      "prefix_tokens": 32768,
+      "parent_fork_server_ms": 21.671,
+      "candidate_fork_server_ms": 21.666,
+      "fork_delta_pct": -0.0231,
+      "parent_branch_tps": 79.0586,
+      "candidate_branch_tps": 79.5491,
+      "branch_delta_pct": 0.6205,
+      "rss_delta_mib": -1.3242,
+      "vram_delta_mib": -0.0078,
+      "manual_commit_speedup": 1.0143
+    }
+  ],
+  "state_memory": {
+    "bytes_per_checkpoint": 65864428,
+    "six_slot_family_bytes": 395186568,
+    "six_slot_reclaimed_bytes": 329322140,
+    "six_slot_reclaimed_pct": 83.3333,
+    "twelve_slot_family_bytes": 790373136,
+    "twelve_slot_reclaimed_bytes": 724508708,
+    "twelve_slot_reclaimed_pct": 91.6667,
+    "fragment_survivor_state_bytes": 790373136,
+    "fragment_peak_exposed_state_bytes": 1185559704
+  },
+  "full_width_32k": {
+    "fork_server_ms": 36.961,
+    "branch_tps": 118.7630,
+    "commit_server_ms": 73.016,
+    "refork_server_ms": 33.022,
+    "rss_bytes": 2351669248,
+    "vram_bytes": 33174650880
+  },
+  "page_probe": {
+    "page_size_cells": 256,
+    "max_fragmented_hole_ratio": 0.431907,
+    "max_fragmented_dense_to_live_pages": 1.76,
+    "max_fragmented_free_run_cells": 4096,
+    "dense_32k_used_cells": 33002,
+    "full_width_32k_used_cells": 33236
+  },
+  "stability": {
+    "server_crashes": 0,
+    "kernel_gpu_reset_or_fault_lines": 0,
+    "automatic_rollbacks_fired": 0,
+    "production_restored": true,
+    "hydra_health_verified": true
+  },
+  "artifact_root": "/home/frosty40/turbo/results/statetree-b70-gate/20260709T230139-0500"
+}

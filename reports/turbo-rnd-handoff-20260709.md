@@ -7,13 +7,14 @@ prior chat. Start with these files:
 
 1. `AGENTS.md`
 2. `TURBO_RND.md`
-3. `reports/turbo-slot-fork-20260709.md`
-4. `reports/turbo-serving-benchmark-20260708-head-a2edfe66f.md`
-5. This handoff
+3. `reports/turbo-statetree-b70-benchmark-20260709.md`
+4. `docs/turbo-statetree.md`
+5. `reports/turbo-slot-fork-20260709.md`
+6. This handoff
 
-The current milestone is a validated R&D checkpoint, not a production rollout.
-Do not replace the live `:8093` server from this branch without a new maintenance
-plan, exact rollback capture, and explicit approval.
+The current milestone is a validated StateTree R&D baseline, not a production
+rollout. Do not replace the live `:8093` server from this branch without a new
+maintenance plan, exact rollback capture, and explicit approval.
 
 ## Repository State
 
@@ -21,19 +22,18 @@ plan, exact rollback capture, and explicit approval.
 | --- | --- |
 | Local worktree | `/home/frosty40/turbo/turbo-combined` |
 | Local branch | `turbo-combined` |
-| Local checkpoint | `8acb67d399318ee0525b1385625c1101090dd1d3` |
+| StateTree implementation | `9a37cb8fd88a737a34d03aebc0d5575976805c59` |
+| Benchmark-harness checkpoint | `35a439d2c0cc282085a8d0de2f832166c47ab5f1` |
 | Private repository | `https://github.com/newjordan/turbo_RND` |
 | Private default branch | `main` |
-| Private snapshot commit | `bb158776aa49a4e0df4714bb0d95f0f123921fca` |
+| Pre-report private snapshot | `78c0d6c88ced9fe4752fee26cdeac4d33cddb539` |
 | Public base | `f3a302b47` |
-| Snapshot tree | `de59749a7d0b9bb0d289c433fd5d72e0b477060d` |
+| Pre-report snapshot tree | `42e1c8a91a455336a48947f91a6916d004c33410` |
 
-The private repository is verified `PRIVATE`. Its root snapshot has the exact
-same tree as local checkpoint `8acb67d39`, without importing the full shallow
-llama.cpp history. Public `origin` and `fork` were not pushed.
-
-This handoff file was created after that snapshot and is intentionally
-uncommitted until the user reviews it.
+The private repository is verified `PRIVATE`. Pre-report private commit
+`78c0d6c88` has the exact tree of local harness checkpoint `35a439d2c`, without
+importing the full shallow llama.cpp history. The final report/handoff commit
+advances that checkpoint. Public `origin` and `fork` were not pushed.
 
 ## Hardware And Model
 
@@ -141,6 +141,27 @@ hidden 62.8 MiB recurrent checkpoints and made fork look artificially slower.
 `/slots` now reports `n_prompt_checkpoints` so resets can prove this state is
 zero. The clean rerun falsified the suspected recurrent copy-on-write slowdown.
 
+### StateTree Transaction
+
+The first StateTree slice adds:
+
+```text
+POST /slots/{winner}?action=commit
+{"fork_id": GENERATION}
+```
+
+Fork now returns an opaque generation. Commit validates that generation and
+the exact family, rejects stale or busy mutation atomically, erases every
+loser, preserves the winner in place as a protected root, and permits a
+new-generation refork. Idle sleep and automatic scheduling respect protected
+state. This is still a physical-slot contract, not a durable logical DAG.
+
+Relevant evidence:
+
+- `docs/turbo-statetree.md`
+- `reports/turbo-statetree-commit-20260709.md`
+- `reports/turbo-statetree-b70-benchmark-20260709.md`
+
 ### Measurement Harnesses
 
 `scripts/turbo-speculative-breakout.py` now provides:
@@ -157,6 +178,11 @@ zero. The clean rerun falsified the suspected recurrent copy-on-write slowdown.
 
 `scripts/turbo-kv-page-ablate.py` now provides strict warmup, fill, and measured
 parity plus reference/control attribution.
+
+`scripts/turbo-statetree-bench.py` now provides managed dense and persistent
+fragmented parent/candidate lanes, exact prompt-state bytes, Xe DRM per-process
+VRAM, commit/manual comparisons, refork validation, and fail-closed regression
+thresholds. It refuses production port `8093`.
 
 ## Current Serving Benchmarks
 
@@ -213,6 +239,35 @@ Artifacts:
 - `reports/turbo-slot-fork-20260709.md`
 - `/home/frosty40/turbo/results/slot-fork-35b-gate/20260709T201929Z-checkpoint-fix/rerun-summary.json`
 
+## StateTree 35B/B70 Gate
+
+The corrected matched gate passes. A first parent build with
+`GGML_SYCL_F16=OFF` was discarded after audit because candidate and production
+used `ON`. The parent was rebuilt with matching SYCL flags before acceptance.
+
+| Signal | Result |
+| --- | ---: |
+| Accepted samples | 96 |
+| Contract failures | 0 |
+| Dense/fragmented regression checks | 24/24 passed |
+| Candidate branch delta | -0.29% to +0.62% |
+| Candidate fork delta | -8.26% to -0.02% |
+| Maximum matched RSS delta | +24.254 MiB |
+| Matched VRAM delta | -0.008 MiB |
+| Six-slot state reclaimed | 329,322,140 bytes (83.33%) |
+| Twelve-slot state reclaimed | 724,508,708 bytes (91.67%) |
+
+The full-width 12-slot/32K lane held 790,373,136 bytes of family checkpoint
+state, returned to one 65,864,428-byte winner, used 2.190 GiB RSS and 30.896 GiB
+DRM VRAM at p50, and completed without a crash or GPU reset. Persistent
+fragmentation reached a 43.19% physical hole ratio and a 4,096-cell free run.
+
+Raw artifacts:
+
+```text
+/home/frosty40/turbo/results/statetree-b70-gate/20260709T230139-0500
+```
+
 ## Combined-Answer Harness Evidence
 
 The optimized objective-core run used the production `:8093` surface:
@@ -238,12 +293,16 @@ Passed:
 
 ```text
 cmake --build build --target llama-server -j16
-tools/server/tests/unit/test_slot_fork.py: 9 passed
+tools/server/tests/unit/test_slot_fork.py: 15 passed
 tools/server/tests/unit/test_ignore_eos.py: 3 passed
 tests/test_turbo_speculative_breakout.py: 16 passed
 tests/test_turbo_kv_page_ablate.py: 16 passed
+tests/test_turbo_statetree_bench.py: 17 passed
 python3 -m py_compile: passed
 git diff --check: passed
+matched 35B/B70 StateTree samples: 96 passed, 0 failed
+kernel/server crash inspection: clean
+production/Hydra restoration: verified
 ```
 
 The standard repository pytest session fixture could not bootstrap because the
@@ -255,24 +314,24 @@ local build lacks HTTPS model-download support. Focused tests ran against:
 
 ## Remaining Gates
 
-Do these before any canary rollout:
+Do these before any canary rollout or persistent logical-state claim:
 
-1. Run forced-token file/fork pairs at 1k, 8k, and 32k-plus shared prefixes.
-2. Use at least five order-balanced pairs per prefix length.
-3. Require fork/file branch throughput within 2% and retain a clone win.
-4. Test sparse and fragmented slot layouts while instrumenting shared tails,
-   allocated rows, `n_rs`, `n_seqs`, and fork time.
-5. Test a fork after bounded recurrent rollback/checkpoint restore. Recurrent
+1. Add a hard lease and exact byte budget for retained prompt state. Benchmark
+   expiry latency, enforcement cost, victim selection, and throughput under
+   pressure against the accepted StateTree baseline.
+2. Add durable logical state handles only after physical-slot expiry and byte
+   ceilings are proven. Measure lookup latency by depth and branch width.
+3. Test a fork after bounded recurrent rollback/checkpoint restore. Recurrent
    `seq_cp` aliases the tail but does not copy `rs_idx`; compare source and
    destination top-1 logits before optimizing anything.
-6. Add explicit busy-slot, context-limit, LoRA, speculative/draft, and mtmd
+4. Add explicit busy-slot, context-limit, LoRA, speculative/draft, and mtmd
    rejection regressions.
-7. Build at least 30 representative workflow tasks with deterministic or
+5. Build at least 30 representative workflow tasks with deterministic or
    semi-deterministic acceptance gates.
-8. Measure net win rate, human override rate, latency, and generated-token cost.
-9. Add adaptive fanout and early branch pruning only after the fixed 12-way
+6. Measure net win rate, human override rate, latency, and generated-token cost.
+7. Add adaptive fanout and early branch pruning only after the fixed 12-way
    quality baseline is established.
-10. Use a dedicated canary endpoint before changing `:8093`.
+8. Use a dedicated canary endpoint before changing `:8093`.
 
 Do not implement eager recurrent copying now. The clean forced lane shows no
 performance reason for it.
@@ -299,11 +358,11 @@ non-overlapping files or separate worktrees.
 ```text
 Work in /home/frosty40/turbo/turbo-combined on branch turbo-combined.
 Read AGENTS.md, TURBO_RND.md, reports/turbo-rnd-handoff-20260709.md,
-and reports/turbo-slot-fork-20260709.md. Treat commit 8acb67d39 as the
-validated local checkpoint and private newjordan/turbo_RND main snapshot
-bb158776aa49 as the off-machine backup. Do not touch production :8093 until
-the next gate is implemented and reviewed. First execute the 1k/8k/32k
-prefix-scaling and recurrent-rollback correctness gates, using delegated
-read-only analysis/review lanes where useful. Preserve raw artifacts and
-restore production exactly after any approved B70 maintenance window.
+and reports/turbo-statetree-b70-benchmark-20260709.md. Treat StateTree
+implementation 9a37cb8fd and benchmark checkpoint 35a439d2c as the accepted
+R&D baseline. Do not touch production :8093 until the next gate is implemented
+and reviewed. First design a bounded lease/byte-budget leg around the measured
+65,864,428 bytes per live Qwen3.6 checkpoint, then run the mandatory CPU and
+B70 parent/candidate gates. Preserve raw artifacts and restore production
+exactly after any approved maintenance window.
 ```

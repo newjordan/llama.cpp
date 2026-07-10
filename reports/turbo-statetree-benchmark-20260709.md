@@ -1,5 +1,10 @@
 # Turbo StateTree Benchmark Gate - 2026-07-09
 
+> Follow-up: the matched Qwen3.6-35B/B70 gate subsequently passed all 24
+> dense/fragmented regression checks with zero failures. See
+> `reports/turbo-statetree-b70-benchmark-20260709.md`. An initially mismatched
+> `GGML_SYCL_F16=OFF` parent run was discarded before acceptance.
+
 ## Status
 
 The first StateTree parent/candidate microbenchmark gate passes.
@@ -8,8 +13,8 @@ The first StateTree parent/candidate microbenchmark gate passes.
 - All 15 dense and fragmented parent/candidate regression checks passed.
 - Atomic commit reclaimed the exact loser checkpoint bytes in every candidate
   sample and preserved the winner byte-for-byte at the exposed state boundary.
-- The 35B/B70 gate has not run. No production-size performance claim is valid
-  from this report.
+- At the time of this microbenchmark the 35B/B70 gate had not run. The later
+  matched production-size result is recorded in the follow-up report above.
 
 The benchmark harness, policy, and prompt-state byte telemetry are new local
 changes on top of StateTree commit `9a37cb8fd88a737a34d03aebc0d5575976805c59`.
@@ -193,15 +198,11 @@ The compact durable data is in
 - All 96 measured samples reported zero contract failures.
 - Production `:8093` was untouched.
 
-## Remaining B70 Gate
+## B70 Gate Follow-Up
 
-The next acceptance step requires a maintenance window and rollback capture.
-Run Qwen3.6-35B-A3B Q5_K_XL on B70 with the production unified-KV shape, exact
-1K/8K/32K-plus prefixes, dense and fragmented layouts, at least five
-order-balanced parent/candidate pairs, physical KV page-probe rows, GPU memory
-sampling, and post-run kernel-reset inspection.
-
-Until that run exists, the valid conclusion is limited to: the StateTree
-transaction is non-regressive in the isolated hybrid-model gate, commit is
-faster than three manual erase requests, and exact host checkpoint reclamation
-is bounded and observable.
+The required maintenance run is complete. It used the production model and
+262K/12-slot shape, exact 1K/8K/32K prefixes, five-repeat dense and persistent
+fragmented parent/candidate lanes, Xe DRM memory telemetry, physical page-probe
+rows, a full-width 12-slot stress lane, and kernel-reset inspection. The
+matched gate passed; exact results and the build-confounder audit are in
+`reports/turbo-statetree-b70-benchmark-20260709.md`.

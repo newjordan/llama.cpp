@@ -32,6 +32,8 @@ Active experiment:
   unified-KV fork, winner commit, protected continuation, and re-fork.
 - `docs/turbo-statetree-benchmark.md`: mandatory parent/candidate performance
   and memory gate for every major StateTree architecture leg.
+- `reports/turbo-statetree-b70-benchmark-20260709.md`: matched 35B/B70
+  production-size acceptance evidence for the first transaction slice.
 - `reports/turbo-speculative-breakout-handoff-20260709.md`: latest handoff note
   for the optimized objective fast-path benchmark.
 
@@ -82,6 +84,10 @@ Status:
 - The StateTree benchmark gate now measures dense and fragmented fork, branch,
   commit, reclamation, and refork cycles. The first CPU hybrid-model gate ran
   96 measured transactions with zero failures, passed all 15 parent/candidate
-  regression checks, and directly measured checkpoint bytes. The 35B/B70 gate
-  remains required before a production performance claim; see
-  `reports/turbo-statetree-benchmark-20260709.md`.
+  regression checks, and directly measured checkpoint bytes. The matched
+  35B/B70 gate then ran 96 accepted transactions with zero failures and passed
+  all 24 dense/fragmented regression checks. Candidate branch throughput was
+  within -0.29% to +0.62% of parent, matched VRAM was flat, and a full-width
+  commit reclaimed exactly 724,508,708 bytes from 11 losers. This accepts the
+  transaction as the R&D baseline, not as a production rollout; see
+  `reports/turbo-statetree-b70-benchmark-20260709.md`.

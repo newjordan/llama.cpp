@@ -1,5 +1,9 @@
 # Turbo StateTree Benchmark Gate
 
+Latest completed production-size gate:
+`reports/turbo-statetree-b70-benchmark-20260709.md` (passed 24/24 matched
+dense/fragmented checks; see its `GGML_SYCL_F16` build-audit note).
+
 ## Policy
 
 Every major StateTree implementation leg requires a parent/candidate benchmark
