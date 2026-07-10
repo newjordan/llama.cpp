@@ -28,6 +28,8 @@ Active experiment:
   recombine harness over 12 serving slots.
 - `docs/turbo-speculative-breakout-value-benchmark.md`: product-value benchmark
   criteria for moving beyond deterministic harness tests.
+- `docs/turbo-statetree.md`: first transactional inference-state slice over
+  unified-KV fork, winner commit, protected continuation, and re-fork.
 - `reports/turbo-speculative-breakout-handoff-20260709.md`: latest handoff note
   for the optimized objective fast-path benchmark.
 
@@ -68,3 +70,10 @@ Status:
   forced 12-way decode flat at 158.05 versus 158.48 predicted tok/s, and reduced
   full-flow wall by 2.17%. Branch self-controls remain non-bit-reproducible, so
   no rollout yet; see `reports/turbo-slot-fork-20260709.md`.
+- The first StateTree transaction slice adds an opaque fork generation and a
+  zero-copy winner-in-place commit. Commit reclaims exact-family losers,
+  preserves the winner as a protected singleton, supports a new-generation
+  re-fork, rejects stale or busy commits atomically, and prevents idle sleep
+  from destroying protected state. This is a physical-slot contract, not yet a
+  persistent state DAG or stable logical state handle; see
+  `docs/turbo-statetree.md`.

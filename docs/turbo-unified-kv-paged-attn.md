@@ -24,6 +24,10 @@ Current state:
   multiple reserved destination slots through existing unified-KV sequence
   ownership metadata. This is the first server-native branch primitive; it is
   not a page-table implementation.
+- `POST /slots/{winner}?action=commit` can select a completed branch in place,
+  reclaim the rest of its generation, and retain the winner as a protected
+  singleton that can be continued or forked again. See
+  `docs/turbo-statetree.md`.
 
 Not done:
 
@@ -150,7 +154,8 @@ Content-Type: application/json
 {"destinations":[1,2,3]}
 ```
 
-It returns the source, destinations, logical token count, and `fork_ms`.
+It returns the source, destinations, an opaque `fork_id`, logical token count,
+and `fork_ms`.
 Destination IDs are strict and canonical; they do not inherit the server's
 normal modulo slot lookup. The action validates the entire list before changing
 any destination.
@@ -160,7 +165,8 @@ Initial constraints:
 - Unified KV only.
 - Full logical sequence only.
 - No multimodal context, speculative/draft context, or LoRA adapters.
-- Source and destinations must be idle, unreserved, in range, and distinct.
+- Source and destinations must be idle, in range, and distinct. A source may
+  also be a protected singleton from an earlier commit.
 - Automatic scheduling, idle cache clearing, and KV-pressure clearing skip
   reserved slots; explicit `id_slot` requests may use them.
 - Context shift and `n_cache_reuse` position shifts are disabled while shared.
@@ -168,8 +174,15 @@ Initial constraints:
 - Erase and successful restore clear prompt checkpoint/data metadata; `/slots`
   exposes `n_prompt_checkpoints` so controlled resets can prove this state is
   empty.
-- Idle sleep is suppressed while requests are deferred behind reservations.
+- Idle sleep is suppressed while any reservation or protected root exists.
 - Prometheus exposes `requests_idle` and `requests_reserved`.
+
+`action=commit` requires the exact `fork_id` and targets the physical winner.
+It validates that the full matching family is idle, clears every loser, and
+reanchors the untouched winner under its own slot ID. The winner remains
+reserved from automatic scheduling. Re-forking it requires its current
+`fork_id` and creates a new generation; stale commits and re-forks then fail
+without changing the new family.
 
 Fork copies prompt-token metadata on the CPU but shares K/V state through
 sequence ownership. It clears inherited checkpoints, then allows each branch

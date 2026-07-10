@@ -26,6 +26,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_SLOT_FORK,
+    SERVER_TASK_TYPE_SLOT_COMMIT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -160,9 +161,10 @@ struct server_task {
     server_task_type type;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE,
-    // SERVER_TASK_TYPE_SLOT_FORK
+    // SERVER_TASK_TYPE_SLOT_FORK, SERVER_TASK_TYPE_SLOT_COMMIT
     struct slot_action {
         int id_slot = -1;
+        int fork_id = -1;
         std::vector<int> destinations;
         std::string filename;
         std::string filepath;
@@ -561,7 +563,19 @@ struct server_task_result_slot_erase : server_task_result {
 };
 
 struct server_task_result_slot_fork : server_task_result {
+    int fork_id;
     std::vector<int> destinations;
+
+    size_t n_tokens;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_commit : server_task_result {
+    int source_id;
+    int fork_id;
+    std::vector<int> released;
 
     size_t n_tokens;
     double t_ms;

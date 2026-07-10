@@ -1120,6 +1120,34 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 }
 ```
 
+### POST `/slots/{id_slot}?action=fork`: Share a unified-KV prompt with destination slots.
+
+This experimental action requires unified KV. The body contains a non-empty
+array of idle destination slot IDs:
+
+```json
+{"destinations": [1, 2, 3]}
+```
+
+The response includes an opaque `fork_id`. The source and destinations remain
+reserved from automatic scheduling and may be used with explicit `id_slot`
+requests.
+
+### POST `/slots/{id_slot}?action=commit`: Commit a fork winner in place.
+
+The path identifies the winning physical slot and the body must contain the
+exact generation returned by `action=fork`:
+
+```json
+{"fork_id": 42}
+```
+
+Commit clears the other idle members of that generation and keeps the winner
+as a protected singleton. The response `id_slot` is the canonical continuation
+slot. A committed singleton can be forked again, which creates a new
+generation; that fork request must include the singleton's current `fork_id`.
+Use `action=erase` to destroy and release the protected state.
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

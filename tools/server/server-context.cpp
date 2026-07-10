@@ -139,6 +139,7 @@ struct server_slot {
 
     // A forked prompt remains idle but is unavailable to automatic scheduling.
     int fork_source_id = -1;
+    int fork_id        = -1;
 
     server_prompt prompt;
 
@@ -148,6 +149,7 @@ struct server_slot {
         prompt.data.drft.clear();
         prompt.checkpoints.clear();
         fork_source_id = -1;
+        fork_id = -1;
     }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -340,6 +342,10 @@ struct server_slot {
 
     bool is_fork_reserved() const {
         return fork_source_id >= 0;
+    }
+
+    bool is_fork_root() const {
+        return fork_source_id == id;
     }
 
     bool is_available() const {
@@ -561,6 +567,7 @@ struct server_slot {
             {"is_processing", is_processing()},
             {"is_reserved",   is_fork_reserved()},
             {"fork_source_id", fork_source_id},
+            {"fork_id",        fork_id},
             {"n_prompt_checkpoints", prompt.checkpoints.size()},
         };
 
@@ -1218,6 +1225,11 @@ private:
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
+        });
+        queue_tasks.on_idle_sleep_inhibited([this]() {
+            return std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.is_fork_reserved();
+            });
         });
 
         metrics.init();
@@ -2421,8 +2433,29 @@ private:
                     }
                     server_slot * source = get_slot_by_id(id_slot);
                     GGML_ASSERT(source != nullptr);
-                    if (source->is_processing() || source->is_fork_reserved()) {
+                    if (source->is_processing()) {
                         send_error(task, "Source slot is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (source->is_fork_reserved()) {
+                        bool has_sibling = false;
+                        for (const server_slot & slot : slots) {
+                            if (slot.id != source->id &&
+                                    slot.fork_source_id == source->id &&
+                                    slot.fork_id == source->fork_id) {
+                                has_sibling = true;
+                                break;
+                            }
+                        }
+                        if (!source->is_fork_root() ||
+                                source->fork_id < 0 ||
+                                source->fork_id != task.slot_action.fork_id ||
+                                has_sibling) {
+                            send_error(task, "Source slot is unavailable", ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                    } else if (task.slot_action.fork_id >= 0) {
+                        send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
                         break;
                     }
                     if (source->prompt.tokens.empty()) {
@@ -2495,20 +2528,114 @@ private:
                     }
 
                     source->prompt.checkpoints.clear();
+                    const int fork_id = task.id;
                     for (server_slot * destination : destinations) {
                         destination->fork_source_id = id_slot;
+                        destination->fork_id = fork_id;
                     }
                     source->fork_source_id = id_slot;
+                    source->fork_id = fork_id;
 
                     const int64_t t_end = ggml_time_us();
 
                     auto res = std::make_unique<server_task_result_slot_fork>();
                     res->id           = task.id;
                     res->id_slot      = id_slot;
+                    res->fork_id      = fork_id;
                     res->destinations = task.slot_action.destinations;
                     res->n_tokens     = source->prompt.tokens.size();
                     res->t_ms         = (t_end - t_start) / 1000.0;
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_COMMIT:
+                {
+                    if (!params_base.kv_unified) {
+                        send_error(task, "Slot commit requires a unified KV cache", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    if (ctx_dft || spec) {
+                        send_error(task, "Slot commit is not supported with speculative decoding", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!params_base.lora_adapters.empty()) {
+                        send_error(task, "Slot commit is not supported with LoRA adapters", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    const int id_slot = task.slot_action.id_slot;
+                    if (id_slot < 0 || (size_t) id_slot >= slots.size()) {
+                        send_error(task, "Invalid winner slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    server_slot * winner = get_slot_by_id(id_slot);
+                    GGML_ASSERT(winner != nullptr);
+                    if (winner->is_processing()) {
+                        send_error(task, "Winner slot is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (!winner->is_fork_reserved() || winner->fork_id != task.slot_action.fork_id) {
+                        send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (winner->prompt.tokens.empty()) {
+                        send_error(task, "Winner slot has no cached prompt", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const int source_id = winner->fork_source_id;
+                    std::vector<server_slot *> family;
+                    std::vector<int> released;
+                    family.reserve(slots.size());
+                    released.reserve(slots.size());
+
+                    bool valid = true;
+                    for (server_slot & slot : slots) {
+                        if (slot.fork_source_id != source_id || slot.fork_id != task.slot_action.fork_id) {
+                            continue;
+                        }
+                        if (slot.is_processing()) {
+                            send_error(task, "Fork family is still processing", ERROR_TYPE_UNAVAILABLE);
+                            valid = false;
+                            break;
+                        }
+
+                        family.push_back(&slot);
+                        if (slot.id != winner->id) {
+                            released.push_back(slot.id);
+                        }
+                    }
+                    if (!valid) {
+                        break;
+                    }
+                    GGML_ASSERT(!family.empty());
+
+                    const int64_t t_start = ggml_time_us();
+                    for (server_slot * slot : family) {
+                        if (slot != winner) {
+                            slot->prompt_clear(false);
+                        }
+                    }
+
+                    winner->fork_source_id = winner->id;
+                    const int64_t t_end = ggml_time_us();
+
+                    auto res = std::make_unique<server_task_result_slot_commit>();
+                    res->id        = task.id;
+                    res->id_slot   = winner->id;
+                    res->source_id = source_id;
+                    res->fork_id   = winner->fork_id;
+                    res->released  = released;
+                    res->n_tokens  = winner->prompt.tokens.size();
+                    res->t_ms      = (t_end - t_start) / 1000.0;
+                    queue_results.send(std::move(res));
+
+                    for (const int released_id : released) {
+                        slots[released_id].callback_on_release(released_id);
+                    }
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
@@ -4345,6 +4472,9 @@ void server_routes::init_routes() {
         if (action == "fork") {
             return handle_slots_fork(req, id_slot);
         }
+        if (action == "commit") {
+            return handle_slots_commit(req, id_slot);
+        }
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
         }
@@ -5046,6 +5176,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
     auto res = create_response();
 
     std::vector<int> destinations;
+    int fork_id = -1;
     try {
         const json request_data = json::parse(req.body);
         if (!request_data.is_object() ||
@@ -5064,6 +5195,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
             }
             destinations.push_back(destination.get<int>());
         }
+        if (request_data.contains("fork_id")) {
+            if (!request_data.at("fork_id").is_number_integer()) {
+                res->error(format_error_response(
+                        "Slot fork fork_id must be an integer", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            fork_id = request_data.at("fork_id").get<int>();
+            if (fork_id < 0) {
+                res->error(format_error_response(
+                        "Slot fork fork_id must be non-negative", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
     } catch (const std::exception & e) {
         res->error(format_error_response(
                 std::string("Invalid slot fork request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -5081,6 +5225,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
         server_task task(SERVER_TASK_TYPE_SLOT_FORK);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.fork_id = fork_id;
         task.slot_action.destinations = std::move(destinations);
         rd.post_task(std::move(task));
     }
@@ -5097,6 +5242,57 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_fork *>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_commit(const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    int fork_id;
+    try {
+        const json request_data = json::parse(req.body);
+        if (!request_data.is_object() ||
+                !request_data.contains("fork_id") ||
+                !request_data.at("fork_id").is_number_integer()) {
+            res->error(format_error_response(
+                    "Slot commit requires an integer fork_id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        fork_id = request_data.at("fork_id").get<int>();
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid slot commit request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    if (fork_id < 0) {
+        res->error(format_error_response(
+                "Slot commit requires a non-negative fork_id", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_COMMIT);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.fork_id = fork_id;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_commit *>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

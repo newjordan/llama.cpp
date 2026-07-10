@@ -1958,11 +1958,29 @@ json server_task_result_slot_erase::to_json() {
 json server_task_result_slot_fork::to_json() {
     return json {
         { "id_slot",        id_slot },
+        { "fork_id",        fork_id },
         { "destinations",   destinations },
         { "n_destinations", destinations.size() },
         { "n_tokens",       n_tokens },
         { "timings", {
             { "fork_ms", t_ms },
+        }},
+    };
+}
+
+//
+// server_task_result_slot_commit
+//
+json server_task_result_slot_commit::to_json() {
+    return json {
+        { "id_slot",    id_slot },
+        { "source_id",  source_id },
+        { "fork_id",    fork_id },
+        { "released",   released },
+        { "n_released", released.size() },
+        { "n_cached_tokens", n_tokens },
+        { "timings", {
+            { "commit_ms", t_ms },
         }},
     };
 }

@@ -29,6 +29,7 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    std::function<bool(void)>           callback_idle_sleep_inhibited;
 
 public:
     // Add a new task to the end of the queue
@@ -108,6 +109,10 @@ public:
         } else {
             callback_sleeping_state = std::move(callback);
         }
+    }
+
+    void on_idle_sleep_inhibited(std::function<bool(void)> callback) {
+        callback_idle_sleep_inhibited = std::move(callback);
     }
 
 private:
