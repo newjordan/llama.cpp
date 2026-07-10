@@ -627,16 +627,16 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
-    size_t size() const {
+    size_t checkpoint_size() const {
         size_t res = 0;
-
-        res += data.size();
-
         for (const auto & ckpt : checkpoints) {
             res += ckpt.size();
         }
-
         return res;
+    }
+
+    size_t size() const {
+        return data.size() + checkpoint_size();
     }
 
     int n_tokens() const {

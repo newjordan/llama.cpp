@@ -1148,6 +1148,15 @@ slot. A committed singleton can be forked again, which creates a new
 generation; that fork request must include the singleton's current `fork_id`.
 Use `action=erase` to destroy and release the protected state.
 
+`GET /slots` also exposes exact host-side recurrent prompt-state accounting:
+
+- `n_prompt_data_bytes`: current serialized prompt-state bytes.
+- `n_prompt_checkpoint_bytes`: bytes retained by context checkpoints.
+- `n_prompt_state_bytes`: the sum of prompt data and checkpoint bytes.
+
+These fields do not include the preallocated device KV pool. They are intended
+for transaction memory budgets and benchmark reclamation checks.
+
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 
 This endpoint returns the loaded LoRA adapters. You can add adapters using `--lora` when starting the server, for example: `--lora my_adapter_1.gguf --lora my_adapter_2.gguf ...`

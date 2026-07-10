@@ -86,6 +86,10 @@ indefinitely in this slice; clients must explicitly erase abandoned roots.
 - Loser checkpoint lists are destroyed immediately. The winner's prompt
   metadata and checkpoint list are not modified.
 - Commit creates no additional KV or recurrent tensor allocation.
+- `GET /slots` exposes `n_prompt_data_bytes`,
+  `n_prompt_checkpoint_bytes`, and `n_prompt_state_bytes` so retained host-side
+  recurrent state can be measured exactly. These fields do not include the
+  preallocated device KV pool.
 
 `n_cached_tokens` intentionally describes materialized server state, not the
 complete visible answer history. A terminal sampled token can have been
@@ -113,6 +117,9 @@ change the zero-copy operation.
   its pending rollback index.
 
 ## Next Gates
+
+Every major leg is now subject to the parent/candidate process in
+`docs/turbo-statetree-benchmark.md`.
 
 1. Compare winner logits before and after loser cleanup on the deployed hybrid
    model, including raw rollback and restored-checkpoint cases.

@@ -559,6 +559,8 @@ struct server_slot {
 
     json to_json(bool only_metrics = false) const {
         json res;
+        const size_t prompt_data_bytes       = prompt.data.size();
+        const size_t prompt_checkpoint_bytes = prompt.checkpoint_size();
 
         res = {
             {"id",            id},
@@ -569,6 +571,9 @@ struct server_slot {
             {"fork_source_id", fork_source_id},
             {"fork_id",        fork_id},
             {"n_prompt_checkpoints", prompt.checkpoints.size()},
+            {"n_prompt_data_bytes", prompt_data_bytes},
+            {"n_prompt_checkpoint_bytes", prompt_checkpoint_bytes},
+            {"n_prompt_state_bytes", prompt_data_bytes + prompt_checkpoint_bytes},
         };
 
         const auto & ptask = task ? task : task_prev;

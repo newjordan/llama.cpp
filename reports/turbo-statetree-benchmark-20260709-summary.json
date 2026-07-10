@@ -1,0 +1,95 @@
+{
+  "kind": "turbo-statetree-benchmark-summary",
+  "schema_version": 1,
+  "date": "2026-07-09",
+  "parent": "8acb67d399318ee0525b1385625c1101090dd1d3",
+  "candidate": "9a37cb8fd88a737a34d03aebc0d5575976805c59",
+  "model": "/home/frosty40/models/Qwen3.5-0.8B-draft/Qwen3.5-0.8B-Q8_0.gguf",
+  "hardware_gate": "cpu-only hybrid-model microbenchmark",
+  "samples": {
+    "parent": 25,
+    "candidate": 71,
+    "total": 96,
+    "failed": 0
+  },
+  "regression_checks": {
+    "dense": 9,
+    "fragmented": 6,
+    "passed": 15,
+    "failed": 0
+  },
+  "dense": {
+    "128": {
+      "parent_fork_server_p50_ms": 0.183,
+      "candidate_fork_server_p50_ms": 0.159,
+      "parent_branch_tps_p50": 57.58113419474806,
+      "candidate_branch_tps_p50": 61.080845140563035,
+      "commit_client_p50_ms": 0.5101329879835248,
+      "commit_server_p50_ms": 0.104,
+      "commit_server_p95_ms": 0.1626,
+      "manual_to_commit_speedup": 2.5166849269364806,
+      "refork_server_p50_ms": 0.137
+    },
+    "1024": {
+      "parent_fork_server_p50_ms": 0.304,
+      "candidate_fork_server_p50_ms": 0.262,
+      "parent_branch_tps_p50": 52.49467438929339,
+      "candidate_branch_tps_p50": 53.613269565554965,
+      "commit_client_p50_ms": 0.6270430167205632,
+      "commit_server_p50_ms": 0.249,
+      "commit_server_p95_ms": 0.319,
+      "manual_to_commit_speedup": 2.0065848120731675,
+      "refork_server_p50_ms": 0.257
+    },
+    "8192": {
+      "parent_fork_server_p50_ms": 1.244,
+      "candidate_fork_server_p50_ms": 1.31,
+      "parent_branch_tps_p50": 39.697389923074546,
+      "candidate_branch_tps_p50": 43.88034981116763,
+      "commit_client_p50_ms": 1.5470509533770382,
+      "commit_server_p50_ms": 1.172,
+      "commit_server_p95_ms": 1.1782,
+      "manual_to_commit_speedup": 1.3798317210618218,
+      "refork_server_p50_ms": 1.068
+    }
+  },
+  "fragmented": {
+    "1024": {
+      "parent_fork_server_p50_ms": 0.271,
+      "candidate_fork_server_p50_ms": 0.255,
+      "parent_branch_tps_p50": 57.901838680621154,
+      "candidate_branch_tps_p50": 57.83486305314093,
+      "commit_client_p50_ms": 0.7126160198822618,
+      "commit_server_p50_ms": 0.279,
+      "commit_server_p95_ms": 2.1268,
+      "manual_to_commit_speedup": 1.8934011835672833,
+      "refork_server_p50_ms": 0.234
+    },
+    "8192": {
+      "parent_fork_server_p50_ms": 1.204,
+      "candidate_fork_server_p50_ms": 1.179,
+      "parent_branch_tps_p50": 41.96938709990495,
+      "candidate_branch_tps_p50": 42.876209448928385,
+      "commit_client_p50_ms": 1.5189980040304363,
+      "commit_server_p50_ms": 1.166,
+      "commit_server_p95_ms": 1.1822,
+      "manual_to_commit_speedup": 1.4290203392549263,
+      "refork_server_p50_ms": 1.015
+    }
+  },
+  "fragmented_1024_tail_21": {
+    "commit_server_p50_ms": 0.248,
+    "commit_server_p95_ms": 0.311,
+    "commit_server_max_ms": 0.32,
+    "commit_client_p50_ms": 0.6574210128746927,
+    "commit_client_p95_ms": 0.7439149776473641,
+    "commit_client_max_ms": 0.8703629719093442
+  },
+  "prompt_state_memory": {
+    "family_before_commit_bytes": 80807728,
+    "winner_after_commit_bytes": 20201932,
+    "reclaimed_bytes": 60605796,
+    "reclaimed_fraction": 0.75
+  },
+  "b70_35b_gate_run": false
+}

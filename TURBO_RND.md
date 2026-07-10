@@ -30,6 +30,8 @@ Active experiment:
   criteria for moving beyond deterministic harness tests.
 - `docs/turbo-statetree.md`: first transactional inference-state slice over
   unified-KV fork, winner commit, protected continuation, and re-fork.
+- `docs/turbo-statetree-benchmark.md`: mandatory parent/candidate performance
+  and memory gate for every major StateTree architecture leg.
 - `reports/turbo-speculative-breakout-handoff-20260709.md`: latest handoff note
   for the optimized objective fast-path benchmark.
 
@@ -77,3 +79,9 @@ Status:
   from destroying protected state. This is a physical-slot contract, not yet a
   persistent state DAG or stable logical state handle; see
   `docs/turbo-statetree.md`.
+- The StateTree benchmark gate now measures dense and fragmented fork, branch,
+  commit, reclamation, and refork cycles. The first CPU hybrid-model gate ran
+  96 measured transactions with zero failures, passed all 15 parent/candidate
+  regression checks, and directly measured checkpoint bytes. The 35B/B70 gate
+  remains required before a production performance claim; see
+  `reports/turbo-statetree-benchmark-20260709.md`.

@@ -441,9 +441,21 @@ def test_slot_commit_preserves_winner_and_supports_refork(tmp_path):
     assert before_slots.status_code == 200
     winner_checkpoint_count = before_slots.body[1]["n_prompt_checkpoints"]
     winner_cached_tokens = before_slots.body[1]["n_prompt_tokens"]
+    winner_data_bytes = before_slots.body[1]["n_prompt_data_bytes"]
+    winner_checkpoint_bytes = before_slots.body[1]["n_prompt_checkpoint_bytes"]
+    winner_state_bytes = before_slots.body[1]["n_prompt_state_bytes"]
+    assert winner_state_bytes == winner_data_bytes + winner_checkpoint_bytes
+    for id_slot in (0, 1, 2, 3):
+        row = before_slots.body[id_slot]
+        assert row["n_prompt_data_bytes"] >= 0
+        assert row["n_prompt_checkpoint_bytes"] >= 0
+        assert row["n_prompt_state_bytes"] == (
+            row["n_prompt_data_bytes"] + row["n_prompt_checkpoint_bytes"]
+        )
     if os.environ.get("LLAMA_SERVER_TEST_MODEL"):
         for id_slot in (0, 1, 2):
             assert before_slots.body[id_slot]["n_prompt_checkpoints"] > 0
+            assert before_slots.body[id_slot]["n_prompt_checkpoint_bytes"] > 0
 
     before_save = server.make_request(
         "POST",
@@ -499,12 +511,18 @@ def test_slot_commit_preserves_winner_and_supports_refork(tmp_path):
     assert slots.body[1]["fork_source_id"] == 1
     assert slots.body[1]["fork_id"] == fork_id
     assert slots.body[1]["n_prompt_checkpoints"] == winner_checkpoint_count
+    assert slots.body[1]["n_prompt_data_bytes"] == winner_data_bytes
+    assert slots.body[1]["n_prompt_checkpoint_bytes"] == winner_checkpoint_bytes
+    assert slots.body[1]["n_prompt_state_bytes"] == winner_state_bytes
     for id_slot in (0, 2):
         assert slots.body[id_slot]["is_reserved"] is False
         assert slots.body[id_slot]["fork_source_id"] == -1
         assert slots.body[id_slot]["fork_id"] == -1
         assert slots.body[id_slot].get("n_prompt_tokens", 0) == 0
         assert slots.body[id_slot]["n_prompt_checkpoints"] == 0
+        assert slots.body[id_slot]["n_prompt_data_bytes"] == 0
+        assert slots.body[id_slot]["n_prompt_checkpoint_bytes"] == 0
+        assert slots.body[id_slot]["n_prompt_state_bytes"] == 0
 
     tokenized = server.make_request(
         "POST",
@@ -577,6 +595,10 @@ def test_slot_commit_preserves_winner_and_supports_refork(tmp_path):
     assert slots_after_refork.status_code == 200
     for id_slot in (0, 1, 2):
         assert slots_after_refork.body[id_slot]["n_prompt_checkpoints"] == 0
+        assert slots_after_refork.body[id_slot]["n_prompt_checkpoint_bytes"] == 0
+        assert slots_after_refork.body[id_slot]["n_prompt_state_bytes"] == (
+            slots_after_refork.body[id_slot]["n_prompt_data_bytes"]
+        )
 
     stale = server.make_request(
         "POST",
