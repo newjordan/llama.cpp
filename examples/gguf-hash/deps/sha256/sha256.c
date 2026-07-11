@@ -5,6 +5,8 @@ This code is based on public domain code from Wei Dai's Crypto++ library. */
 #include "rotate-bits/rotate-bits.h"
 #include "sha256.h"
 
+#include <string.h>
+
 /* define it for speed optimization */
 #define _SHA256_UNROLL
 #define _SHA256_UNROLL2
@@ -175,16 +177,44 @@ void
 sha256_update(sha256_t *p, const unsigned char *data, size_t size)
 {
   uint32_t curBufferPos = (uint32_t)p->count & 0x3F;
-  while (size > 0)
+
+  if (curBufferPos != 0 && size > 0)
   {
-    p->buffer[curBufferPos++] = *data++;
-    p->count++;
-    size--;
+    size_t prefix = 64 - curBufferPos;
+    if (prefix > size)
+      prefix = size;
+    memcpy(p->buffer + curBufferPos, data, prefix);
+    curBufferPos += (uint32_t) prefix;
+    p->count += prefix;
+    data += prefix;
+    size -= prefix;
     if (curBufferPos == 64)
     {
       curBufferPos = 0;
       sha256_write_byte_block(p);
     }
+  }
+
+  while (size >= 64)
+  {
+    uint32_t data32[16];
+    unsigned i;
+    for (i = 0; i < 16; i++)
+      data32[i] =
+        ((uint32_t)(data[i * 4    ]) << 24) +
+        ((uint32_t)(data[i * 4 + 1]) << 16) +
+        ((uint32_t)(data[i * 4 + 2]) <<  8) +
+        ((uint32_t)(data[i * 4 + 3]));
+    sha256_transform(p->state, data32);
+    p->count += 64;
+    data += 64;
+    size -= 64;
+  }
+
+  if (size > 0)
+  {
+    memcpy(p->buffer, data, size);
+    p->count += size;
   }
 }
 

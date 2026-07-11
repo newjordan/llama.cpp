@@ -106,6 +106,14 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    statetree_lease_ms: int | None = None
+    statetree_max_state_bytes: int | None = None
+    statetree_max_snapshot_bytes: int | None = None
+    statetree_snapshot_store: str | None = None
+    statetree_snapshot_compat_id: str | None = None
+    statetree_max_snapshot_disk_bytes: int | None = None
+    statetree_max_snapshot_load_bytes: int | None = None
+    statetree_max_snapshot_manifest_bytes: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     webui_mcp_proxy: bool = False
@@ -253,6 +261,22 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.statetree_lease_ms is not None:
+            server_args.extend(["--statetree-lease-ms", self.statetree_lease_ms])
+        if self.statetree_max_state_bytes is not None:
+            server_args.extend(["--statetree-max-state-bytes", self.statetree_max_state_bytes])
+        if self.statetree_max_snapshot_bytes is not None:
+            server_args.extend(["--statetree-max-snapshot-bytes", self.statetree_max_snapshot_bytes])
+        if self.statetree_snapshot_store is not None:
+            server_args.extend(["--statetree-snapshot-store", self.statetree_snapshot_store])
+        if self.statetree_snapshot_compat_id is not None:
+            server_args.extend(["--statetree-snapshot-compat-id", self.statetree_snapshot_compat_id])
+        if self.statetree_max_snapshot_disk_bytes is not None:
+            server_args.extend(["--statetree-max-snapshot-disk-bytes", self.statetree_max_snapshot_disk_bytes])
+        if self.statetree_max_snapshot_load_bytes is not None:
+            server_args.extend(["--statetree-max-snapshot-load-bytes", self.statetree_max_snapshot_load_bytes])
+        if self.statetree_max_snapshot_manifest_bytes is not None:
+            server_args.extend(["--statetree-max-snapshot-manifest-bytes", self.statetree_max_snapshot_manifest_bytes])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.webui_mcp_proxy:

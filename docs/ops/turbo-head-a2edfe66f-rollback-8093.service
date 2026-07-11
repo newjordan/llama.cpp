@@ -1,0 +1,18 @@
+[Unit]
+Description=Persistent exact rollback for Turbo a2edfe66f on port 8093
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=exec
+Environment=GGML_SYCL_ENABLE_FUSION=1
+ExecStart=/usr/bin/bash -lc 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /home/frosty40/builds/turbo-experimental-build/bin/llama-server -m /home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf -ngl 99 -ncmoe 0 --no-op-offload -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 -b 8192 -ub 1024 -t 16 --host 0.0.0.0 --port 8093 --jinja -a turbo-head-a2edfe66f-Qwen3.6-35B-A3B-Q5-np12-kvu-c262144-ub1024'
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+TimeoutStopSec=60
+OOMPolicy=stop
+
+[Install]
+WantedBy=default.target

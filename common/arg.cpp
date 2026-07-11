@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -1349,6 +1350,100 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--statetree-lease-ms"}, "N",
+        string_format("StateTree fork-family lease duration in milliseconds (default: %d, 0 = no expiry)",
+            params.statetree_lease_ms),
+        [](common_params & params, const std::string & value) {
+            int64_t parsed_value = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed_value);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size() ||
+                    parsed_value < 0 || parsed_value > INT32_MAX) {
+                throw std::invalid_argument("statetree-lease-ms must be a non-negative 32-bit integer");
+            }
+            params.statetree_lease_ms = (int32_t) parsed_value;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_LEASE_MS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-max-state-bytes"}, "N",
+        "maximum exact prompt-state bytes across live slots (default: 0, 0 = no limit)",
+        [](common_params & params, const std::string & value) {
+            uint64_t bytes = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+                throw std::invalid_argument("statetree-max-state-bytes must be a non-negative 64-bit integer");
+            }
+            params.statetree_max_state_bytes = bytes;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_MAX_STATE_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-max-snapshot-bytes"}, "N",
+        "maximum exact immutable StateTree snapshot payload bytes (default: 0, 0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            uint64_t bytes = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+                throw std::invalid_argument("statetree-max-snapshot-bytes must be a non-negative 64-bit integer");
+            }
+            params.statetree_max_snapshot_bytes = bytes;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-snapshot-store"}, "PATH",
+        "base directory for durable StateTree snapshot content (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            if (!fs_is_directory(value)) {
+                throw std::invalid_argument("statetree snapshot store is not a directory: " + value);
+            }
+            params.statetree_snapshot_store = value;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_SNAPSHOT_STORE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-snapshot-compat-id"}, "ID",
+        "explicit model/runtime compatibility ID for durable StateTree content",
+        [](common_params & params, const std::string & value) {
+            if (value.empty() || value.size() > 256) {
+                throw std::invalid_argument("statetree snapshot compatibility ID must contain 1 to 256 bytes");
+            }
+            params.statetree_snapshot_compat_id = value;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_SNAPSHOT_COMPAT_ID").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-max-snapshot-disk-bytes"}, "N",
+        "maximum durable StateTree namespace file bytes (default: 0, 0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            uint64_t bytes = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+                throw std::invalid_argument("statetree-max-snapshot-disk-bytes must be a non-negative 64-bit integer");
+            }
+            params.statetree_max_snapshot_disk_bytes = bytes;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_DISK_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-max-snapshot-load-bytes"}, "N",
+        "maximum aggregate transient payload bytes for queued durable StateTree loads (default: 0, 0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            uint64_t bytes = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+                throw std::invalid_argument("statetree-max-snapshot-load-bytes must be a non-negative 64-bit integer");
+            }
+            params.statetree_max_snapshot_load_bytes = bytes;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_LOAD_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--statetree-max-snapshot-manifest-bytes"}, "N",
+        "maximum durable StateTree ownership manifest bytes (default: 0, 0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            uint64_t bytes = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), bytes);
+            if (result.ec != std::errc() || result.ptr != value.data() + value.size()) {
+                throw std::invalid_argument("statetree-max-snapshot-manifest-bytes must be a non-negative 64-bit integer");
+            }
+            params.statetree_max_snapshot_manifest_bytes = bytes;
+        }
+    ).set_env("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_MANIFEST_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

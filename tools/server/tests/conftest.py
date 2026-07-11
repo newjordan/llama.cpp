@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from utils import *
 
@@ -18,4 +20,5 @@ def stop_server_after_each_test():
 @pytest.fixture(scope="module", autouse=True)
 def do_something():
     # this will be run once per test session, before any tests
-    ServerPreset.load_all()
+    if not os.environ.get("LLAMA_SERVER_TEST_MODEL"):
+        ServerPreset.load_all()

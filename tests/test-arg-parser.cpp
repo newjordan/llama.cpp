@@ -106,6 +106,43 @@ int main(void) {
     argv = {"binary_name", "--no-mmap"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // negative StateTree lease
+    argv = {"binary_name", "--statetree-lease-ms", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // partially parsed StateTree lease
+    argv = {"binary_name", "--statetree-lease-ms", "250ms"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // negative StateTree state byte budget
+    argv = {"binary_name", "--statetree-max-state-bytes", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // partially parsed StateTree state byte budget
+    argv = {"binary_name", "--statetree-max-state-bytes", "4294967296bytes"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // negative or partially parsed StateTree snapshot budget
+    argv = {"binary_name", "--statetree-max-snapshot-bytes", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-max-snapshot-bytes", "536870912bytes"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    argv = {"binary_name", "--statetree-max-snapshot-disk-bytes", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-max-snapshot-disk-bytes", "1073741824bytes"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-max-snapshot-load-bytes", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-max-snapshot-load-bytes", "536870912bytes"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-max-snapshot-manifest-bytes", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-max-snapshot-manifest-bytes", "67108864bytes"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    argv = {"binary_name", "--statetree-snapshot-compat-id", std::string(257, 'x')};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
 
     printf("test-arg-parser: test valid usage\n\n");
 
@@ -127,6 +164,27 @@ int main(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    argv = {
+        "binary_name",
+        "--statetree-lease-ms", "250",
+        "--statetree-max-state-bytes", "4294967296",
+        "--statetree-max-snapshot-bytes", "536870912",
+        "--statetree-snapshot-store", ".",
+        "--statetree-snapshot-compat-id", "model-runtime-test",
+        "--statetree-max-snapshot-disk-bytes", "1073741824",
+        "--statetree-max-snapshot-load-bytes", "536870912",
+        "--statetree-max-snapshot-manifest-bytes", "67108864",
+    };
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.statetree_lease_ms == 250);
+    assert(params.statetree_max_state_bytes == 4294967296ULL);
+    assert(params.statetree_max_snapshot_bytes == 536870912ULL);
+    assert(params.statetree_snapshot_store == ".");
+    assert(params.statetree_snapshot_compat_id == "model-runtime-test");
+    assert(params.statetree_max_snapshot_disk_bytes == 1073741824ULL);
+    assert(params.statetree_max_snapshot_load_bytes == 536870912ULL);
+    assert(params.statetree_max_snapshot_manifest_bytes == 67108864ULL);
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
@@ -146,6 +204,35 @@ int main(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    setenv("LLAMA_ARG_STATETREE_LEASE_MS", "250ms", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    unsetenv("LLAMA_ARG_STATETREE_LEASE_MS");
+
+    setenv("LLAMA_ARG_STATETREE_LEASE_MS", "300", true);
+    setenv("LLAMA_ARG_STATETREE_MAX_STATE_BYTES", "4294967296", true);
+    setenv("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_BYTES", "536870912", true);
+    setenv("LLAMA_ARG_STATETREE_SNAPSHOT_STORE", ".", true);
+    setenv("LLAMA_ARG_STATETREE_SNAPSHOT_COMPAT_ID", "model-runtime-env", true);
+    setenv("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_DISK_BYTES", "1073741824", true);
+    setenv("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_LOAD_BYTES", "536870912", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.statetree_lease_ms == 300);
+    assert(params.statetree_max_state_bytes == 4294967296ULL);
+    assert(params.statetree_max_snapshot_bytes == 536870912ULL);
+    assert(params.statetree_snapshot_store == ".");
+    assert(params.statetree_snapshot_compat_id == "model-runtime-env");
+    assert(params.statetree_max_snapshot_disk_bytes == 1073741824ULL);
+    assert(params.statetree_max_snapshot_load_bytes == 536870912ULL);
+    unsetenv("LLAMA_ARG_STATETREE_LEASE_MS");
+    unsetenv("LLAMA_ARG_STATETREE_MAX_STATE_BYTES");
+    unsetenv("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_BYTES");
+    unsetenv("LLAMA_ARG_STATETREE_SNAPSHOT_STORE");
+    unsetenv("LLAMA_ARG_STATETREE_SNAPSHOT_COMPAT_ID");
+    unsetenv("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_DISK_BYTES");
+    unsetenv("LLAMA_ARG_STATETREE_MAX_SNAPSHOT_LOAD_BYTES");
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

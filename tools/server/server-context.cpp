@@ -4,6 +4,8 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-snapshot-store.h"
+#include "server-snapshot-manifest.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -17,19 +19,36 @@
 
 #include "ggml-cpp.h"
 
+extern "C" {
+#include "sha256.h"
+}
+
 // TODO: tmp until the mtmd draft processing is refactored [TAG_MTMD_DRAFT_PROCESSING]
 #include "../../src/llama-ext.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
 #include <utility>
 #include <fstream>
 #include <limits>
+#include <numeric>
+#include <map>
+#include <sstream>
+#include <iomanip>
 #include <unordered_set>
+#include <thread>
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -42,7 +61,129 @@
 
 using json = nlohmann::ordered_json;
 
-constexpr int HTTP_POLLING_SECONDS = 1;
+constexpr int HTTP_POLLING_MILLISECONDS = 1000;
+constexpr int DURABLE_IO_POLLING_MILLISECONDS = 10;
+constexpr size_t SERVER_STATETREE_JOURNAL_CAPACITY = 1024;
+
+struct server_sha256 {
+    server_sha256() {
+#if !defined(_WIN32)
+        const auto & api = openssl_api();
+        if (api.available()) {
+            openssl_ctx = api.ctx_new();
+            if (openssl_ctx != nullptr && api.digest_init(openssl_ctx, api.sha256(), nullptr) == 1) {
+                use_openssl = true;
+                return;
+            }
+            if (openssl_ctx != nullptr) {
+                api.ctx_free(openssl_ctx);
+                openssl_ctx = nullptr;
+            }
+        }
+#endif
+        sha256_init(&fallback);
+    }
+
+    ~server_sha256() {
+#if !defined(_WIN32)
+        if (openssl_ctx != nullptr) {
+            openssl_api().ctx_free(openssl_ctx);
+        }
+#endif
+    }
+
+    void update(const void * data, size_t size) {
+        if (size == 0) {
+            return;
+        }
+#if !defined(_WIN32)
+        if (use_openssl) {
+            GGML_ASSERT(openssl_api().digest_update(openssl_ctx, data, size) == 1);
+            return;
+        }
+#endif
+        sha256_update(&fallback, static_cast<const unsigned char *>(data), size);
+    }
+
+    void final(unsigned char digest[SHA256_DIGEST_SIZE]) {
+#if !defined(_WIN32)
+        if (use_openssl) {
+            unsigned int size = 0;
+            GGML_ASSERT(openssl_api().digest_final(openssl_ctx, digest, &size) == 1);
+            GGML_ASSERT(size == SHA256_DIGEST_SIZE);
+            return;
+        }
+#endif
+        sha256_final(&fallback, digest);
+    }
+
+private:
+#if !defined(_WIN32)
+    struct dynamic_openssl {
+        using ctx_new_t = void * (*)();
+        using ctx_free_t = void (*)(void *);
+        using sha256_t = const void * (*)();
+        using digest_init_t = int (*)(void *, const void *, void *);
+        using digest_update_t = int (*)(void *, const void *, size_t);
+        using digest_final_t = int (*)(void *, unsigned char *, unsigned int *);
+
+        void * handle = nullptr;
+        ctx_new_t ctx_new = nullptr;
+        ctx_free_t ctx_free = nullptr;
+        sha256_t sha256 = nullptr;
+        digest_init_t digest_init = nullptr;
+        digest_update_t digest_update = nullptr;
+        digest_final_t digest_final = nullptr;
+
+        dynamic_openssl() {
+            static constexpr const char * names[] = {
+                "libcrypto.so.3",
+                "libcrypto.so.1.1",
+                "libcrypto.so",
+            };
+            for (const char * name : names) {
+                handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+                if (handle != nullptr) {
+                    break;
+                }
+            }
+            if (handle == nullptr) {
+                return;
+            }
+            ctx_new = reinterpret_cast<ctx_new_t>(dlsym(handle, "EVP_MD_CTX_new"));
+            ctx_free = reinterpret_cast<ctx_free_t>(dlsym(handle, "EVP_MD_CTX_free"));
+            sha256 = reinterpret_cast<sha256_t>(dlsym(handle, "EVP_sha256"));
+            digest_init = reinterpret_cast<digest_init_t>(dlsym(handle, "EVP_DigestInit_ex"));
+            digest_update = reinterpret_cast<digest_update_t>(dlsym(handle, "EVP_DigestUpdate"));
+            digest_final = reinterpret_cast<digest_final_t>(dlsym(handle, "EVP_DigestFinal_ex"));
+            if (!available()) {
+                dlclose(handle);
+                handle = nullptr;
+            }
+        }
+
+        ~dynamic_openssl() {
+            if (handle != nullptr) {
+                dlclose(handle);
+            }
+        }
+
+        bool available() const {
+            return handle != nullptr && ctx_new != nullptr && ctx_free != nullptr && sha256 != nullptr &&
+                digest_init != nullptr && digest_update != nullptr && digest_final != nullptr;
+        }
+    };
+
+    static const dynamic_openssl & openssl_api() {
+        static const dynamic_openssl api;
+        return api;
+    }
+
+    void * openssl_ctx = nullptr;
+    bool use_openssl = false;
+#endif
+    sha256_t fallback {};
+};
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -66,6 +207,40 @@ static uint32_t server_mtp_tree_width(const common_params & params) {
 static uint32_t server_mtp_n_seq_max(const common_params & params) {
     const uint64_t n_seq = (uint64_t) std::max<int32_t>(1, params.n_parallel) * server_mtp_tree_width(params);
     return (uint32_t) std::min<uint64_t>(n_seq, (uint64_t) std::numeric_limits<uint32_t>::max());
+}
+
+static int64_t server_optional_fork_id(const json & data) {
+    if (!data.is_object()) {
+        throw std::invalid_argument("request body must be an object");
+    }
+    if (!data.contains("fork_id")) {
+        return -1;
+    }
+    if (!data.at("fork_id").is_number_integer()) {
+        throw std::invalid_argument("fork_id must be a non-negative integer");
+    }
+    const int64_t fork_id = data.at("fork_id").get<int64_t>();
+    if (fork_id < 0) {
+        throw std::invalid_argument("fork_id must be a non-negative integer");
+    }
+    return fork_id;
+}
+
+static int64_t server_optional_state_id(const json & data) {
+    if (!data.is_object()) {
+        throw std::invalid_argument("request body must be an object");
+    }
+    if (!data.contains("state_id")) {
+        return -1;
+    }
+    if (!data.at("state_id").is_number_integer()) {
+        throw std::invalid_argument("state_id must be a non-negative integer");
+    }
+    const int64_t state_id = data.at("state_id").get<int64_t>();
+    if (state_id < 0) {
+        throw std::invalid_argument("state_id must be a non-negative integer");
+    }
+    return state_id;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -139,7 +314,14 @@ struct server_slot {
 
     // A forked prompt remains idle but is unavailable to automatic scheduling.
     int fork_source_id = -1;
-    int fork_id        = -1;
+    int64_t fork_id    = -1;
+    int64_t state_id   = -1;
+    int64_t node_id    = -1;
+    int64_t parent_node_id = -1;
+    int64_t materialized_snapshot_id = -1;
+    std::string materialized_content_digest;
+    uint64_t retention_touch = 0;
+    int64_t lease_deadline_us = -1;
 
     server_prompt prompt;
 
@@ -150,6 +332,13 @@ struct server_slot {
         prompt.checkpoints.clear();
         fork_source_id = -1;
         fork_id = -1;
+        state_id = -1;
+        node_id = -1;
+        parent_node_id = -1;
+        materialized_snapshot_id = -1;
+        materialized_content_digest.clear();
+        retention_touch = 0;
+        lease_deadline_us = -1;
     }
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -227,6 +416,7 @@ struct server_slot {
     double t_token_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
+    std::function<void(int /* id_slot */)> callback_on_deferred;
 
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
@@ -346,6 +536,10 @@ struct server_slot {
 
     bool is_fork_root() const {
         return fork_source_id == id;
+    }
+
+    size_t prompt_state_bytes() const {
+        return prompt.size();
     }
 
     bool is_available() const {
@@ -557,10 +751,15 @@ struct server_slot {
         common_speculative_print_stats(spec);
     }
 
-    json to_json(bool only_metrics = false) const {
+    json to_json(bool only_metrics = false, bool lease_pinned = false) const {
         json res;
         const size_t prompt_data_bytes       = prompt.data.size();
         const size_t prompt_checkpoint_bytes = prompt.checkpoint_size();
+        const int64_t now_us = ggml_time_us();
+        lease_pinned = is_fork_reserved() && (lease_pinned || is_processing());
+        const int64_t lease_remaining_ms = lease_pinned || lease_deadline_us < 0
+            ? -1
+            : std::max<int64_t>(0, (lease_deadline_us - now_us + 999) / 1000);
 
         res = {
             {"id",            id},
@@ -570,6 +769,13 @@ struct server_slot {
             {"is_reserved",   is_fork_reserved()},
             {"fork_source_id", fork_source_id},
             {"fork_id",        fork_id},
+            {"state_id",       state_id},
+            {"node_id",        node_id},
+            {"parent_node_id", parent_node_id},
+            {"retention_touch", retention_touch},
+            {"lease_pinned", lease_pinned},
+            {"lease_remaining_ms", lease_remaining_ms},
+            {"lease_expired", !lease_pinned && lease_deadline_us >= 0 && lease_deadline_us <= now_us},
             {"n_prompt_checkpoints", prompt.checkpoints.size()},
             {"n_prompt_data_bytes", prompt_data_bytes},
             {"n_prompt_checkpoint_bytes", prompt_checkpoint_bytes},
@@ -602,7 +808,7 @@ struct server_slot {
         return res;
     }
 
-    void copy_state_to(server_slot & other) const {
+    void copy_state_to(server_slot & other, bool copy_prompt_state) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
         common_context_seq_rm(ctx_tgt, other.id,     -1, -1);
@@ -622,7 +828,13 @@ struct server_slot {
         other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
-        other.prompt = prompt.clone();
+        if (copy_prompt_state) {
+            other.prompt = prompt.clone();
+        } else {
+            server_prompt prompt_without_state;
+            prompt_without_state.tokens = prompt.tokens.clone();
+            other.prompt = std::move(prompt_without_state);
+        }
         other.init_sampler();
     }
 };
@@ -718,6 +930,7 @@ public:
     }
 
     ~server_context_impl() {
+        stop_durable_io_worker();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -762,8 +975,272 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<server_snapshot_store> snapshot_store;
+    std::unique_ptr<server_snapshot_manifest> snapshot_manifest;
+    std::map<std::string, server_snapshot_store_entry> durable_store_entries;
+    uint64_t durable_store_disk_bytes = 0;
+    uint64_t durable_store_disk_budget_bytes = 0;
+    uint64_t durable_store_disk_high_water_bytes = 0;
+    uint64_t durable_store_recovered_temp_files = 0;
+    uint64_t durable_store_ignored_corrupt_files = 0;
+    uint64_t durable_store_runtime_integrity_failures = 0;
+    uint64_t durable_store_orphaned_disk_bytes = 0;
+    std::map<std::string, server_snapshot_manifest_ref> durable_manifest_refs;
+    std::set<std::string> durable_managed_digests;
+    std::map<std::string, server_snapshot_logical_head> durable_logical_heads;
+    uint64_t durable_manifest_revision = 0;
+    uint64_t durable_manifest_file_bytes = 0;
+    uint64_t durable_manifest_budget_bytes = 0;
+    uint64_t durable_manifest_high_water_bytes = 0;
+    uint64_t durable_manifest_record_count = 0;
+    uint64_t durable_manifest_recovered_temp_files = 0;
+    uint64_t durable_manifest_recovered_tail_bytes = 0;
+    uint64_t durable_manifest_compactions = 0;
+    uint64_t durable_manifest_recovered_publish_commits = 0;
+    uint64_t durable_manifest_recovered_publish_aborts = 0;
+    uint64_t durable_managed_recovered_erases = 0;
+    uint64_t durable_managed_recovered_bytes = 0;
 
     server_metrics metrics;
+
+    struct statetree_family {
+        int source_id = -1;
+        int64_t state_id = -1;
+        int64_t fork_id = -1;
+        uint64_t touch = 0;
+        int64_t lease_deadline_us = -1;
+        size_t state_bytes = 0;
+        bool active = false;
+        std::vector<server_slot *> members;
+    };
+
+    struct statetree_node_ref {
+        int id_slot = -1;
+        int64_t node_id = -1;
+        int64_t parent_node_id = -1;
+        int64_t materialized_snapshot_id = -1;
+        std::string materialized_content_digest;
+
+        json to_json() const {
+            return json {
+                { "id_slot", id_slot },
+                { "node_id", node_id },
+                { "parent_node_id", parent_node_id },
+                { "materialized_snapshot_id", materialized_snapshot_id >= 0
+                    ? json(materialized_snapshot_id)
+                    : json(nullptr) },
+                { "materialized_content_digest", materialized_content_digest.empty()
+                    ? json(nullptr)
+                    : json(materialized_content_digest) },
+            };
+        }
+    };
+
+    struct statetree_snapshot_payload {
+        llama_tokens tokens;
+        std::vector<uint8_t> state;
+        std::string digest;
+
+        size_t payload_bytes() const {
+            return state.size() + tokens.size() * sizeof(llama_token);
+        }
+    };
+
+    struct statetree_snapshot {
+        int64_t snapshot_id = -1;
+        int64_t state_id = -1;
+        int64_t source_node_id = -1;
+        int64_t source_fork_id = -1;
+        int source_slot = -1;
+        int64_t captured_at_us = 0;
+        std::shared_ptr<const statetree_snapshot_payload> payload;
+
+        size_t payload_bytes() const {
+            return payload->payload_bytes();
+        }
+
+        json to_json() const {
+            return json {
+                { "snapshot_id", snapshot_id },
+                { "state_id", state_id },
+                { "source_node_id", source_node_id },
+                { "source_fork_id", source_fork_id },
+                { "source_slot", source_slot },
+                { "captured_at_us", captured_at_us },
+                { "n_tokens", payload->tokens.size() },
+                { "state_bytes", payload->state.size() },
+                { "token_bytes", payload->tokens.size() * sizeof(llama_token) },
+                { "payload_bytes", payload_bytes() },
+                { "digest", payload->digest },
+            };
+        }
+    };
+
+    enum class durable_io_operation {
+        spill,
+        publish,
+        publish_advance,
+        load,
+        erase,
+        retain,
+        release,
+        compact,
+        prune,
+        head_create,
+        head_advance,
+        head_delete,
+        head_load,
+    };
+
+    struct durable_io_job {
+        uint64_t id = 0;
+        durable_io_operation operation = durable_io_operation::load;
+        server_task request;
+        std::shared_ptr<const statetree_snapshot_payload> hot_payload;
+        std::string digest;
+        std::string owner;
+        std::string retention_class;
+        uint64_t max_load_bytes = 0;
+        uint64_t disk_reservation_bytes = 0;
+        uint64_t load_reservation_bytes = 0;
+        uint64_t target_disk_bytes = 0;
+        int64_t enqueued_us = 0;
+    };
+
+    struct durable_io_completion {
+        struct cache_eviction {
+            std::string digest;
+            uint64_t released_refs = 0;
+            uint64_t file_bytes = 0;
+            bool object_erased = false;
+            bool forgotten = false;
+        };
+        durable_io_job job;
+        bool success = false;
+        bool object_published = false;
+        bool object_erased = false;
+        bool managed_forgotten = false;
+        bool unavailable = false;
+        std::string error;
+        server_snapshot_store_spill_result spill;
+        server_snapshot_store_payload load;
+        server_snapshot_store_entry erase;
+        server_snapshot_manifest_result manifest;
+        server_snapshot_publish_begin_result publish_begin;
+        server_snapshot_publish_advance_begin_result publish_advance_begin;
+        server_snapshot_publish_advance_result publish_advance;
+        server_snapshot_manifest_compact_result compact;
+        server_snapshot_logical_head_result head;
+        std::vector<cache_eviction> cache_evictions;
+        uint64_t prune_disk_bytes_before = 0;
+        uint64_t prune_disk_bytes_after = 0;
+        uint64_t disk_bytes = 0;
+        uint64_t disk_budget_bytes = 0;
+        uint64_t disk_high_water_bytes = 0;
+        uint64_t recovered_temp_files = 0;
+        uint64_t ignored_corrupt_files = 0;
+        uint64_t runtime_integrity_failures = 0;
+        uint64_t orphaned_disk_bytes = 0;
+        uint64_t manifest_revision = 0;
+        uint64_t manifest_file_bytes = 0;
+        uint64_t manifest_budget_bytes = 0;
+        uint64_t manifest_high_water_bytes = 0;
+        uint64_t manifest_record_count = 0;
+        uint64_t manifest_recovered_temp_files = 0;
+        uint64_t manifest_recovered_tail_bytes = 0;
+        uint64_t manifest_compactions = 0;
+        int64_t started_us = 0;
+        int64_t finished_us = 0;
+    };
+
+    struct statetree_journal_entry {
+        uint64_t sequence = 0;
+        int64_t timestamp_us = 0;
+        std::string event;
+        int64_t state_id = -1;
+        int64_t fork_id = -1;
+        int64_t parent_fork_id = -1;
+        int source_slot = -1;
+        size_t state_bytes = 0;
+        std::vector<int> slots;
+        std::vector<statetree_node_ref> nodes;
+
+        json to_json() const {
+            json node_values = json::array();
+            for (const auto & node : nodes) {
+                node_values.push_back(node.to_json());
+            }
+            return json {
+                { "sequence", sequence },
+                { "timestamp_us", timestamp_us },
+                { "event", event },
+                { "state_id", state_id },
+                { "fork_id", fork_id },
+                { "parent_fork_id", parent_fork_id },
+                { "source_slot", source_slot },
+                { "state_bytes", state_bytes },
+                { "slots", slots },
+                { "nodes", node_values },
+            };
+        }
+    };
+
+    struct retention_stats {
+        size_t state_bytes = 0;
+        size_t retained_bytes = 0;
+        size_t active_bytes = 0;
+        int n_families = 0;
+        int n_active_families = 0;
+    };
+
+    uint64_t retention_touch_next = 0;
+    uint64_t statetree_next_state_id = 0;
+    uint64_t statetree_next_node_id = 0;
+    uint64_t statetree_next_fork_id = 0;
+    uint64_t statetree_next_snapshot_id = 0;
+    uint64_t statetree_journal_next_sequence = 1;
+    static constexpr size_t statetree_journal_capacity = SERVER_STATETREE_JOURNAL_CAPACITY;
+    std::deque<statetree_journal_entry> statetree_journal;
+    uint64_t state_high_water_bytes = 0;
+    uint64_t retained_high_water_bytes = 0;
+    uint64_t statetree_expired_total = 0;
+    uint64_t statetree_evicted_total = 0;
+    uint64_t statetree_reclaimed_bytes_total = 0;
+    uint64_t statetree_renewed_total = 0;
+    uint64_t statetree_pressure_rejected_total = 0;
+    uint64_t snapshot_bytes = 0;
+    uint64_t snapshot_high_water_bytes = 0;
+    uint64_t snapshots_captured_total = 0;
+    uint64_t snapshots_materialized_total = 0;
+    uint64_t snapshots_erased_total = 0;
+    uint64_t snapshot_rejected_total = 0;
+    uint64_t durable_spilled_total = 0;
+    uint64_t durable_materialized_total = 0;
+    uint64_t durable_erased_total = 0;
+    uint64_t durable_retained_total = 0;
+    uint64_t durable_released_total = 0;
+    uint64_t durable_compacted_total = 0;
+    uint64_t durable_cache_evicted_total = 0;
+    uint64_t durable_cache_reclaimed_bytes_total = 0;
+    uint64_t durable_rejected_total = 0;
+    uint64_t durable_io_completed_total = 0;
+    uint64_t durable_io_cancelled_loads_total = 0;
+    uint64_t durable_io_queue_high_water = 0;
+    uint64_t durable_io_reserved_disk_bytes = 0;
+    uint64_t durable_io_reserved_disk_high_water = 0;
+    uint64_t durable_io_reserved_load_bytes = 0;
+    uint64_t durable_io_reserved_load_high_water = 0;
+    uint64_t durable_io_next_id = 1;
+    std::unordered_set<std::string> durable_io_pending_spill_digests;
+    std::atomic<uint64_t> durable_io_pending {0};
+    std::thread durable_io_thread;
+    std::mutex durable_io_mutex;
+    std::condition_variable durable_io_condition;
+    std::deque<durable_io_job> durable_io_jobs;
+    std::map<uint64_t, durable_io_completion> durable_io_completions;
+    bool durable_io_stopping = false;
+    std::map<int64_t, statetree_snapshot> statetree_snapshots;
+    std::map<std::string, std::shared_ptr<const statetree_snapshot_payload>> statetree_snapshot_contents;
 
     json json_ui_settings = json::object();    // Primary: new name
     json json_webui_settings = json::object();    // Deprecated: use json_ui_settings instead (kept for compat)
@@ -776,6 +1253,1175 @@ private:
     std::set<std::string> model_tags;    // informational tags
 
     bool sleeping = false;
+
+    bool retention_enabled() const {
+        return params_base.statetree_lease_ms > 0 || params_base.statetree_max_state_bytes > 0;
+    }
+
+    void record_statetree_event(
+            const char * event,
+            int64_t state_id,
+            int64_t fork_id,
+            int source_slot,
+            std::vector<int> event_slots,
+            size_t state_bytes,
+            int64_t parent_fork_id = -1,
+            std::vector<statetree_node_ref> event_nodes = {}) {
+        if (state_id < 0) {
+            return;
+        }
+        if (statetree_journal.size() == statetree_journal_capacity) {
+            statetree_journal.pop_front();
+        }
+        statetree_journal.push_back(statetree_journal_entry {
+            statetree_journal_next_sequence++,
+            ggml_time_us(),
+            event,
+            state_id,
+            fork_id,
+            parent_fork_id,
+            source_slot,
+            state_bytes,
+            std::move(event_slots),
+            std::move(event_nodes),
+        });
+    }
+
+    std::vector<statetree_node_ref> get_statetree_node_refs(
+            const std::vector<server_slot *> & members) const {
+        std::vector<statetree_node_ref> result;
+        result.reserve(members.size());
+        for (const server_slot * member : members) {
+            if (member->node_id >= 0) {
+                result.push_back({ member->id, member->node_id, member->parent_node_id,
+                        member->materialized_snapshot_id, member->materialized_content_digest });
+            }
+        }
+        std::sort(result.begin(), result.end(), [](const auto & left, const auto & right) {
+            return left.id_slot < right.id_slot;
+        });
+        return result;
+    }
+
+    json get_statetree_nodes_json(const std::vector<server_slot *> & members) const {
+        json result = json::array();
+        for (const auto & node : get_statetree_node_refs(members)) {
+            result.push_back(node.to_json());
+        }
+        return result;
+    }
+
+    std::vector<statetree_family> collect_statetree_families() {
+        std::vector<statetree_family> families;
+        for (server_slot & slot : slots) {
+            if (!slot.is_fork_reserved()) {
+                continue;
+            }
+
+            auto family = std::find_if(families.begin(), families.end(), [&](const statetree_family & value) {
+                return value.source_id == slot.fork_source_id && value.fork_id == slot.fork_id;
+            });
+            if (family == families.end()) {
+                statetree_family value;
+                value.source_id = slot.fork_source_id;
+                value.state_id = slot.state_id;
+                value.fork_id = slot.fork_id;
+                value.touch = slot.retention_touch;
+                value.lease_deadline_us = slot.lease_deadline_us;
+                families.push_back(std::move(value));
+                family = std::prev(families.end());
+            }
+            GGML_ASSERT(family->state_id == slot.state_id);
+            family->state_bytes += slot.prompt_state_bytes();
+            family->active = family->active || slot.is_processing();
+            family->members.push_back(&slot);
+        }
+
+        for (auto & family : families) {
+            std::sort(family.members.begin(), family.members.end(), [](const server_slot * left, const server_slot * right) {
+                return left->id < right->id;
+            });
+        }
+        return families;
+    }
+
+    json get_statetree_states_json() {
+        json result = json::array();
+        auto families = collect_statetree_families();
+        std::sort(families.begin(), families.end(), [](const statetree_family & left, const statetree_family & right) {
+            return left.state_id < right.state_id;
+        });
+        const int64_t now_us = ggml_time_us();
+        for (const auto & family : families) {
+            std::vector<int> members;
+            json heads = json::array();
+            members.reserve(family.members.size());
+            size_t n_tokens = 0;
+            for (const server_slot * slot : family.members) {
+                members.push_back(slot->id);
+                heads.push_back(statetree_node_ref {
+                    slot->id,
+                    slot->node_id,
+                    slot->parent_node_id,
+                    slot->materialized_snapshot_id,
+                    slot->materialized_content_digest,
+                }.to_json());
+                n_tokens += slot->prompt.tokens.size();
+            }
+            const bool singleton = family.members.size() == 1;
+            const bool committed = singleton && family.members.front()->is_fork_root();
+            result.push_back({
+                { "state_id", family.state_id },
+                { "fork_id", family.fork_id },
+                { "source_slot", family.source_id },
+                { "canonical_slot", singleton ? json(family.members.front()->id) : json(nullptr) },
+                { "canonical_node_id", singleton ? json(family.members.front()->node_id) : json(nullptr) },
+                { "status", committed ? "committed" : (singleton ? "single_head" : "forked") },
+                { "members", members },
+                { "heads", heads },
+                { "n_members", members.size() },
+                { "n_tokens", n_tokens },
+                { "state_bytes", family.state_bytes },
+                { "active", family.active },
+                { "retention_touch", family.touch },
+                { "lease_remaining_ms", family.active || family.lease_deadline_us < 0
+                    ? -1
+                    : std::max<int64_t>(0, (family.lease_deadline_us - now_us + 999) / 1000) },
+            });
+        }
+        return result;
+    }
+
+    json get_statetree_journal_json() const {
+        json result = json::array();
+        for (const auto & entry : statetree_journal) {
+            result.push_back(entry.to_json());
+        }
+        return result;
+    }
+
+    static void snapshot_hash_u64(server_sha256 & hash, uint64_t value) {
+        unsigned char bytes[8];
+        for (size_t i = 0; i < sizeof(bytes); ++i) {
+            bytes[i] = (unsigned char) (value >> (i * 8));
+        }
+        hash.update(bytes, sizeof(bytes));
+    }
+
+    static std::string snapshot_content_digest(
+            const llama_tokens & tokens,
+            const std::vector<uint8_t> & state) {
+        static constexpr unsigned char domain[] = "turbo-statetree-snapshot-v1\0";
+        server_sha256 hash;
+        hash.update(domain, sizeof(domain));
+        snapshot_hash_u64(hash, tokens.size());
+        for (const llama_token token : tokens) {
+            const uint32_t value = (uint32_t) token;
+            unsigned char bytes[4];
+            for (size_t i = 0; i < sizeof(bytes); ++i) {
+                bytes[i] = (unsigned char) (value >> (i * 8));
+            }
+            hash.update(bytes, sizeof(bytes));
+        }
+        snapshot_hash_u64(hash, state.size());
+        if (!state.empty()) {
+            hash.update(state.data(), state.size());
+        }
+        unsigned char digest[SHA256_DIGEST_SIZE];
+        hash.final(digest);
+        std::ostringstream encoded;
+        encoded << "sha256:" << std::hex << std::setfill('0');
+        for (const unsigned char byte : digest) {
+            encoded << std::setw(2) << (unsigned int) byte;
+        }
+        return encoded.str();
+    }
+
+    json get_statetree_snapshots_json() const {
+        json result = json::array();
+        for (const auto & entry : statetree_snapshots) {
+            result.push_back(entry.second.to_json());
+        }
+        return result;
+    }
+
+    json get_snapshot_store_contents_json() const {
+        json result = json::array();
+        if (!snapshot_store) {
+            return result;
+        }
+        for (const auto & item : durable_store_entries) {
+            const auto & entry = item.second;
+            result.push_back({
+                {"digest", entry.digest},
+                {"n_tokens", entry.n_tokens},
+                {"state_bytes", entry.state_bytes},
+                {"payload_bytes", entry.payload_bytes},
+                {"file_bytes", entry.file_bytes},
+                {"ref_count", durable_manifest_ref_count(entry.digest)},
+                {"owner_ref_count", (uint64_t) std::count_if(
+                    durable_manifest_refs.begin(), durable_manifest_refs.end(), [&](const auto & item) {
+                        return item.second.digest == entry.digest;
+                    })},
+                {"head_ref_count", (uint64_t) std::count_if(
+                    durable_logical_heads.begin(), durable_logical_heads.end(), [&](const auto & item) {
+                        return item.second.digest == entry.digest;
+                    })},
+                {"managed", durable_managed_digests.find(entry.digest) != durable_managed_digests.end()},
+            });
+        }
+        return result;
+    }
+
+    void refresh_durable_store_cache() {
+        if (!snapshot_store) {
+            durable_store_entries.clear();
+            durable_store_disk_bytes = 0;
+            durable_store_disk_budget_bytes = 0;
+            durable_store_disk_high_water_bytes = 0;
+            durable_store_recovered_temp_files = 0;
+            durable_store_ignored_corrupt_files = 0;
+            durable_store_runtime_integrity_failures = 0;
+            durable_store_orphaned_disk_bytes = 0;
+            return;
+        }
+        durable_store_entries = snapshot_store->entries();
+        durable_store_disk_bytes = snapshot_store->disk_bytes();
+        durable_store_disk_budget_bytes = snapshot_store->disk_budget_bytes();
+        durable_store_disk_high_water_bytes = snapshot_store->disk_high_water_bytes();
+        durable_store_recovered_temp_files = snapshot_store->recovered_temp_files();
+        durable_store_ignored_corrupt_files = snapshot_store->ignored_corrupt_files();
+        durable_store_runtime_integrity_failures = snapshot_store->runtime_integrity_failures();
+        durable_store_orphaned_disk_bytes = snapshot_store->orphaned_disk_bytes();
+    }
+
+    void refresh_durable_manifest_cache() {
+        if (!snapshot_manifest) {
+            durable_manifest_refs.clear();
+            durable_managed_digests.clear();
+            durable_logical_heads.clear();
+            durable_manifest_revision = 0;
+            durable_manifest_file_bytes = 0;
+            durable_manifest_budget_bytes = 0;
+            durable_manifest_high_water_bytes = 0;
+            durable_manifest_record_count = 0;
+            durable_manifest_recovered_temp_files = 0;
+            durable_manifest_recovered_tail_bytes = 0;
+            durable_manifest_compactions = 0;
+            return;
+        }
+        durable_manifest_refs = snapshot_manifest->refs();
+        durable_managed_digests = snapshot_manifest->managed_digests();
+        durable_logical_heads = snapshot_manifest->logical_heads();
+        durable_manifest_revision = snapshot_manifest->revision();
+        durable_manifest_file_bytes = snapshot_manifest->file_bytes();
+        durable_manifest_budget_bytes = snapshot_manifest->byte_budget();
+        durable_manifest_high_water_bytes = snapshot_manifest->high_water_bytes();
+        durable_manifest_record_count = snapshot_manifest->record_count();
+        durable_manifest_recovered_temp_files = snapshot_manifest->recovered_temp_files();
+        durable_manifest_recovered_tail_bytes = snapshot_manifest->recovered_tail_bytes();
+        durable_manifest_compactions = snapshot_manifest->compactions();
+    }
+
+    uint64_t durable_manifest_ref_count(const std::string & digest) const {
+        const uint64_t owner_refs = (uint64_t) std::count_if(
+                durable_manifest_refs.begin(), durable_manifest_refs.end(), [&](const auto & item) {
+                    return item.second.digest == digest;
+                });
+        const uint64_t head_refs = (uint64_t) std::count_if(
+                durable_logical_heads.begin(), durable_logical_heads.end(), [&](const auto & item) {
+                    return item.second.digest == digest;
+                });
+        return owner_refs + head_refs;
+    }
+
+    json get_snapshot_manifest_refs_json() const {
+        json result = json::array();
+        for (const auto & item : durable_manifest_refs) {
+            const auto & ref = item.second;
+            result.push_back({
+                {"owner", ref.owner},
+                {"digest", ref.digest},
+                {"retention_class", ref.retention_class},
+                {"revision", ref.revision},
+            });
+        }
+        return result;
+    }
+
+    json get_snapshot_managed_digests_json() const {
+        return json(durable_managed_digests);
+    }
+
+    json get_snapshot_logical_heads_json() const {
+        json result = json::array();
+        for (const auto & item : durable_logical_heads) {
+            const auto & head = item.second;
+            result.push_back({
+                {"name", head.name},
+                {"digest", head.digest},
+                {"parent_digest", head.parent_digest.empty() ? json(nullptr) : json(head.parent_digest)},
+                {"generation", head.generation},
+                {"revision", head.revision},
+            });
+        }
+        return result;
+    }
+
+    void apply_durable_store_cache(durable_io_completion & completion) {
+        if (completion.success || completion.object_published || completion.object_erased) {
+            switch (completion.job.operation) {
+                case durable_io_operation::spill:
+                case durable_io_operation::publish:
+                case durable_io_operation::publish_advance:
+                    durable_store_entries[completion.spill.entry.digest] = completion.spill.entry;
+                    break;
+                case durable_io_operation::load:
+                    break;
+                case durable_io_operation::erase:
+                    durable_store_entries.erase(completion.erase.digest);
+                    break;
+                case durable_io_operation::retain:
+                case durable_io_operation::release:
+                case durable_io_operation::compact:
+                case durable_io_operation::prune:
+                case durable_io_operation::head_create:
+                case durable_io_operation::head_advance:
+                case durable_io_operation::head_delete:
+                case durable_io_operation::head_load:
+                    break;
+            }
+        }
+        for (const auto & eviction : completion.cache_evictions) {
+            if (eviction.object_erased) {
+                durable_store_entries.erase(eviction.digest);
+            }
+        }
+        durable_store_disk_bytes = completion.disk_bytes;
+        durable_store_disk_budget_bytes = completion.disk_budget_bytes;
+        durable_store_disk_high_water_bytes = completion.disk_high_water_bytes;
+        durable_store_recovered_temp_files = completion.recovered_temp_files;
+        durable_store_ignored_corrupt_files = completion.ignored_corrupt_files;
+        durable_store_runtime_integrity_failures = completion.runtime_integrity_failures;
+        durable_store_orphaned_disk_bytes = completion.orphaned_disk_bytes;
+    }
+
+    void apply_durable_manifest_cache(const durable_io_completion & completion) {
+        if (completion.success) {
+            switch (completion.job.operation) {
+                case durable_io_operation::retain:
+                case durable_io_operation::publish:
+                    durable_manifest_refs[completion.manifest.ref.owner + '\0' + completion.manifest.ref.digest] =
+                        completion.manifest.ref;
+                    if (completion.job.operation == durable_io_operation::publish) {
+                        durable_managed_digests.insert(completion.manifest.ref.digest);
+                    }
+                    break;
+                case durable_io_operation::publish_advance:
+                    durable_manifest_refs[
+                        completion.publish_advance.ref.owner + '\0' +
+                        completion.publish_advance.ref.digest] = completion.publish_advance.ref;
+                    durable_managed_digests.insert(completion.publish_advance.ref.digest);
+                    durable_logical_heads[completion.publish_advance.head.name] =
+                        completion.publish_advance.head;
+                    break;
+                case durable_io_operation::release:
+                    durable_manifest_refs.erase(
+                            completion.manifest.ref.owner + '\0' + completion.manifest.ref.digest);
+                    break;
+                case durable_io_operation::head_create:
+                case durable_io_operation::head_advance:
+                    durable_logical_heads[completion.head.head.name] = completion.head.head;
+                    break;
+                case durable_io_operation::head_delete:
+                    durable_logical_heads.erase(completion.head.head.name);
+                    break;
+                case durable_io_operation::spill:
+                case durable_io_operation::load:
+                case durable_io_operation::erase:
+                case durable_io_operation::compact:
+                case durable_io_operation::prune:
+                case durable_io_operation::head_load:
+                    break;
+            }
+        }
+        for (const auto & eviction : completion.cache_evictions) {
+            for (auto it = durable_manifest_refs.begin(); it != durable_manifest_refs.end();) {
+                if (it->second.digest == eviction.digest) {
+                    it = durable_manifest_refs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (eviction.forgotten) {
+                durable_managed_digests.erase(eviction.digest);
+            }
+        }
+        if (completion.managed_forgotten) {
+            durable_managed_digests.erase(completion.job.digest);
+        }
+        durable_manifest_revision = completion.manifest_revision;
+        durable_manifest_file_bytes = completion.manifest_file_bytes;
+        durable_manifest_budget_bytes = completion.manifest_budget_bytes;
+        durable_manifest_high_water_bytes = completion.manifest_high_water_bytes;
+        durable_manifest_record_count = completion.manifest_record_count;
+        durable_manifest_recovered_temp_files = completion.manifest_recovered_temp_files;
+        durable_manifest_recovered_tail_bytes = completion.manifest_recovered_tail_bytes;
+        durable_manifest_compactions = completion.manifest_compactions;
+    }
+
+    void prune_managed_cache(
+            durable_io_completion & completion,
+            uint64_t target_disk_bytes,
+            const std::string & protected_digest = {}) {
+        completion.prune_disk_bytes_before = snapshot_store->disk_bytes();
+        if (completion.prune_disk_bytes_before <= target_disk_bytes) {
+            completion.prune_disk_bytes_after = completion.prune_disk_bytes_before;
+            return;
+        }
+
+        std::vector<server_snapshot_cache_eviction_candidate> planned;
+        uint64_t reclaimable_bytes = 0;
+        for (const auto & candidate : snapshot_manifest->cache_eviction_candidates()) {
+            if (candidate.digest == protected_digest) {
+                continue;
+            }
+            planned.push_back(candidate);
+            server_snapshot_store_entry entry;
+            if (snapshot_store->find_entry(candidate.digest, entry)) {
+                reclaimable_bytes += entry.file_bytes;
+            }
+            if (reclaimable_bytes >= completion.prune_disk_bytes_before - target_disk_bytes) {
+                break;
+            }
+        }
+        if (reclaimable_bytes < completion.prune_disk_bytes_before - target_disk_bytes) {
+            throw server_snapshot_store_error(
+                    "durable disk pressure cannot be reclaimed without crossing a pinned or unmanaged fence",
+                    true);
+        }
+
+        for (const auto & selected : planned) {
+            if (snapshot_store->disk_bytes() <= target_disk_bytes) {
+                break;
+            }
+
+            durable_io_completion::cache_eviction eviction;
+            eviction.digest = selected.digest;
+            server_snapshot_store_entry entry;
+            const bool has_object = snapshot_store->find_entry(selected.digest, entry);
+            if (has_object) {
+                eviction.file_bytes = entry.file_bytes;
+            }
+            if (selected.refs > 0) {
+                const auto evicted = snapshot_manifest->evict_cache(selected.digest);
+                eviction.released_refs = evicted.released_refs;
+            }
+            completion.cache_evictions.push_back(eviction);
+            if (has_object) {
+                snapshot_store->erase(selected.digest);
+                completion.cache_evictions.back().object_erased = true;
+            }
+            snapshot_manifest->forget_managed(selected.digest);
+            completion.cache_evictions.back().forgotten = true;
+        }
+        completion.prune_disk_bytes_after = snapshot_store->disk_bytes();
+    }
+
+    void start_durable_io_worker() {
+        if (!snapshot_store || durable_io_thread.joinable()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(durable_io_mutex);
+            durable_io_stopping = false;
+        }
+        durable_io_thread = std::thread([this]() {
+            while (true) {
+                durable_io_job job;
+                {
+                    std::unique_lock<std::mutex> lock(durable_io_mutex);
+                    durable_io_condition.wait(lock, [this]() {
+                        return durable_io_stopping || !durable_io_jobs.empty();
+                    });
+                    if (durable_io_stopping) {
+                        break;
+                    }
+                    job = std::move(durable_io_jobs.front());
+                    durable_io_jobs.pop_front();
+                }
+
+                durable_io_completion completion;
+                completion.job = std::move(job);
+                completion.started_us = ggml_time_us();
+                try {
+                    switch (completion.job.operation) {
+                        case durable_io_operation::spill:
+                            GGML_ASSERT(completion.job.hot_payload);
+                            completion.spill = snapshot_store->spill(
+                                    completion.job.hot_payload->digest,
+                                    completion.job.hot_payload->tokens,
+                                    completion.job.hot_payload->state);
+                            break;
+                        case durable_io_operation::publish:
+                            {
+                                GGML_ASSERT(completion.job.hot_payload);
+                                completion.publish_begin = snapshot_manifest->begin_publish(
+                                        completion.job.owner,
+                                        completion.job.digest,
+                                        completion.job.retention_class);
+                                try {
+                                    server_snapshot_store_entry existing_entry;
+                                    if (!snapshot_store->find_entry(completion.job.digest, existing_entry)) {
+                                        const uint64_t projected = snapshot_store->projected_file_bytes(
+                                                completion.job.hot_payload->tokens.size(),
+                                                completion.job.hot_payload->state.size());
+                                        const uint64_t budget = snapshot_store->disk_budget_bytes();
+                                        if (projected > budget) {
+                                            throw server_snapshot_store_error(
+                                                    "managed snapshot object exceeds the durable disk budget", true);
+                                        }
+                                        prune_managed_cache(
+                                                completion, budget - projected, completion.job.digest);
+                                    }
+                                    completion.spill = snapshot_store->spill(
+                                            completion.job.hot_payload->digest,
+                                            completion.job.hot_payload->tokens,
+                                            completion.job.hot_payload->state);
+                                    completion.object_published = true;
+                                } catch (...) {
+                                    if (!completion.publish_begin.already_retained) {
+                                        try {
+                                            snapshot_manifest->abort_publish(
+                                                    completion.job.owner, completion.job.digest);
+                                        } catch (const std::exception & abort_error) {
+                                            throw server_snapshot_manifest_error(
+                                                    std::string("snapshot publish failed and its durable intent could not be aborted: ") +
+                                                    abort_error.what());
+                                        }
+                                    }
+                                    throw;
+                                }
+                                if (completion.publish_begin.already_retained) {
+                                    if (completion.publish_begin.existing_ref.retention_class ==
+                                            completion.job.retention_class) {
+                                        completion.manifest = {
+                                            completion.publish_begin.existing_ref,
+                                            true,
+                                            snapshot_manifest->revision(),
+                                            snapshot_manifest->file_bytes(),
+                                        };
+                                    } else {
+                                        completion.manifest = snapshot_manifest->retain(
+                                                completion.job.owner,
+                                                completion.job.digest,
+                                                completion.job.retention_class);
+                                    }
+                                } else {
+                                    completion.manifest = snapshot_manifest->commit_publish(
+                                            completion.job.owner, completion.job.digest);
+                                }
+                            } break;
+                        case durable_io_operation::publish_advance:
+                            {
+                                GGML_ASSERT(completion.job.hot_payload);
+                                completion.publish_advance_begin =
+                                    snapshot_manifest->begin_publish_advance(
+                                        completion.job.owner,
+                                        completion.job.digest,
+                                        completion.job.retention_class,
+                                        completion.job.request.slot_action.head_name,
+                                        completion.job.request.slot_action.expected_generation,
+                                        completion.job.request.slot_action.expected_digest);
+                                try {
+                                    server_snapshot_store_entry existing_entry;
+                                    if (!snapshot_store->find_entry(completion.job.digest, existing_entry)) {
+                                        const uint64_t projected = snapshot_store->projected_file_bytes(
+                                                completion.job.hot_payload->tokens.size(),
+                                                completion.job.hot_payload->state.size());
+                                        const uint64_t budget = snapshot_store->disk_budget_bytes();
+                                        if (projected > budget) {
+                                            throw server_snapshot_store_error(
+                                                    "atomic publish-and-advance object exceeds the durable disk budget",
+                                                    true);
+                                        }
+                                        prune_managed_cache(
+                                                completion, budget - projected, completion.job.digest);
+                                    }
+                                    completion.spill = snapshot_store->spill(
+                                            completion.job.hot_payload->digest,
+                                            completion.job.hot_payload->tokens,
+                                            completion.job.hot_payload->state);
+                                    completion.object_published = true;
+                                } catch (...) {
+                                    if (!completion.publish_advance_begin.already_committed) {
+                                        try {
+                                            snapshot_manifest->abort_publish_advance(
+                                                    completion.job.owner, completion.job.digest);
+                                        } catch (const std::exception & abort_error) {
+                                            throw server_snapshot_manifest_error(
+                                                    std::string("atomic publish-and-advance failed and its durable intent could not be aborted: ") +
+                                                    abort_error.what());
+                                        }
+                                    }
+                                    throw;
+                                }
+                                if (completion.publish_advance_begin.already_committed) {
+                                    completion.publish_advance = {
+                                        completion.publish_advance_begin.ref,
+                                        completion.publish_advance_begin.head,
+                                        true,
+                                        snapshot_manifest->revision(),
+                                        snapshot_manifest->file_bytes(),
+                                    };
+                                } else {
+                                    completion.publish_advance =
+                                        snapshot_manifest->commit_publish_advance(
+                                            completion.job.owner, completion.job.digest);
+                                }
+                            } break;
+                        case durable_io_operation::load:
+                            completion.load = snapshot_store->load(
+                                    completion.job.digest,
+                                    completion.job.max_load_bytes);
+                            break;
+                        case durable_io_operation::erase:
+                            if (snapshot_manifest->ref_count(completion.job.digest) > 0 ||
+                                    snapshot_manifest->publish_intent_count(completion.job.digest) > 0) {
+                                throw server_snapshot_store_error(
+                                        "durable snapshot content is retained by manifest owners", true);
+                            }
+                            completion.erase = snapshot_store->erase(completion.job.digest);
+                            completion.object_erased = true;
+                            if (snapshot_manifest->managed_digests().find(completion.job.digest) !=
+                                    snapshot_manifest->managed_digests().end()) {
+                                snapshot_manifest->forget_managed(completion.job.digest);
+                                completion.managed_forgotten = true;
+                            }
+                            break;
+                        case durable_io_operation::retain:
+                            {
+                                server_snapshot_store_entry entry;
+                                if (!snapshot_store->find_entry(completion.job.digest, entry)) {
+                                    throw server_snapshot_manifest_error(
+                                            "durable snapshot content is unavailable", true);
+                                }
+                                completion.manifest = snapshot_manifest->retain(
+                                        completion.job.owner,
+                                        completion.job.digest,
+                                        completion.job.retention_class);
+                            } break;
+                        case durable_io_operation::release:
+                            completion.manifest = snapshot_manifest->release(
+                                    completion.job.owner, completion.job.digest);
+                            break;
+                        case durable_io_operation::compact:
+                            completion.compact = snapshot_manifest->compact();
+                            break;
+                        case durable_io_operation::prune:
+                            prune_managed_cache(completion, completion.job.target_disk_bytes);
+                            break;
+                        case durable_io_operation::head_create:
+                            {
+                                server_snapshot_store_entry entry;
+                                if (!snapshot_store->find_entry(completion.job.digest, entry)) {
+                                    throw server_snapshot_manifest_error(
+                                            "logical head content is unavailable", true);
+                                }
+                                completion.head = snapshot_manifest->create_head(
+                                        completion.job.request.slot_action.head_name,
+                                        completion.job.digest);
+                            } break;
+                        case durable_io_operation::head_advance:
+                            {
+                                server_snapshot_store_entry entry;
+                                if (!snapshot_store->find_entry(completion.job.digest, entry)) {
+                                    throw server_snapshot_manifest_error(
+                                            "logical head target content is unavailable", true);
+                                }
+                                completion.head = snapshot_manifest->advance_head(
+                                        completion.job.request.slot_action.head_name,
+                                        completion.job.request.slot_action.expected_generation,
+                                        completion.job.request.slot_action.expected_digest,
+                                        completion.job.digest);
+                            } break;
+                        case durable_io_operation::head_delete:
+                            completion.head = snapshot_manifest->delete_head(
+                                    completion.job.request.slot_action.head_name,
+                                    completion.job.request.slot_action.expected_generation,
+                                    completion.job.request.slot_action.expected_digest);
+                            break;
+                        case durable_io_operation::head_load:
+                            {
+                                const auto & heads = snapshot_manifest->logical_heads();
+                                const auto found = heads.find(completion.job.request.slot_action.head_name);
+                                if (found == heads.end() ||
+                                        found->second.generation !=
+                                            completion.job.request.slot_action.expected_generation ||
+                                        found->second.digest !=
+                                            completion.job.request.slot_action.expected_digest) {
+                                    throw server_snapshot_manifest_error(
+                                            "logical head compare-and-swap conflict", true);
+                                }
+                                completion.head = {found->second, true,
+                                    snapshot_manifest->revision(), snapshot_manifest->file_bytes()};
+                                completion.load = snapshot_store->load(
+                                        found->second.digest, completion.job.max_load_bytes);
+                            } break;
+                    }
+                    completion.success = true;
+                } catch (const server_snapshot_store_error & error) {
+                    completion.unavailable = error.unavailable;
+                    completion.error = error.what();
+                } catch (const server_snapshot_manifest_error & error) {
+                    completion.unavailable = error.unavailable;
+                    completion.error = error.what();
+                } catch (const std::exception & error) {
+                    completion.error = std::string("durable snapshot I/O failed: ") + error.what();
+                }
+                completion.finished_us = ggml_time_us();
+                completion.disk_bytes = snapshot_store->disk_bytes();
+                completion.disk_budget_bytes = snapshot_store->disk_budget_bytes();
+                completion.disk_high_water_bytes = snapshot_store->disk_high_water_bytes();
+                completion.recovered_temp_files = snapshot_store->recovered_temp_files();
+                completion.ignored_corrupt_files = snapshot_store->ignored_corrupt_files();
+                completion.runtime_integrity_failures = snapshot_store->runtime_integrity_failures();
+                completion.orphaned_disk_bytes = snapshot_store->orphaned_disk_bytes();
+                completion.manifest_revision = snapshot_manifest->revision();
+                completion.manifest_file_bytes = snapshot_manifest->file_bytes();
+                completion.manifest_budget_bytes = snapshot_manifest->byte_budget();
+                completion.manifest_high_water_bytes = snapshot_manifest->high_water_bytes();
+                completion.manifest_record_count = snapshot_manifest->record_count();
+                completion.manifest_recovered_temp_files = snapshot_manifest->recovered_temp_files();
+                completion.manifest_recovered_tail_bytes = snapshot_manifest->recovered_tail_bytes();
+                completion.manifest_compactions = snapshot_manifest->compactions();
+
+                const uint64_t completion_id = completion.job.id;
+                bool publish = false;
+                {
+                    std::lock_guard<std::mutex> lock(durable_io_mutex);
+                    if (!durable_io_stopping) {
+                        const auto inserted = durable_io_completions.emplace(
+                                completion_id, std::move(completion));
+                        GGML_ASSERT(inserted.second);
+                        publish = true;
+                    }
+                }
+                if (publish) {
+                    server_task completed(SERVER_TASK_TYPE_DURABLE_IO_COMPLETE);
+                    completed.id = queue_tasks.get_new_id();
+                    completed.slot_action.durable_io_id = completion_id;
+                    queue_tasks.post(std::move(completed));
+                } else {
+                    send_error(completion.job.request,
+                            "durable snapshot I/O was canceled during server shutdown",
+                            ERROR_TYPE_UNAVAILABLE);
+                }
+            }
+        });
+    }
+
+    void stop_durable_io_worker() {
+        std::vector<int> cancelled_task_ids;
+        {
+            std::lock_guard<std::mutex> lock(durable_io_mutex);
+            durable_io_stopping = true;
+            for (const auto & job : durable_io_jobs) {
+                cancelled_task_ids.push_back(job.request.id);
+            }
+            for (const auto & item : durable_io_completions) {
+                cancelled_task_ids.push_back(item.second.job.request.id);
+            }
+            durable_io_jobs.clear();
+            durable_io_completions.clear();
+        }
+        for (const int id_task : cancelled_task_ids) {
+            send_error(id_task,
+                    "durable snapshot I/O was canceled during server shutdown",
+                    ERROR_TYPE_UNAVAILABLE);
+        }
+        durable_io_condition.notify_all();
+        if (durable_io_thread.joinable()) {
+            durable_io_thread.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(durable_io_mutex);
+            GGML_ASSERT(durable_io_jobs.empty());
+            GGML_ASSERT(durable_io_completions.empty());
+        }
+    }
+
+    bool enqueue_durable_io(durable_io_job & job) {
+        {
+            std::lock_guard<std::mutex> lock(durable_io_mutex);
+            if (durable_io_stopping || !durable_io_thread.joinable()) {
+                return false;
+            }
+            durable_io_jobs.push_back(std::move(job));
+        }
+        const uint64_t pending = durable_io_pending.fetch_add(1) + 1;
+        durable_io_queue_high_water = std::max(durable_io_queue_high_water, pending);
+        durable_io_condition.notify_one();
+        return true;
+    }
+
+    bool take_durable_io_completion(uint64_t id, durable_io_completion & completion) {
+        std::lock_guard<std::mutex> lock(durable_io_mutex);
+        const auto found = durable_io_completions.find(id);
+        if (found == durable_io_completions.end()) {
+            return false;
+        }
+        completion = std::move(found->second);
+        durable_io_completions.erase(found);
+        return true;
+    }
+
+    void release_durable_io_reservations(const durable_io_job & job) {
+        if (job.disk_reservation_bytes > 0) {
+            GGML_ASSERT(durable_io_reserved_disk_bytes >= job.disk_reservation_bytes);
+            durable_io_reserved_disk_bytes -= job.disk_reservation_bytes;
+            durable_io_pending_spill_digests.erase(job.digest);
+        }
+        if (job.load_reservation_bytes > 0) {
+            GGML_ASSERT(durable_io_reserved_load_bytes >= job.load_reservation_bytes);
+            durable_io_reserved_load_bytes -= job.load_reservation_bytes;
+        }
+        const uint64_t previous = durable_io_pending.fetch_sub(1);
+        GGML_ASSERT(previous > 0);
+        durable_io_completed_total++;
+    }
+
+    statetree_snapshot * resolve_snapshot(server_task & task) {
+        auto found = statetree_snapshots.find(task.slot_action.snapshot_id);
+        if (found == statetree_snapshots.end()) {
+            send_error(task, "StateTree snapshot is unavailable", ERROR_TYPE_UNAVAILABLE);
+            return nullptr;
+        }
+        if (!task.slot_action.digest.empty() && task.slot_action.digest != found->second.payload->digest) {
+            send_error(task, "StateTree snapshot does not match the requested digest", ERROR_TYPE_UNAVAILABLE);
+            return nullptr;
+        }
+        return &found->second;
+    }
+
+    retention_stats get_retention_stats() {
+        retention_stats result;
+        auto families = collect_statetree_families();
+        result.n_families = families.size();
+        result.n_active_families = std::count_if(families.begin(), families.end(), [](const statetree_family & family) {
+            return family.active;
+        });
+
+        for (const server_slot & slot : slots) {
+            const size_t bytes = slot.prompt_state_bytes();
+            result.state_bytes += bytes;
+            if (slot.is_processing()) {
+                result.active_bytes += bytes;
+            } else {
+                result.retained_bytes += bytes;
+            }
+        }
+        return result;
+    }
+
+    int64_t lease_remaining_ms(const server_slot & slot, int64_t now_us) const {
+        if (slot.lease_deadline_us < 0) {
+            return -1;
+        }
+        return std::max<int64_t>(0, (slot.lease_deadline_us - now_us + 999) / 1000);
+    }
+
+    bool touch_family(int source_id, int64_t fork_id, bool renewal) {
+        const int64_t now_us = ggml_time_us();
+        const int64_t deadline_us = params_base.statetree_lease_ms > 0
+            ? now_us + (int64_t) params_base.statetree_lease_ms * 1000
+            : -1;
+        const uint64_t touch = ++retention_touch_next;
+        bool found = false;
+        for (server_slot & slot : slots) {
+            if (slot.fork_source_id != source_id || slot.fork_id != fork_id) {
+                continue;
+            }
+            slot.retention_touch = touch;
+            slot.lease_deadline_us = deadline_us;
+            found = true;
+        }
+        if (found && renewal) {
+            statetree_renewed_total++;
+        }
+        return found;
+    }
+
+    bool family_is_active(int source_id, int64_t fork_id) const {
+        return std::any_of(slots.begin(), slots.end(), [&](const server_slot & slot) {
+            return slot.fork_source_id == source_id && slot.fork_id == fork_id && slot.is_processing();
+        });
+    }
+
+    bool family_is_expired(const server_slot & slot, int64_t now_us) const {
+        return slot.lease_deadline_us >= 0 && slot.lease_deadline_us <= now_us &&
+            !family_is_active(slot.fork_source_id, slot.fork_id);
+    }
+
+    bool validate_slot_fence(const server_task & task, server_slot & slot) {
+        if (task.slot_action.fork_id >= 0) {
+            if (!slot.is_fork_reserved() || slot.fork_id != task.slot_action.fork_id ||
+                    family_is_expired(slot, ggml_time_us())) {
+                send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
+                if (slot.is_available()) {
+                    slot.callback_on_deferred(slot.id);
+                }
+                return false;
+            }
+        } else if (slot.is_fork_reserved() && retention_enabled()) {
+            send_error(task, "A generation-fenced fork_id is required for this reserved slot",
+                    ERROR_TYPE_INVALID_REQUEST);
+            return false;
+        }
+        return true;
+    }
+
+    server_slot * resolve_slot_action_target(server_task & task, const char * invalid_slot_error) {
+        server_slot * slot = nullptr;
+        if (task.slot_action.node_id >= 0) {
+            for (server_slot & candidate : slots) {
+                if (candidate.node_id == task.slot_action.node_id) {
+                    GGML_ASSERT(slot == nullptr);
+                    slot = &candidate;
+                }
+            }
+            if (slot == nullptr || !slot->is_fork_reserved()) {
+                send_error(task, "StateTree branch node is unavailable", ERROR_TYPE_UNAVAILABLE);
+                return nullptr;
+            }
+            if ((task.slot_action.id_slot >= 0 && task.slot_action.id_slot != slot->id) ||
+                    (task.slot_action.state_id >= 0 && task.slot_action.state_id != slot->state_id) ||
+                    (task.slot_action.fork_id >= 0 && task.slot_action.fork_id != slot->fork_id)) {
+                send_error(task, "StateTree branch node does not match the requested identity",
+                        ERROR_TYPE_UNAVAILABLE);
+                return nullptr;
+            }
+            task.slot_action.id_slot = slot->id;
+            task.slot_action.fork_id = slot->fork_id;
+            return slot;
+        }
+
+        slot = get_slot_by_id(task.slot_action.id_slot);
+        if (slot == nullptr) {
+            send_error(task, invalid_slot_error, ERROR_TYPE_INVALID_REQUEST);
+            return nullptr;
+        }
+        if (task.slot_action.state_id >= 0 && task.slot_action.state_id != slot->state_id) {
+            send_error(task, "StateTree state does not match the requested slot", ERROR_TYPE_UNAVAILABLE);
+            return nullptr;
+        }
+        return slot;
+    }
+
+    void release_family(const statetree_family & family, bool expired) {
+        GGML_ASSERT(!family.active);
+        const size_t reclaimed = family.state_bytes;
+        SRV_INF("StateTree %s family source=%d fork=%" PRId64 " members=%zu state=%.3f MiB\n",
+                expired ? "expiring" : "evicting", family.source_id, family.fork_id,
+                family.members.size(), reclaimed / (1024.0 * 1024.0));
+
+        std::vector<int> released;
+        released.reserve(family.members.size());
+        for (server_slot * slot : family.members) {
+            released.push_back(slot->id);
+        }
+        const auto released_nodes = get_statetree_node_refs(family.members);
+        record_statetree_event(
+                expired ? "expire" : "evict",
+                family.state_id,
+                family.fork_id,
+                family.source_id,
+                released,
+                family.state_bytes,
+                -1,
+                released_nodes);
+        for (server_slot * slot : family.members) {
+            slot->prompt_clear(false);
+        }
+
+        if (expired) {
+            statetree_expired_total++;
+        } else {
+            statetree_evicted_total++;
+        }
+        statetree_reclaimed_bytes_total += reclaimed;
+
+        for (const int id_slot : released) {
+            slots[id_slot].callback_on_deferred(id_slot);
+        }
+    }
+
+    void release_idle_slot(server_slot & slot) {
+        GGML_ASSERT(!slot.is_processing());
+        GGML_ASSERT(!slot.is_fork_reserved());
+        const size_t reclaimed = slot.prompt_state_bytes();
+        SRV_INF("evicting idle slot %d state=%.3f MiB for retained-state budget\n",
+                slot.id, reclaimed / (1024.0 * 1024.0));
+        slot.prompt_clear(false);
+        statetree_evicted_total++;
+        statetree_reclaimed_bytes_total += reclaimed;
+        slot.callback_on_deferred(slot.id);
+    }
+
+    bool reserve_state_bytes(size_t added_bytes, size_t removed_bytes, const server_slot & owner) {
+        const uint64_t budget = params_base.statetree_max_state_bytes;
+        if (budget == 0) {
+            return true;
+        }
+
+        size_t non_evictable_bytes = 0;
+        for (const server_slot & slot : slots) {
+            const bool owns_family = owner.is_fork_reserved() && slot.is_fork_reserved() &&
+                slot.fork_source_id == owner.fork_source_id && slot.fork_id == owner.fork_id;
+            if (slot.is_processing() || slot.id == owner.id || owns_family) {
+                non_evictable_bytes += slot.prompt_state_bytes();
+            }
+        }
+        const size_t non_evictable_base = non_evictable_bytes > removed_bytes
+            ? non_evictable_bytes - removed_bytes
+            : 0;
+        if (non_evictable_base > budget || added_bytes > budget - non_evictable_base) {
+            statetree_pressure_rejected_total++;
+            return false;
+        }
+
+        auto exceeds_budget = [&]() {
+            const size_t current = get_retention_stats().state_bytes;
+            const size_t projected_base = current > removed_bytes ? current - removed_bytes : 0;
+            return projected_base > budget || added_bytes > budget - projected_base;
+        };
+
+        while (exceeds_budget()) {
+            auto families = collect_statetree_families();
+            std::sort(families.begin(), families.end(), [](const statetree_family & left, const statetree_family & right) {
+                if (left.touch != right.touch) {
+                    return left.touch < right.touch;
+                }
+                if (left.source_id != right.source_id) {
+                    return left.source_id < right.source_id;
+                }
+                return left.fork_id < right.fork_id;
+            });
+
+            statetree_family * family_victim = nullptr;
+            for (auto & family : families) {
+                const bool owns_family = owner.is_fork_reserved() &&
+                    family.source_id == owner.fork_source_id && family.fork_id == owner.fork_id;
+                if (!family.active && !owns_family && family.state_bytes > 0) {
+                    family_victim = &family;
+                    break;
+                }
+            }
+
+            server_slot * slot_victim = nullptr;
+            for (server_slot & slot : slots) {
+                if (slot.id == owner.id || slot.is_processing() || slot.is_fork_reserved() || slot.prompt_state_bytes() == 0) {
+                    continue;
+                }
+                if (slot_victim == nullptr ||
+                        slot.retention_touch < slot_victim->retention_touch ||
+                        (slot.retention_touch == slot_victim->retention_touch && slot.id < slot_victim->id)) {
+                    slot_victim = &slot;
+                }
+            }
+
+            const bool use_family = family_victim != nullptr &&
+                (slot_victim == nullptr ||
+                 family_victim->touch < slot_victim->retention_touch ||
+                 (family_victim->touch == slot_victim->retention_touch && family_victim->source_id <= slot_victim->id));
+            if (use_family) {
+                release_family(*family_victim, false);
+            } else if (slot_victim != nullptr) {
+                release_idle_slot(*slot_victim);
+            } else {
+                statetree_pressure_rejected_total++;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void maintain_retention() {
+        const int64_t now_us = ggml_time_us();
+
+        for (const auto & family : collect_statetree_families()) {
+            if (!family.active && family.lease_deadline_us >= 0 && family.lease_deadline_us <= now_us) {
+                release_family(family, true);
+            }
+        }
+
+        const uint64_t budget = params_base.statetree_max_state_bytes;
+        if (budget > 0) {
+            while (get_retention_stats().state_bytes > budget) {
+                auto families = collect_statetree_families();
+                std::sort(families.begin(), families.end(), [](const statetree_family & left, const statetree_family & right) {
+                    if (left.touch != right.touch) {
+                        return left.touch < right.touch;
+                    }
+                    if (left.source_id != right.source_id) {
+                        return left.source_id < right.source_id;
+                    }
+                    return left.fork_id < right.fork_id;
+                });
+
+                statetree_family * family_victim = nullptr;
+                for (auto & family : families) {
+                    if (!family.active && family.state_bytes > 0) {
+                        family_victim = &family;
+                        break;
+                    }
+                }
+
+                server_slot * slot_victim = nullptr;
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing() || slot.is_fork_reserved() || slot.prompt_state_bytes() == 0) {
+                        continue;
+                    }
+                    if (slot_victim == nullptr ||
+                            slot.retention_touch < slot_victim->retention_touch ||
+                            (slot.retention_touch == slot_victim->retention_touch && slot.id < slot_victim->id)) {
+                        slot_victim = &slot;
+                    }
+                }
+
+                const bool use_family = family_victim != nullptr &&
+                    (slot_victim == nullptr ||
+                     family_victim->touch < slot_victim->retention_touch ||
+                     (family_victim->touch == slot_victim->retention_touch && family_victim->source_id <= slot_victim->id));
+                if (use_family) {
+                    release_family(*family_victim, false);
+                } else if (slot_victim != nullptr) {
+                    release_idle_slot(*slot_victim);
+                } else {
+                    statetree_pressure_rejected_total++;
+                    break;
+                }
+            }
+        }
+
+        const auto stats = get_retention_stats();
+        state_high_water_bytes = std::max<uint64_t>(state_high_water_bytes, stats.state_bytes);
+        retained_high_water_bytes = std::max<uint64_t>(retained_high_water_bytes, stats.retained_bytes);
+    }
+
+    int64_t retention_idle_wait_ms() {
+        maintain_retention();
+        const int64_t now_us = ggml_time_us();
+        int64_t wait_ms = 1000;
+        for (const auto & family : collect_statetree_families()) {
+            if (family.active || family.lease_deadline_us < 0) {
+                continue;
+            }
+            wait_ms = std::min(wait_ms,
+                    std::max<int64_t>(1, (family.lease_deadline_us - now_us + 999) / 1000));
+        }
+        return wait_ms;
+    }
 
     void destroy() {
         spec.reset();
@@ -816,6 +2462,129 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        const bool durable_store_requested = !params_base.statetree_snapshot_store.empty() ||
+            !params_base.statetree_snapshot_compat_id.empty() ||
+            params_base.statetree_max_snapshot_disk_bytes > 0 ||
+            params_base.statetree_max_snapshot_load_bytes > 0 ||
+            params_base.statetree_max_snapshot_manifest_bytes > 0;
+        if (durable_store_requested && (params_base.statetree_snapshot_store.empty() ||
+                params_base.statetree_snapshot_compat_id.empty() ||
+                params_base.statetree_max_snapshot_disk_bytes == 0 ||
+                params_base.statetree_max_snapshot_load_bytes == 0 ||
+                params_base.statetree_max_snapshot_manifest_bytes == 0)) {
+            SRV_ERR("%s", "durable StateTree content requires store path, compatibility ID, and positive disk/load/manifest budgets\n");
+            return false;
+        }
+        if (!is_resume && durable_store_requested) {
+            try {
+                snapshot_store = std::make_unique<server_snapshot_store>(
+                        params_base.statetree_snapshot_store,
+                        params_base.statetree_snapshot_compat_id,
+                        params_base.statetree_max_snapshot_disk_bytes,
+                        [](const llama_tokens & tokens, const std::vector<uint8_t> & state) {
+                            return snapshot_content_digest(tokens, state);
+                        });
+                snapshot_manifest = std::make_unique<server_snapshot_manifest>(
+                        snapshot_store->namespace_path(),
+                        params_base.statetree_snapshot_compat_id,
+                        params_base.statetree_max_snapshot_manifest_bytes);
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to initialize durable StateTree content: %s\n", e.what());
+                return false;
+            }
+        } else if (!durable_store_requested) {
+            snapshot_store.reset();
+            snapshot_manifest.reset();
+        }
+        refresh_durable_store_cache();
+        refresh_durable_manifest_cache();
+        if (snapshot_manifest) {
+            const auto pending_publishes = snapshot_manifest->publish_intents();
+            try {
+                for (const auto & item : pending_publishes) {
+                    const auto & intent = item.second;
+                    server_snapshot_store_entry entry;
+                    if (!snapshot_store->find_entry(intent.digest, entry)) {
+                        snapshot_manifest->abort_publish(intent.owner, intent.digest);
+                        durable_manifest_recovered_publish_aborts++;
+                        continue;
+                    }
+                    if (entry.payload_bytes > params_base.statetree_max_snapshot_load_bytes) {
+                        throw server_snapshot_manifest_error(
+                                "pending snapshot publish exceeds the configured recovery load budget", true);
+                    }
+                    try {
+                        snapshot_store->load(
+                                intent.digest, params_base.statetree_max_snapshot_load_bytes);
+                        snapshot_manifest->commit_publish(intent.owner, intent.digest);
+                        durable_manifest_recovered_publish_commits++;
+                    } catch (const server_snapshot_store_error &) {
+                        snapshot_manifest->abort_publish(intent.owner, intent.digest);
+                        snapshot_store->erase(intent.digest);
+                        durable_manifest_recovered_publish_aborts++;
+                    }
+                }
+                const auto pending_publish_advances = snapshot_manifest->publish_advance_intents();
+                for (const auto & item : pending_publish_advances) {
+                    const auto & intent = item.second;
+                    server_snapshot_store_entry entry;
+                    if (!snapshot_store->find_entry(intent.digest, entry)) {
+                        snapshot_manifest->abort_publish_advance(intent.owner, intent.digest);
+                        durable_manifest_recovered_publish_aborts++;
+                        continue;
+                    }
+                    if (entry.payload_bytes > params_base.statetree_max_snapshot_load_bytes) {
+                        throw server_snapshot_manifest_error(
+                                "pending atomic publish-and-advance exceeds the configured recovery load budget",
+                                true);
+                    }
+                    try {
+                        snapshot_store->load(
+                                intent.digest, params_base.statetree_max_snapshot_load_bytes);
+                        snapshot_manifest->commit_publish_advance(intent.owner, intent.digest);
+                        durable_manifest_recovered_publish_commits++;
+                    } catch (const server_snapshot_store_error &) {
+                        snapshot_manifest->abort_publish_advance(intent.owner, intent.digest);
+                        snapshot_store->erase(intent.digest);
+                        durable_manifest_recovered_publish_aborts++;
+                    }
+                }
+                const auto managed_digests = snapshot_manifest->managed_digests();
+                for (const auto & digest : managed_digests) {
+                    if (snapshot_manifest->ref_count(digest) != 0 ||
+                            snapshot_manifest->publish_intent_count(digest) != 0) {
+                        continue;
+                    }
+                    server_snapshot_store_entry entry;
+                    if (snapshot_store->find_entry(digest, entry)) {
+                        snapshot_store->erase(digest);
+                        durable_managed_recovered_erases++;
+                        durable_managed_recovered_bytes += entry.file_bytes;
+                    }
+                    snapshot_manifest->forget_managed(digest);
+                }
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to reconcile durable snapshot publish intent: %s\n", e.what());
+                return false;
+            }
+            refresh_durable_store_cache();
+            refresh_durable_manifest_cache();
+        }
+        for (const auto & item : durable_manifest_refs) {
+            if (durable_store_entries.find(item.second.digest) == durable_store_entries.end()) {
+                SRV_ERR("durable snapshot manifest owner '%s' references missing content '%s'\n",
+                        item.second.owner.c_str(), item.second.digest.c_str());
+                return false;
+            }
+        }
+        for (const auto & item : durable_logical_heads) {
+            if (durable_store_entries.find(item.second.digest) == durable_store_entries.end()) {
+                SRV_ERR("durable logical head '%s' references missing content '%s'\n",
+                        item.second.name.c_str(), item.second.digest.c_str());
+                return false;
+            }
+        }
 
         std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -1138,6 +2907,18 @@ private:
             SLT_INF(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                server_slot & released = slots[id_slot];
+                if (released.is_fork_reserved()) {
+                    if (!family_is_active(released.fork_source_id, released.fork_id)) {
+                        touch_family(released.fork_source_id, released.fork_id, false);
+                    }
+                } else if (released.prompt_state_bytes() > 0) {
+                    released.retention_touch = ++retention_touch_next;
+                }
+                released.callback_on_deferred(id_slot);
+            };
+
+            slot.callback_on_deferred = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1190,6 +2971,36 @@ private:
             SRV_INF("%s", "context checkpoints disabled\n");
         }
 
+        if (params_base.statetree_lease_ms > 0) {
+            SRV_INF("StateTree family lease = %d ms\n", params_base.statetree_lease_ms);
+        } else {
+            SRV_INF("%s", "StateTree family lease disabled\n");
+        }
+        if (params_base.statetree_max_state_bytes > 0) {
+            SRV_INF("StateTree live state budget = %.3f MiB\n",
+                    params_base.statetree_max_state_bytes / (1024.0 * 1024.0));
+        } else {
+            SRV_INF("%s", "StateTree live state budget disabled\n");
+        }
+        if (params_base.statetree_max_snapshot_bytes > 0) {
+            SRV_INF("StateTree immutable snapshot budget = %.3f MiB\n",
+                    params_base.statetree_max_snapshot_bytes / (1024.0 * 1024.0));
+        } else {
+            SRV_INF("%s", "StateTree immutable snapshots disabled\n");
+        }
+        if (snapshot_store) {
+            SRV_INF("StateTree durable snapshot namespace = %s, objects=%zu, disk=%.3f/%.3f MiB\n",
+                    snapshot_store->namespace_id().c_str(), snapshot_store->entries().size(),
+                    snapshot_store->disk_bytes() / (1024.0 * 1024.0),
+                    snapshot_store->disk_budget_bytes() / (1024.0 * 1024.0));
+            if (snapshot_store->ignored_corrupt_files() > 0) {
+                SRV_WRN("StateTree durable snapshot namespace ignored %" PRIu64 " corrupt objects\n",
+                        snapshot_store->ignored_corrupt_files());
+            }
+        } else {
+            SRV_INF("%s", "StateTree durable snapshot content disabled\n");
+        }
+
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
@@ -1228,14 +3039,29 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        queue_tasks.on_idle([this]() {
+            return retention_idle_wait_ms();
+        });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
         queue_tasks.on_idle_sleep_inhibited([this]() {
-            return std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return durable_io_pending.load() > 0 || std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
                 return slot.is_fork_reserved();
             });
         });
+        queue_tasks.on_terminated_task([this](server_task && task) {
+            if (task.type != SERVER_TASK_TYPE_CANCEL && task.type != SERVER_TASK_TYPE_DURABLE_IO_COMPLETE) {
+                send_error(task, "server is shutting down", ERROR_TYPE_UNAVAILABLE);
+            }
+        });
+
+        try {
+            start_durable_io_worker();
+        } catch (const std::exception & error) {
+            SRV_ERR("failed to start durable snapshot I/O worker: %s\n", error.what());
+            return false;
+        }
 
         metrics.init();
 
@@ -1431,6 +3257,8 @@ private:
                 }
 
                 prompt_cache->update();
+
+                maintain_retention();
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2092,6 +3920,26 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        const size_t checkpoint_bytes =
+            llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) +
+            (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : 0);
+        size_t replaced_bytes = 0;
+        if (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+            size_t n_replace = slot.prompt.checkpoints.size() - params_base.n_ctx_checkpoints + 1;
+            for (const auto & checkpoint : slot.prompt.checkpoints) {
+                if (n_replace-- == 0) {
+                    break;
+                }
+                replaced_bytes += checkpoint.size();
+            }
+        }
+        if (!reserve_state_bytes(checkpoint_bytes, replaced_bytes, slot)) {
+            const size_t additional_bytes = checkpoint_bytes > replaced_bytes ? checkpoint_bytes - replaced_bytes : 0;
+            SLT_WRN(slot, "skipping context checkpoint: retained-state budget needs %zu additional bytes\n",
+                    additional_bytes);
+            return;
+        }
+
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
@@ -2113,9 +3961,113 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+        const auto retention = get_retention_stats();
+        state_high_water_bytes = std::max<uint64_t>(state_high_water_bytes, retention.state_bytes);
+        retained_high_water_bytes = std::max<uint64_t>(retained_high_water_bytes, retention.retained_bytes);
+    }
+
+    bool materialize_snapshot_content(
+            server_task & task,
+            const llama_tokens & tokens,
+            const std::vector<uint8_t> & state,
+            int64_t state_id,
+            int64_t parent_node_id,
+            int64_t snapshot_id,
+            const std::string & content_digest,
+            json & result) {
+        if (!check_no_mtmd(task.id)) {
+            return false;
+        }
+        if (ctx_dft || spec || !params_base.lora_adapters.empty()) {
+            send_error(task, "StateTree snapshot materialization is unavailable with the active model configuration",
+                    ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+
+        server_slot * destination = nullptr;
+        if (task.slot_action.id_slot >= 0) {
+            destination = get_slot_by_id(task.slot_action.id_slot);
+            if (destination == nullptr) {
+                send_error(task, "Invalid destination slot ID", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            if (!destination->is_available()) {
+                send_error(task, "Destination slot is unavailable", ERROR_TYPE_UNAVAILABLE);
+                return false;
+            }
+        } else {
+            const auto free_slots = get_free_slots(1, -1);
+            if (free_slots.empty()) {
+                send_error(task, "No destination slot is available", ERROR_TYPE_UNAVAILABLE);
+                return false;
+            }
+            destination = free_slots.front();
+        }
+
+        const bool allocate_state_id = state_id < 0;
+        if (statetree_next_fork_id > (uint64_t) std::numeric_limits<int64_t>::max() ||
+                statetree_next_node_id > (uint64_t) std::numeric_limits<int64_t>::max() ||
+                (allocate_state_id && statetree_next_state_id > (uint64_t) std::numeric_limits<int64_t>::max())) {
+            send_error(task, "StateTree identity space is exhausted", ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        server_tokens restored_tokens;
+        try {
+            restored_tokens = server_tokens(tokens, false);
+        } catch (const std::exception & e) {
+            send_error(task, std::string("Failed to clone StateTree snapshot tokens: ") + e.what(),
+                    ERROR_TYPE_SERVER);
+            return false;
+        }
+
+        const int64_t t_start = ggml_time_us();
+        destination->prompt_clear(false);
+        const size_t read = llama_state_seq_set_data_ext(
+                ctx_tgt, state.data(), state.size(), destination->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (read != state.size()) {
+            destination->prompt_clear(false);
+            send_error(task, "Failed to restore the complete StateTree snapshot", ERROR_TYPE_SERVER);
+            destination->callback_on_deferred(destination->id);
+            return false;
+        }
+
+        const int64_t final_state_id = allocate_state_id
+            ? (int64_t) statetree_next_state_id++
+            : state_id;
+        const int64_t fork_id = (int64_t) statetree_next_fork_id++;
+        const int64_t node_id = (int64_t) statetree_next_node_id++;
+        server_prompt restored_prompt;
+        restored_prompt.tokens = std::move(restored_tokens);
+        destination->prompt = std::move(restored_prompt);
+        destination->task_prev.reset();
+        destination->fork_source_id = destination->id;
+        destination->state_id = final_state_id;
+        destination->node_id = node_id;
+        destination->parent_node_id = parent_node_id;
+        destination->materialized_snapshot_id = snapshot_id;
+        destination->materialized_content_digest = content_digest;
+        destination->fork_id = fork_id;
+        touch_family(destination->id, fork_id, false);
+
+        const int64_t t_end = ggml_time_us();
+        result = {
+            {"id_slot", destination->id},
+            {"state_id", final_state_id},
+            {"node_id", node_id},
+            {"parent_node_id", parent_node_id},
+            {"fork_id", fork_id},
+            {"n_tokens", tokens.size()},
+            {"digest", content_digest},
+            {"timings", {{"materialize_ms", (t_end - t_start) / 1000.0}}},
+        };
+        return true;
     }
 
     void process_single_task(server_task && task) {
+        maintain_retention();
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -2130,8 +4082,70 @@ private:
                         }
                     }
 
-                    const int id_slot = task.id_slot;
+                    int id_slot = task.id_slot;
                     const int id_task = task.id;
+
+                    if (task.node_id >= 0) {
+                        server_slot * logical_node = nullptr;
+                        for (server_slot & candidate : slots) {
+                            if (candidate.node_id == task.node_id) {
+                                GGML_ASSERT(logical_node == nullptr);
+                                logical_node = &candidate;
+                            }
+                        }
+                        if (logical_node == nullptr) {
+                            send_error(task, "StateTree branch node is unavailable", ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                        if ((id_slot >= 0 && id_slot != logical_node->id) ||
+                                (task.state_id >= 0 && task.state_id != logical_node->state_id) ||
+                                (task.fork_id >= 0 && task.fork_id != logical_node->fork_id)) {
+                            send_error(task, "StateTree branch node does not match the requested identity",
+                                    ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                        id_slot = logical_node->id;
+                    }
+
+                    if (task.state_id >= 0 && task.node_id < 0) {
+                        if (task.fork_id < 0) {
+                            send_error(task, "A logical state_id requires a generation-fenced fork_id",
+                                    ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        std::vector<server_slot *> logical_members;
+                        for (server_slot & candidate : slots) {
+                            if (candidate.state_id == task.state_id && candidate.fork_id == task.fork_id) {
+                                logical_members.push_back(&candidate);
+                            }
+                        }
+                        if (logical_members.empty()) {
+                            send_error(task, "Logical StateTree state is unavailable", ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                        if (id_slot < 0) {
+                            if (logical_members.size() != 1) {
+                                send_error(task,
+                                        "Logical StateTree state has multiple heads; provide an exact id_slot",
+                                        ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                            id_slot = logical_members.front()->id;
+                        } else if (std::none_of(
+                                logical_members.begin(), logical_members.end(),
+                                [id_slot](const server_slot * member) { return member->id == id_slot; })) {
+                            send_error(task, "Logical StateTree state does not own the requested slot",
+                                    ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                    }
+
+                    if (task.fork_id >= 0 &&
+                            (id_slot < 0 || (size_t) id_slot >= slots.size())) {
+                        send_error(task, "A generation-fenced fork_id requires an exact valid id_slot",
+                                ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     server_slot * slot = id_slot != -1 ? get_slot_by_id(id_slot) : get_available_slot(task);
 
@@ -2144,6 +4158,35 @@ private:
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    if (id_slot != -1) {
+                        if (task.node_id >= 0) {
+                            if (!slot->is_fork_reserved() || slot->node_id != task.node_id ||
+                                    (task.fork_id >= 0 && slot->fork_id != task.fork_id) ||
+                                    (task.state_id >= 0 && slot->state_id != task.state_id) ||
+                                    family_is_expired(*slot, ggml_time_us())) {
+                                send_error(task, "StateTree branch node is unavailable", ERROR_TYPE_UNAVAILABLE);
+                                if (slot->is_available()) {
+                                    slot->callback_on_deferred(slot->id);
+                                }
+                                break;
+                            }
+                        } else if (task.fork_id >= 0) {
+                            if (!slot->is_fork_reserved() || slot->fork_id != task.fork_id ||
+                                    (task.state_id >= 0 && slot->state_id != task.state_id) ||
+                                    family_is_expired(*slot, ggml_time_us())) {
+                                send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
+                                if (slot->is_available()) {
+                                    slot->callback_on_deferred(slot->id);
+                                }
+                                break;
+                            }
+                        } else if (slot->is_fork_reserved() && retention_enabled()) {
+                            send_error(task, "A generation-fenced fork_id or node_id is required for this reserved slot",
+                                    ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
                     }
 
                     if (slot->is_processing()) {
@@ -2166,9 +4209,14 @@ private:
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
+                        if (slot->is_fork_reserved()) {
+                            touch_family(slot->fork_source_id, slot->fork_id, true);
+                        }
                     } else if (!launch_slot_with_task(*slot, std::move(task))) {
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
+                    } else if (slot->is_fork_reserved()) {
+                        touch_family(slot->fork_source_id, slot->fork_id, true);
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -2243,7 +4291,9 @@ private:
                     int n_reserved_slots   = 0;
 
                     for (server_slot & slot : slots) {
-                        json slot_data = slot.to_json(slots_debug == 0);
+                        const bool lease_pinned = slot.is_fork_reserved() &&
+                            family_is_active(slot.fork_source_id, slot.fork_id);
+                        json slot_data = slot.to_json(slots_debug == 0, lease_pinned);
 
                         if (slot.is_processing()) {
                             n_processing_slots++;
@@ -2281,6 +4331,76 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    const auto retention = get_retention_stats();
+                    res->statetree_state_bytes = retention.state_bytes;
+                    res->statetree_retained_bytes = retention.retained_bytes;
+                    res->statetree_active_bytes = retention.active_bytes;
+                    res->statetree_state_budget_bytes = params_base.statetree_max_state_bytes;
+                    res->statetree_state_high_water_bytes = state_high_water_bytes;
+                    res->statetree_retained_high_water_bytes = retained_high_water_bytes;
+                    res->statetree_expired_total = statetree_expired_total;
+                    res->statetree_evicted_total = statetree_evicted_total;
+                    res->statetree_reclaimed_bytes_total = statetree_reclaimed_bytes_total;
+                    res->statetree_renewed_total = statetree_renewed_total;
+                    res->statetree_pressure_rejected_total = statetree_pressure_rejected_total;
+                    res->statetree_snapshot_bytes = snapshot_bytes;
+                    res->statetree_snapshot_budget_bytes = params_base.statetree_max_snapshot_bytes;
+                    res->statetree_snapshot_high_water_bytes = snapshot_high_water_bytes;
+                    res->statetree_snapshot_count = statetree_snapshots.size();
+                    res->statetree_snapshot_content_count = statetree_snapshot_contents.size();
+                    res->statetree_snapshots_captured_total = snapshots_captured_total;
+                    res->statetree_snapshots_materialized_total = snapshots_materialized_total;
+                    res->statetree_snapshots_erased_total = snapshots_erased_total;
+                    res->statetree_snapshot_rejected_total = snapshot_rejected_total;
+                    if (snapshot_store) {
+                        res->statetree_durable_disk_bytes = durable_store_disk_bytes;
+                        res->statetree_durable_disk_budget_bytes = durable_store_disk_budget_bytes;
+                        res->statetree_durable_disk_high_water_bytes = durable_store_disk_high_water_bytes;
+                        res->statetree_durable_content_count = durable_store_entries.size();
+                        res->statetree_durable_recovered_temp_files = durable_store_recovered_temp_files;
+                        res->statetree_durable_ignored_corrupt_files = durable_store_ignored_corrupt_files;
+                        res->statetree_durable_runtime_integrity_failures = durable_store_runtime_integrity_failures;
+                        res->statetree_durable_orphaned_disk_bytes = durable_store_orphaned_disk_bytes;
+                    }
+                    res->statetree_durable_spilled_total = durable_spilled_total;
+                    res->statetree_durable_materialized_total = durable_materialized_total;
+                    res->statetree_durable_erased_total = durable_erased_total;
+                    res->statetree_durable_rejected_total = durable_rejected_total;
+                    res->statetree_durable_io_pending = durable_io_pending.load();
+                    res->statetree_durable_io_queue_high_water = durable_io_queue_high_water;
+                    res->statetree_durable_io_completed_total = durable_io_completed_total;
+                    res->statetree_durable_io_cancelled_loads_total = durable_io_cancelled_loads_total;
+                    res->statetree_durable_io_reserved_disk_bytes = durable_io_reserved_disk_bytes;
+                    res->statetree_durable_io_reserved_disk_high_water = durable_io_reserved_disk_high_water;
+                    res->statetree_durable_io_reserved_load_bytes = durable_io_reserved_load_bytes;
+                    res->statetree_durable_io_reserved_load_high_water = durable_io_reserved_load_high_water;
+                    res->statetree_durable_manifest_refs = durable_manifest_refs.size();
+                    res->statetree_durable_manifest_revision = durable_manifest_revision;
+                    res->statetree_durable_manifest_file_bytes = durable_manifest_file_bytes;
+                    res->statetree_durable_manifest_budget_bytes = durable_manifest_budget_bytes;
+                    res->statetree_durable_manifest_high_water_bytes = durable_manifest_high_water_bytes;
+                    res->statetree_durable_manifest_record_count = durable_manifest_record_count;
+                    res->statetree_durable_manifest_recovered_temp_files =
+                        durable_manifest_recovered_temp_files;
+                    res->statetree_durable_manifest_recovered_tail_bytes =
+                        durable_manifest_recovered_tail_bytes;
+                    res->statetree_durable_manifest_compactions = durable_manifest_compactions;
+                    res->statetree_durable_manifest_recovered_publish_commits =
+                        durable_manifest_recovered_publish_commits;
+                    res->statetree_durable_manifest_recovered_publish_aborts =
+                        durable_manifest_recovered_publish_aborts;
+                    res->statetree_durable_managed_count = durable_managed_digests.size();
+                    res->statetree_durable_cache_evicted_total = durable_cache_evicted_total;
+                    res->statetree_durable_cache_reclaimed_bytes_total =
+                        durable_cache_reclaimed_bytes_total;
+                    res->statetree_durable_managed_recovered_erases = durable_managed_recovered_erases;
+                    res->statetree_durable_managed_recovered_bytes = durable_managed_recovered_bytes;
+                    res->statetree_durable_retained_total = durable_retained_total;
+                    res->statetree_durable_released_total = durable_released_total;
+                    res->statetree_durable_compacted_total = durable_compacted_total;
+                    res->n_statetree_families = retention.n_families;
+                    res->n_statetree_active_families = retention.n_active_families;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -2296,6 +4416,9 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!validate_slot_fence(task, *slot)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -2326,6 +4449,7 @@ private:
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
+                    slot->callback_on_deferred(slot->id);
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
@@ -2334,6 +4458,9 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!validate_slot_fence(task, *slot)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -2353,15 +4480,32 @@ private:
                     size_t token_count = 0;
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
-                        const bool released_fork = slot->prompt_clear(false);
+                        const auto restored_nodes = get_statetree_node_refs({ slot });
+                        record_statetree_event(
+                                "restore_failed",
+                                slot->state_id,
+                                slot->fork_id,
+                                slot->fork_source_id,
+                                { slot->id },
+                                slot->prompt_state_bytes(),
+                                -1,
+                                restored_nodes);
+                        slot->prompt_clear(false);
                         send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
-                        if (released_fork) {
-                            slot->callback_on_release(slot->id);
-                        }
+                        slot->callback_on_deferred(slot->id);
                         break;
                     }
-                    const bool released_fork = slot->is_fork_reserved();
                     tokens.resize(token_count);
+                    const auto restored_nodes = get_statetree_node_refs({ slot });
+                    record_statetree_event(
+                            "restore",
+                            slot->state_id,
+                            slot->fork_id,
+                            slot->fork_source_id,
+                            { slot->id },
+                            slot->prompt_state_bytes(),
+                            -1,
+                            restored_nodes);
                     slot->prompt_metadata_clear();
                     slot->prompt.tokens.insert(tokens);
 
@@ -2377,19 +4521,19 @@ private:
                     res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
-                    if (released_fork) {
-                        slot->callback_on_release(slot->id);
-                    }
+                    slot->callback_on_deferred(slot->id);
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
-                    const int id_slot = task.slot_action.id_slot;
-                    server_slot * slot = get_slot_by_id(id_slot);
+                    server_slot * slot = resolve_slot_action_target(task, "Invalid slot ID");
                     if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    const int id_slot = slot->id;
+                    if (!validate_slot_fence(task, *slot)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -2401,17 +4545,34 @@ private:
 
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
+                    const int64_t erased_state_id = slot->state_id;
+                    const int64_t erased_fork_id = slot->fork_id;
+                    const int erased_source_id = slot->fork_source_id;
+                    const size_t erased_state_bytes = slot->prompt_state_bytes();
+                    const auto erased_nodes = get_statetree_node_refs({ slot });
 
-                    const bool released_fork = slot->prompt_clear(false);
+                    record_statetree_event(
+                            "erase",
+                            erased_state_id,
+                            erased_fork_id,
+                            erased_source_id,
+                            { id_slot },
+                            erased_state_bytes,
+                            -1,
+                            erased_nodes);
+
+                    slot->prompt_clear(false);
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
+                    res->state_id = erased_state_id;
+                    res->node_id  = erased_nodes.empty() ? -1 : erased_nodes.front().node_id;
+                    res->parent_node_id = erased_nodes.empty() ? -1 : erased_nodes.front().parent_node_id;
+                    res->fork_id  = erased_fork_id;
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
-                    if (released_fork) {
-                        slot->callback_on_release(slot->id);
-                    }
+                    slot->callback_on_deferred(slot->id);
                 } break;
             case SERVER_TASK_TYPE_SLOT_FORK:
                 {
@@ -2431,13 +4592,11 @@ private:
                         break;
                     }
 
-                    const int id_slot = task.slot_action.id_slot;
-                    if (id_slot < 0 || (size_t) id_slot >= slots.size()) {
-                        send_error(task, "Invalid source slot ID", ERROR_TYPE_INVALID_REQUEST);
+                    server_slot * source = resolve_slot_action_target(task, "Invalid source slot ID");
+                    if (source == nullptr) {
                         break;
                     }
-                    server_slot * source = get_slot_by_id(id_slot);
-                    GGML_ASSERT(source != nullptr);
+                    const int id_slot = source->id;
                     if (source->is_processing()) {
                         send_error(task, "Source slot is unavailable", ERROR_TYPE_UNAVAILABLE);
                         break;
@@ -2520,6 +4679,29 @@ private:
                         break;
                     }
 
+                    if (statetree_next_fork_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
+                        send_error(task, "StateTree fork generation space is exhausted", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    if (source->state_id < 0 &&
+                            statetree_next_state_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
+                        send_error(task, "StateTree logical state space is exhausted", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    const size_t n_nodes = destinations.size() + 1;
+                    const uint64_t node_limit = (uint64_t) std::numeric_limits<int64_t>::max();
+                    if (statetree_next_node_id > node_limit ||
+                            n_nodes - 1 > node_limit - statetree_next_node_id) {
+                        send_error(task, "StateTree branch node space is exhausted", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    const int64_t parent_fork_id = source->fork_id;
+                    const int64_t parent_node_id = source->node_id;
+                    const int64_t state_id = source->state_id >= 0
+                        ? source->state_id
+                        : (int64_t) statetree_next_state_id++;
+                    const int64_t fork_id = (int64_t) statetree_next_fork_id++;
+
                     for (size_t i = 0; i < destinations.size(); ++i) {
                         server_slot * destination = destinations[i];
 
@@ -2533,23 +4715,63 @@ private:
                     }
 
                     source->prompt.checkpoints.clear();
-                    const int fork_id = task.id;
-                    for (server_slot * destination : destinations) {
-                        destination->fork_source_id = id_slot;
-                        destination->fork_id = fork_id;
+                    std::vector<server_slot *> family_members = destinations;
+                    family_members.push_back(source);
+                    std::sort(family_members.begin(), family_members.end(), [](const auto * left, const auto * right) {
+                        return left->id < right->id;
+                    });
+                    for (server_slot * member : family_members) {
+                        member->fork_source_id = id_slot;
+                        member->state_id = state_id;
+                        member->node_id = (int64_t) statetree_next_node_id++;
+                        member->parent_node_id = parent_node_id;
+                        member->materialized_snapshot_id = -1;
+                        member->materialized_content_digest.clear();
+                        member->fork_id = fork_id;
                     }
-                    source->fork_source_id = id_slot;
-                    source->fork_id = fork_id;
+                    touch_family(id_slot, fork_id, false);
+
+                    std::vector<int> family_slots;
+                    family_slots.reserve(family_members.size());
+                    for (const server_slot * member : family_members) {
+                        family_slots.push_back(member->id);
+                    }
+                    const auto family_nodes = get_statetree_node_refs(family_members);
+                    size_t family_state_bytes = 0;
+                    for (const server_slot & member : slots) {
+                        if (member.state_id == state_id && member.fork_id == fork_id) {
+                            family_state_bytes += member.prompt_state_bytes();
+                        }
+                    }
+                    record_statetree_event(
+                            "fork",
+                            state_id,
+                            fork_id,
+                            id_slot,
+                            family_slots,
+                            family_state_bytes,
+                            parent_fork_id,
+                            family_nodes);
 
                     const int64_t t_end = ggml_time_us();
+                    const auto retention = get_retention_stats();
 
                     auto res = std::make_unique<server_task_result_slot_fork>();
                     res->id           = task.id;
                     res->id_slot      = id_slot;
+                    res->state_id     = state_id;
+                    res->node_id      = source->node_id;
+                    res->parent_node_id = parent_node_id;
                     res->fork_id      = fork_id;
+                    res->nodes        = get_statetree_nodes_json(family_members);
                     res->destinations = task.slot_action.destinations;
                     res->n_tokens     = source->prompt.tokens.size();
                     res->t_ms         = (t_end - t_start) / 1000.0;
+                    res->retention_enabled = retention_enabled();
+                    res->lease_remaining_ms = lease_remaining_ms(*source, t_end);
+                    res->state_bytes = retention.state_bytes;
+                    res->retained_bytes = retention.retained_bytes;
+                    res->state_budget_bytes = params_base.statetree_max_state_bytes;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_COMMIT:
@@ -2570,19 +4792,19 @@ private:
                         break;
                     }
 
-                    const int id_slot = task.slot_action.id_slot;
-                    if (id_slot < 0 || (size_t) id_slot >= slots.size()) {
-                        send_error(task, "Invalid winner slot ID", ERROR_TYPE_INVALID_REQUEST);
+                    server_slot * winner = resolve_slot_action_target(task, "Invalid winner slot ID");
+                    if (winner == nullptr) {
                         break;
                     }
-
-                    server_slot * winner = get_slot_by_id(id_slot);
-                    GGML_ASSERT(winner != nullptr);
                     if (winner->is_processing()) {
                         send_error(task, "Winner slot is unavailable", ERROR_TYPE_UNAVAILABLE);
                         break;
                     }
                     if (!winner->is_fork_reserved() || winner->fork_id != task.slot_action.fork_id) {
+                        send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (family_is_expired(*winner, ggml_time_us())) {
                         send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
                         break;
                     }
@@ -2592,6 +4814,7 @@ private:
                     }
 
                     const int source_id = winner->fork_source_id;
+                    const int64_t state_id = winner->state_id;
                     std::vector<server_slot *> family;
                     std::vector<int> released;
                     family.reserve(slots.size());
@@ -2602,6 +4825,7 @@ private:
                         if (slot.fork_source_id != source_id || slot.fork_id != task.slot_action.fork_id) {
                             continue;
                         }
+                        GGML_ASSERT(slot.state_id == state_id);
                         if (slot.is_processing()) {
                             send_error(task, "Fork family is still processing", ERROR_TYPE_UNAVAILABLE);
                             valid = false;
@@ -2619,6 +4843,7 @@ private:
                     GGML_ASSERT(!family.empty());
 
                     const int64_t t_start = ggml_time_us();
+                    const auto family_nodes = get_statetree_node_refs(family);
                     for (server_slot * slot : family) {
                         if (slot != winner) {
                             slot->prompt_clear(false);
@@ -2626,21 +4851,1084 @@ private:
                     }
 
                     winner->fork_source_id = winner->id;
+                    touch_family(winner->id, winner->fork_id, false);
                     const int64_t t_end = ggml_time_us();
+                    const auto retention = get_retention_stats();
+                    record_statetree_event(
+                            "commit",
+                            state_id,
+                            winner->fork_id,
+                            winner->id,
+                            released,
+                            winner->prompt_state_bytes(),
+                            -1,
+                            family_nodes);
 
                     auto res = std::make_unique<server_task_result_slot_commit>();
                     res->id        = task.id;
                     res->id_slot   = winner->id;
+                    res->state_id  = state_id;
+                    res->node_id   = winner->node_id;
+                    res->parent_node_id = winner->parent_node_id;
                     res->source_id = source_id;
                     res->fork_id   = winner->fork_id;
+                    res->nodes     = json::array();
+                    for (const auto & node : family_nodes) {
+                        res->nodes.push_back(node.to_json());
+                    }
                     res->released  = released;
                     res->n_tokens  = winner->prompt.tokens.size();
                     res->t_ms      = (t_end - t_start) / 1000.0;
+                    res->retention_enabled = retention_enabled();
+                    res->lease_remaining_ms = lease_remaining_ms(*winner, t_end);
+                    res->state_bytes = retention.state_bytes;
+                    res->retained_bytes = retention.retained_bytes;
+                    res->state_budget_bytes = params_base.statetree_max_state_bytes;
                     queue_results.send(std::move(res));
 
                     for (const int released_id : released) {
-                        slots[released_id].callback_on_release(released_id);
+                        slots[released_id].callback_on_deferred(released_id);
                     }
+                } break;
+            case SERVER_TASK_TYPE_SLOT_RENEW:
+                {
+                    if (!params_base.kv_unified) {
+                        send_error(task, "Slot renew requires a unified KV cache", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    server_slot * member = resolve_slot_action_target(task, "Invalid slot ID");
+                    if (member == nullptr) {
+                        break;
+                    }
+                    const int id_slot = member->id;
+                    if (!member->is_fork_reserved() || member->fork_id != task.slot_action.fork_id ||
+                            family_is_expired(*member, ggml_time_us())) {
+                        send_error(task, "Fork transaction is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+                    const int source_id = member->fork_source_id;
+                    std::vector<int> members;
+                    std::vector<server_slot *> family_members;
+                    for (const server_slot & slot : slots) {
+                        if (slot.fork_source_id == source_id && slot.fork_id == task.slot_action.fork_id) {
+                            members.push_back(slot.id);
+                            family_members.push_back(&slots[slot.id]);
+                        }
+                    }
+                    const auto family_nodes = get_statetree_node_refs(family_members);
+                    touch_family(source_id, task.slot_action.fork_id, true);
+                    const int64_t t_end = ggml_time_us();
+                    const auto retention = get_retention_stats();
+                    record_statetree_event(
+                            "renew",
+                            member->state_id,
+                            task.slot_action.fork_id,
+                            source_id,
+                            members,
+                            std::accumulate(
+                                slots.begin(), slots.end(), size_t(0),
+                                [&](size_t total, const server_slot & slot) {
+                                    return total + (slot.state_id == member->state_id &&
+                                            slot.fork_id == task.slot_action.fork_id
+                                        ? slot.prompt_state_bytes()
+                                        : 0);
+                                }),
+                            -1,
+                            family_nodes);
+
+                    auto res = std::make_unique<server_task_result_slot_renew>();
+                    res->id = task.id;
+                    res->id_slot = id_slot;
+                    res->state_id = member->state_id;
+                    res->node_id = member->node_id;
+                    res->parent_node_id = member->parent_node_id;
+                    res->source_id = source_id;
+                    res->fork_id = task.slot_action.fork_id;
+                    res->nodes = get_statetree_nodes_json(family_members);
+                    res->members = std::move(members);
+                    res->lease_remaining_ms = lease_remaining_ms(*member, t_end);
+                    res->state_bytes = retention.state_bytes;
+                    res->retained_bytes = retention.retained_bytes;
+                    res->state_budget_bytes = params_base.statetree_max_state_bytes;
+                    res->t_ms = (t_end - t_start) / 1000.0;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_CAPTURE:
+                {
+                    if (params_base.statetree_max_snapshot_bytes == 0) {
+                        send_error(task, "StateTree snapshots are disabled; set --statetree-max-snapshot-bytes",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    if (ctx_dft || spec) {
+                        send_error(task, "StateTree snapshots are not supported with speculative decoding",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!params_base.lora_adapters.empty()) {
+                        send_error(task, "StateTree snapshots are not supported with LoRA adapters",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    server_slot * source = resolve_slot_action_target(task, "Invalid source slot ID");
+                    if (source == nullptr) {
+                        break;
+                    }
+                    if (source->is_processing()) {
+                        send_error(task, "Source node is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (source->prompt.tokens.empty()) {
+                        send_error(task, "Source node has no cached prompt", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!source->lora.empty()) {
+                        send_error(task, "StateTree snapshots are not supported with LoRA adapters",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (statetree_next_snapshot_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
+                        send_error(task, "StateTree snapshot identity space is exhausted", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    const int64_t t_start = ggml_time_us();
+                    statetree_snapshot snapshot;
+                    snapshot.state_id = source->state_id;
+                    snapshot.source_node_id = source->node_id;
+                    snapshot.source_fork_id = source->fork_id;
+                    snapshot.source_slot = source->id;
+                    snapshot.captured_at_us = t_start;
+                    std::shared_ptr<statetree_snapshot_payload> candidate;
+                    try {
+                        candidate = std::make_shared<statetree_snapshot_payload>();
+                        candidate->tokens = source->prompt.tokens.get_tokens();
+                    } catch (const std::exception & e) {
+                        send_error(task, std::string("Failed to allocate StateTree snapshot: ") + e.what(),
+                                ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    const size_t state_size = llama_state_seq_get_size_ext(
+                            ctx_tgt, source->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    if (state_size < sizeof(uint32_t) + sizeof(llama_seq_id) ||
+                            candidate->tokens.size() > (std::numeric_limits<size_t>::max() - state_size) /
+                                sizeof(llama_token)) {
+                        send_error(task, "StateTree snapshot payload size is invalid", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    const size_t candidate_payload_bytes =
+                        state_size + candidate->tokens.size() * sizeof(llama_token);
+                    if (candidate_payload_bytes > params_base.statetree_max_snapshot_bytes) {
+                        snapshot_rejected_total++;
+                        send_error(task, "StateTree snapshot exceeds the per-content byte ceiling",
+                                ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+
+                    try {
+                        candidate->state.resize(state_size);
+                    } catch (const std::exception & e) {
+                        send_error(task, std::string("Failed to allocate StateTree snapshot: ") + e.what(),
+                                ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    const size_t written = llama_state_seq_get_data_ext(
+                            ctx_tgt, candidate->state.data(), candidate->state.size(), source->id,
+                            LLAMA_STATE_SEQ_FLAGS_NONE);
+                    if (written != candidate->state.size()) {
+                        send_error(task, "Failed to serialize the complete StateTree snapshot", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    // The sequence header contains a physical slot ID. Canonicalize it so
+                    // identical content captured from different fork heads has one digest.
+                    const llama_seq_id canonical_seq_id = 0;
+                    std::memcpy(candidate->state.data() + sizeof(uint32_t),
+                            &canonical_seq_id, sizeof(canonical_seq_id));
+                    candidate->digest = snapshot_content_digest(candidate->tokens, candidate->state);
+
+                    bool deduplicated = false;
+                    bool inserted_content = false;
+                    size_t inserted_content_bytes = 0;
+                    const auto existing = statetree_snapshot_contents.find(candidate->digest);
+                    if (existing != statetree_snapshot_contents.end()) {
+                        if (existing->second->tokens != candidate->tokens ||
+                                existing->second->state != candidate->state) {
+                            send_error(task, "StateTree snapshot digest collision", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        snapshot.payload = existing->second;
+                        deduplicated = true;
+                    } else {
+                        const uint64_t budget = params_base.statetree_max_snapshot_bytes;
+                        GGML_ASSERT(candidate->payload_bytes() == candidate_payload_bytes);
+                        if (snapshot_bytes > budget - candidate_payload_bytes) {
+                            snapshot_rejected_total++;
+                            send_error(task, "StateTree snapshot budget is exhausted", ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                        snapshot.payload = candidate;
+                        try {
+                            const auto inserted = statetree_snapshot_contents.emplace(
+                                    candidate->digest, snapshot.payload);
+                            GGML_ASSERT(inserted.second);
+                        } catch (const std::exception & e) {
+                            send_error(task, std::string("Failed to retain StateTree snapshot content: ") + e.what(),
+                                    ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        inserted_content = true;
+                        inserted_content_bytes = candidate_payload_bytes;
+                        snapshot_bytes += inserted_content_bytes;
+                    }
+                    snapshot.snapshot_id = (int64_t) statetree_next_snapshot_id;
+
+                    const int64_t snapshot_id = snapshot.snapshot_id;
+                    decltype(statetree_snapshots)::iterator inserted_snapshot;
+                    try {
+                        const auto inserted = statetree_snapshots.emplace(snapshot_id, std::move(snapshot));
+                        GGML_ASSERT(inserted.second);
+                        inserted_snapshot = inserted.first;
+                    } catch (const std::exception & e) {
+                        if (inserted_content) {
+                            GGML_ASSERT(snapshot_bytes >= inserted_content_bytes);
+                            snapshot_bytes -= inserted_content_bytes;
+                            GGML_ASSERT(statetree_snapshot_contents.erase(candidate->digest) == 1);
+                        }
+                        send_error(task, std::string("Failed to retain StateTree snapshot handle: ") + e.what(),
+                                ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    statetree_next_snapshot_id++;
+                    snapshots_captured_total++;
+                    snapshot_high_water_bytes = std::max(snapshot_high_water_bytes, snapshot_bytes);
+
+                    const int64_t t_end = ggml_time_us();
+                    auto res = std::make_unique<server_task_result_snapshot>();
+                    res->id = task.id;
+                    res->result = inserted_snapshot->second.to_json();
+                    res->result["action"] = "capture";
+                    res->result["deduplicated"] = deduplicated;
+                    res->result["snapshot_bytes"] = snapshot_bytes;
+                    res->result["snapshot_budget_bytes"] = params_base.statetree_max_snapshot_bytes;
+                    res->result["snapshot_content_count"] = statetree_snapshot_contents.size();
+                    res->result["timings"] = {{"capture_ms", (t_end - t_start) / 1000.0}};
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_MATERIALIZE:
+                {
+                    statetree_snapshot * snapshot = resolve_snapshot(task);
+                    if (snapshot == nullptr) {
+                        break;
+                    }
+                    json materialized;
+                    if (!materialize_snapshot_content(
+                            task,
+                            snapshot->payload->tokens,
+                            snapshot->payload->state,
+                            snapshot->state_id,
+                            snapshot->source_node_id,
+                            snapshot->snapshot_id,
+                            snapshot->payload->digest,
+                            materialized)) {
+                        break;
+                    }
+                    snapshots_materialized_total++;
+                    auto res = std::make_unique<server_task_result_snapshot>();
+                    res->id = task.id;
+                    res->result = std::move(materialized);
+                    res->result["action"] = "materialize";
+                    res->result["snapshot_id"] = snapshot->snapshot_id;
+                    res->result["cold"] = false;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_ERASE:
+                {
+                    statetree_snapshot * snapshot = resolve_snapshot(task);
+                    if (snapshot == nullptr) {
+                        break;
+                    }
+                    const json erased = snapshot->to_json();
+                    const int64_t erased_snapshot_id = snapshot->snapshot_id;
+                    const size_t erased_bytes = snapshot->payload_bytes();
+                    const std::string digest = snapshot->payload->digest;
+                    const bool last_handle = std::count_if(
+                            statetree_snapshots.begin(), statetree_snapshots.end(),
+                            [&](const auto & entry) { return entry.second.payload->digest == digest; }) == 1;
+                    snapshots_erased_total++;
+                    statetree_snapshots.erase(erased_snapshot_id);
+                    if (last_handle) {
+                        GGML_ASSERT(snapshot_bytes >= erased_bytes);
+                        snapshot_bytes -= erased_bytes;
+                        GGML_ASSERT(statetree_snapshot_contents.erase(digest) == 1);
+                    }
+
+                    auto res = std::make_unique<server_task_result_snapshot>();
+                    res->id = task.id;
+                    res->result = erased;
+                    res->result["action"] = "erase";
+                    res->result["content_reclaimed"] = last_handle;
+                    res->result["snapshot_bytes"] = snapshot_bytes;
+                    res->result["snapshot_budget_bytes"] = params_base.statetree_max_snapshot_bytes;
+                    res->result["snapshot_content_count"] = statetree_snapshot_contents.size();
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_SPILL:
+            case SERVER_TASK_TYPE_SNAPSHOT_PUBLISH:
+            case SERVER_TASK_TYPE_SNAPSHOT_PUBLISH_ADVANCE:
+                {
+                    if (!snapshot_store) {
+                        send_error(task, "Durable StateTree snapshot content is disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    statetree_snapshot * snapshot = resolve_snapshot(task);
+                    if (snapshot == nullptr) {
+                        break;
+                    }
+                    const std::string digest = snapshot->payload->digest;
+                    const bool managed_publish = task.type == SERVER_TASK_TYPE_SNAPSHOT_PUBLISH ||
+                        task.type == SERVER_TASK_TYPE_SNAPSHOT_PUBLISH_ADVANCE;
+                    if (managed_publish &&
+                            snapshot->payload->payload_bytes() > params_base.statetree_max_snapshot_load_bytes) {
+                        durable_rejected_total++;
+                        send_error(task,
+                                "managed snapshot publish exceeds the configured recovery load budget",
+                                ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    if (task.type == SERVER_TASK_TYPE_SNAPSHOT_PUBLISH_ADVANCE) {
+                        const auto head = durable_logical_heads.find(task.slot_action.head_name);
+                        const bool committed_retry = head != durable_logical_heads.end() &&
+                            task.slot_action.expected_generation < std::numeric_limits<uint64_t>::max() &&
+                            head->second.generation == task.slot_action.expected_generation + 1 &&
+                            head->second.digest == digest &&
+                            head->second.parent_digest == task.slot_action.expected_digest;
+                        const bool expected = head != durable_logical_heads.end() &&
+                            head->second.generation == task.slot_action.expected_generation &&
+                            head->second.digest == task.slot_action.expected_digest;
+                        if (!expected && !committed_retry) {
+                            send_error(task, "logical head compare-and-swap conflict",
+                                    ERROR_TYPE_UNAVAILABLE);
+                            break;
+                        }
+                    }
+                    uint64_t disk_reservation = 0;
+                    if (durable_store_entries.find(digest) == durable_store_entries.end() &&
+                            durable_io_pending_spill_digests.find(digest) == durable_io_pending_spill_digests.end()) {
+                        try {
+                            disk_reservation = snapshot_store->projected_file_bytes(
+                                    snapshot->payload->tokens.size(), snapshot->payload->state.size());
+                        } catch (const server_snapshot_store_error & error) {
+                            send_error(task, error.what(), ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        const uint64_t disk_bytes = durable_store_disk_bytes;
+                        const uint64_t disk_budget = durable_store_disk_budget_bytes;
+                        const bool fits_without_reclamation = disk_bytes <= disk_budget &&
+                            durable_io_reserved_disk_bytes <= disk_budget - disk_bytes &&
+                            disk_reservation <= disk_budget - disk_bytes - durable_io_reserved_disk_bytes;
+                        if (!fits_without_reclamation) {
+                            if (!managed_publish) {
+                                durable_rejected_total++;
+                                send_error(task, "durable snapshot content disk budget is exhausted",
+                                        ERROR_TYPE_UNAVAILABLE);
+                                break;
+                            }
+                            disk_reservation = 0;
+                        } else {
+                            durable_io_reserved_disk_bytes += disk_reservation;
+                            durable_io_reserved_disk_high_water = std::max(
+                                    durable_io_reserved_disk_high_water, durable_io_reserved_disk_bytes);
+                            durable_io_pending_spill_digests.insert(digest);
+                        }
+                    }
+
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = task.type == SERVER_TASK_TYPE_SNAPSHOT_PUBLISH
+                        ? durable_io_operation::publish
+                        : task.type == SERVER_TASK_TYPE_SNAPSHOT_PUBLISH_ADVANCE
+                            ? durable_io_operation::publish_advance
+                            : durable_io_operation::spill;
+                    job.request = std::move(task);
+                    job.hot_payload = snapshot->payload;
+                    job.digest = digest;
+                    job.owner = job.request.slot_action.owner;
+                    job.retention_class = job.request.slot_action.retention_class;
+                    job.disk_reservation_bytes = disk_reservation;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        if (disk_reservation > 0) {
+                            GGML_ASSERT(durable_io_reserved_disk_bytes >= disk_reservation);
+                            durable_io_reserved_disk_bytes -= disk_reservation;
+                            durable_io_pending_spill_digests.erase(digest);
+                        }
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_CONTENT_MATERIALIZE:
+                {
+                    if (!snapshot_store) {
+                        send_error(task, "Durable StateTree snapshot content is disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    if (ctx_dft || spec || !params_base.lora_adapters.empty()) {
+                        send_error(task, "StateTree snapshot materialization is unavailable with the active model configuration",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (task.slot_action.id_slot >= 0 && get_slot_by_id(task.slot_action.id_slot) == nullptr) {
+                        send_error(task, "Invalid destination slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    server_snapshot_store_entry entry;
+                    const auto found_entry = durable_store_entries.find(task.slot_action.digest);
+                    if (found_entry == durable_store_entries.end()) {
+                        send_error(task, "durable snapshot content is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    entry = found_entry->second;
+                    const uint64_t load_budget = params_base.statetree_max_snapshot_load_bytes;
+                    if (entry.payload_bytes > load_budget ||
+                            durable_io_reserved_load_bytes > load_budget - entry.payload_bytes) {
+                        durable_rejected_total++;
+                        send_error(task, "durable snapshot cold-load reservation budget is exhausted",
+                                ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    durable_io_reserved_load_bytes += entry.payload_bytes;
+                    durable_io_reserved_load_high_water = std::max(
+                            durable_io_reserved_load_high_water, durable_io_reserved_load_bytes);
+
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = durable_io_operation::load;
+                    job.request = std::move(task);
+                    job.digest = entry.digest;
+                    job.max_load_bytes = load_budget;
+                    job.load_reservation_bytes = entry.payload_bytes;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        GGML_ASSERT(durable_io_reserved_load_bytes >= entry.payload_bytes);
+                        durable_io_reserved_load_bytes -= entry.payload_bytes;
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_CONTENT_ERASE:
+                {
+                    if (!snapshot_store) {
+                        send_error(task, "Durable StateTree snapshot content is disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    server_snapshot_store_entry entry;
+                    const auto found_entry = durable_store_entries.find(task.slot_action.digest);
+                    if (found_entry == durable_store_entries.end()) {
+                        send_error(task, "durable snapshot content is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    entry = found_entry->second;
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = durable_io_operation::erase;
+                    job.request = std::move(task);
+                    job.digest = entry.digest;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RETAIN:
+            case SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RELEASE:
+                {
+                    if (!snapshot_manifest) {
+                        send_error(task, "Durable StateTree snapshot ownership is disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = task.type == SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RETAIN
+                        ? durable_io_operation::retain
+                        : durable_io_operation::release;
+                    job.request = std::move(task);
+                    job.digest = job.request.slot_action.digest;
+                    job.owner = job.request.slot_action.owner;
+                    job.retention_class = job.request.slot_action.retention_class;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_MANIFEST_COMPACT:
+                {
+                    if (!snapshot_manifest) {
+                        send_error(task, "Durable StateTree snapshot ownership is disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = durable_io_operation::compact;
+                    job.request = std::move(task);
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_MANIFEST_PRUNE:
+                {
+                    if (!snapshot_manifest) {
+                        send_error(task, "Durable StateTree snapshot ownership is disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (task.slot_action.target_bytes > durable_store_disk_budget_bytes) {
+                        send_error(task, "snapshot prune target exceeds the durable disk budget",
+                                ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = durable_io_operation::prune;
+                    job.request = std::move(task);
+                    job.target_disk_bytes = job.request.slot_action.target_bytes;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_HEAD_CREATE:
+            case SERVER_TASK_TYPE_SNAPSHOT_HEAD_ADVANCE:
+            case SERVER_TASK_TYPE_SNAPSHOT_HEAD_DELETE:
+                {
+                    if (!snapshot_manifest) {
+                        send_error(task, "Durable StateTree logical heads are disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = task.type == SERVER_TASK_TYPE_SNAPSHOT_HEAD_CREATE
+                        ? durable_io_operation::head_create
+                        : task.type == SERVER_TASK_TYPE_SNAPSHOT_HEAD_ADVANCE
+                            ? durable_io_operation::head_advance
+                            : durable_io_operation::head_delete;
+                    job.request = std::move(task);
+                    job.digest = job.request.slot_action.digest;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_HEAD_MATERIALIZE:
+                {
+                    if (!snapshot_manifest) {
+                        send_error(task, "Durable StateTree logical heads are disabled",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    if (ctx_dft || spec || !params_base.lora_adapters.empty()) {
+                        send_error(task, "StateTree logical head materialization is unavailable with the active model configuration",
+                                ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    if (task.slot_action.id_slot >= 0 && get_slot_by_id(task.slot_action.id_slot) == nullptr) {
+                        send_error(task, "Invalid destination slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    const auto head = durable_logical_heads.find(task.slot_action.head_name);
+                    if (head == durable_logical_heads.end() ||
+                            head->second.generation != task.slot_action.expected_generation ||
+                            head->second.digest != task.slot_action.expected_digest) {
+                        send_error(task, "logical head compare-and-swap conflict", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    const auto entry = durable_store_entries.find(head->second.digest);
+                    if (entry == durable_store_entries.end()) {
+                        send_error(task, "logical head content is unavailable", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    const uint64_t load_budget = params_base.statetree_max_snapshot_load_bytes;
+                    if (entry->second.payload_bytes > load_budget ||
+                            durable_io_reserved_load_bytes > load_budget - entry->second.payload_bytes) {
+                        durable_rejected_total++;
+                        send_error(task, "durable snapshot cold-load reservation budget is exhausted",
+                                ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    durable_io_reserved_load_bytes += entry->second.payload_bytes;
+                    durable_io_reserved_load_high_water = std::max(
+                            durable_io_reserved_load_high_water, durable_io_reserved_load_bytes);
+                    durable_io_job job;
+                    job.id = durable_io_next_id++;
+                    job.operation = durable_io_operation::head_load;
+                    job.request = std::move(task);
+                    job.digest = entry->second.digest;
+                    job.max_load_bytes = load_budget;
+                    job.load_reservation_bytes = entry->second.payload_bytes;
+                    job.enqueued_us = ggml_time_us();
+                    if (!enqueue_durable_io(job)) {
+                        GGML_ASSERT(durable_io_reserved_load_bytes >= entry->second.payload_bytes);
+                        durable_io_reserved_load_bytes -= entry->second.payload_bytes;
+                        send_error(job.request, "durable snapshot I/O worker is unavailable", ERROR_TYPE_SERVER);
+                    }
+                } break;
+            case SERVER_TASK_TYPE_DURABLE_IO_COMPLETE:
+                {
+                    durable_io_completion completion;
+                    if (!take_durable_io_completion(task.slot_action.durable_io_id, completion)) {
+                        break;
+                    }
+                    release_durable_io_reservations(completion.job);
+                    apply_durable_store_cache(completion);
+                    apply_durable_manifest_cache(completion);
+                    for (const auto & eviction : completion.cache_evictions) {
+                        if (eviction.object_erased) {
+                            durable_cache_evicted_total++;
+                            durable_cache_reclaimed_bytes_total += eviction.file_bytes;
+                        }
+                    }
+                    server_task & request = completion.job.request;
+                    const int64_t t_complete = ggml_time_us();
+                    const double queue_ms = (completion.started_us - completion.job.enqueued_us) / 1000.0;
+                    const double io_ms = (completion.finished_us - completion.started_us) / 1000.0;
+                    const double completion_wait_ms = (t_complete - completion.finished_us) / 1000.0;
+
+                    if (!completion.success) {
+                        if (completion.unavailable) {
+                            durable_rejected_total++;
+                        }
+                        send_error(request, completion.error,
+                                completion.unavailable ? ERROR_TYPE_UNAVAILABLE : ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    switch (completion.job.operation) {
+                        case durable_io_operation::spill:
+                            {
+                                durable_spilled_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", "spill"},
+                                    {"snapshot_id", request.slot_action.snapshot_id},
+                                    {"digest", completion.spill.entry.digest},
+                                    {"deduplicated", completion.spill.deduplicated},
+                                    {"n_tokens", completion.spill.entry.n_tokens},
+                                    {"state_bytes", completion.spill.entry.state_bytes},
+                                    {"payload_bytes", completion.spill.entry.payload_bytes},
+                                    {"file_bytes", completion.spill.entry.file_bytes},
+                                    {"disk_bytes", completion.disk_bytes},
+                                    {"disk_budget_bytes", completion.disk_budget_bytes},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"spill_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::publish_advance:
+                            {
+                                durable_spilled_total++;
+                                durable_retained_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                json evictions = json::array();
+                                for (const auto & eviction : completion.cache_evictions) {
+                                    evictions.push_back({
+                                        {"digest", eviction.digest},
+                                        {"released_refs", eviction.released_refs},
+                                        {"file_bytes", eviction.file_bytes},
+                                    });
+                                }
+                                const auto & committed = completion.publish_advance;
+                                res->result = {
+                                    {"action", "publish_advance"},
+                                    {"snapshot_id", request.slot_action.snapshot_id},
+                                    {"digest", completion.spill.entry.digest},
+                                    {"owner", committed.ref.owner},
+                                    {"retention_class", committed.ref.retention_class},
+                                    {"object_deduplicated", completion.spill.deduplicated},
+                                    {"transaction_deduplicated", committed.deduplicated},
+                                    {"head", {
+                                        {"name", committed.head.name},
+                                        {"generation", committed.head.generation},
+                                        {"digest", committed.head.digest},
+                                        {"parent_digest", committed.head.parent_digest},
+                                        {"revision", committed.head.revision},
+                                    }},
+                                    {"n_tokens", completion.spill.entry.n_tokens},
+                                    {"state_bytes", completion.spill.entry.state_bytes},
+                                    {"payload_bytes", completion.spill.entry.payload_bytes},
+                                    {"file_bytes", completion.spill.entry.file_bytes},
+                                    {"disk_bytes", completion.disk_bytes},
+                                    {"disk_budget_bytes", completion.disk_budget_bytes},
+                                    {"manifest_revision", committed.revision},
+                                    {"manifest_file_bytes", completion.manifest_file_bytes},
+                                    {"manifest_budget_bytes", completion.manifest_budget_bytes},
+                                    {"ref_revision", committed.ref.revision},
+                                    {"cache_evictions", std::move(evictions)},
+                                    {"cache_reclaimed_bytes", completion.prune_disk_bytes_before -
+                                        completion.prune_disk_bytes_after},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::publish:
+                            {
+                                durable_spilled_total++;
+                                durable_retained_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                json evictions = json::array();
+                                for (const auto & eviction : completion.cache_evictions) {
+                                    evictions.push_back({
+                                        {"digest", eviction.digest},
+                                        {"released_refs", eviction.released_refs},
+                                        {"file_bytes", eviction.file_bytes},
+                                    });
+                                }
+                                res->result = {
+                                    {"action", "publish"},
+                                    {"snapshot_id", request.slot_action.snapshot_id},
+                                    {"digest", completion.spill.entry.digest},
+                                    {"owner", completion.manifest.ref.owner},
+                                    {"retention_class", completion.manifest.ref.retention_class},
+                                    {"object_deduplicated", completion.spill.deduplicated},
+                                    {"ownership_deduplicated", completion.publish_begin.deduplicated},
+                                    {"n_tokens", completion.spill.entry.n_tokens},
+                                    {"state_bytes", completion.spill.entry.state_bytes},
+                                    {"payload_bytes", completion.spill.entry.payload_bytes},
+                                    {"file_bytes", completion.spill.entry.file_bytes},
+                                    {"disk_bytes", completion.disk_bytes},
+                                    {"disk_budget_bytes", completion.disk_budget_bytes},
+                                    {"manifest_revision", completion.manifest.revision},
+                                    {"manifest_file_bytes", completion.manifest_file_bytes},
+                                    {"manifest_budget_bytes", completion.manifest_budget_bytes},
+                                    {"ref_revision", completion.manifest.ref.revision},
+                                    {"ref_count", durable_manifest_ref_count(completion.manifest.ref.digest)},
+                                    {"cache_evictions", std::move(evictions)},
+                                    {"cache_reclaimed_bytes", completion.prune_disk_bytes_before -
+                                        completion.prune_disk_bytes_after},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::load:
+                            {
+                                if (!queue_results.is_waiting_task_id(request.id)) {
+                                    durable_io_cancelled_loads_total++;
+                                    break;
+                                }
+                                json materialized;
+                                if (!materialize_snapshot_content(
+                                        request,
+                                        completion.load.tokens,
+                                        completion.load.state,
+                                        -1,
+                                        -1,
+                                        -1,
+                                        completion.load.entry.digest,
+                                        materialized)) {
+                                    break;
+                                }
+                                durable_materialized_total++;
+                                const int64_t t_end = ggml_time_us();
+                                materialized["action"] = "materialize";
+                                materialized["snapshot_id"] = nullptr;
+                                materialized["cold"] = true;
+                                materialized["file_bytes"] = completion.load.entry.file_bytes;
+                                materialized["timings"]["queue_ms"] = queue_ms;
+                                materialized["timings"]["load_verify_ms"] = io_ms;
+                                materialized["timings"]["completion_wait_ms"] = completion_wait_ms;
+                                materialized["timings"]["total_ms"] =
+                                    (t_end - completion.job.enqueued_us) / 1000.0;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = std::move(materialized);
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::erase:
+                            {
+                                durable_erased_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", "erase"},
+                                    {"digest", completion.erase.digest},
+                                    {"file_bytes", completion.erase.file_bytes},
+                                    {"disk_bytes", completion.disk_bytes},
+                                    {"disk_budget_bytes", completion.disk_budget_bytes},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::retain:
+                            {
+                                durable_retained_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", "retain"},
+                                    {"owner", completion.manifest.ref.owner},
+                                    {"digest", completion.manifest.ref.digest},
+                                    {"retention_class", completion.manifest.ref.retention_class},
+                                    {"ref_revision", completion.manifest.ref.revision},
+                                    {"manifest_revision", completion.manifest.revision},
+                                    {"ref_count", durable_manifest_ref_count(completion.manifest.ref.digest)},
+                                    {"deduplicated", completion.manifest.deduplicated},
+                                    {"manifest_file_bytes", completion.manifest_file_bytes},
+                                    {"manifest_budget_bytes", completion.manifest_budget_bytes},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::release:
+                            {
+                                durable_released_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", "release"},
+                                    {"owner", completion.manifest.ref.owner},
+                                    {"digest", completion.manifest.ref.digest},
+                                    {"retention_class", completion.manifest.ref.retention_class},
+                                    {"released_ref_revision", completion.manifest.ref.revision},
+                                    {"manifest_revision", completion.manifest.revision},
+                                    {"ref_count", durable_manifest_ref_count(completion.manifest.ref.digest)},
+                                    {"manifest_file_bytes", completion.manifest_file_bytes},
+                                    {"manifest_budget_bytes", completion.manifest_budget_bytes},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::compact:
+                            {
+                                durable_compacted_total++;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", "compact"},
+                                    {"manifest_revision", completion.compact.revision},
+                                    {"refs", completion.compact.refs},
+                                    {"records_before", completion.compact.records_before},
+                                    {"records_after", completion.compact.records_after},
+                                    {"bytes_before", completion.compact.bytes_before},
+                                    {"bytes_after", completion.compact.bytes_after},
+                                    {"manifest_budget_bytes", completion.manifest_budget_bytes},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::prune:
+                            {
+                                json evictions = json::array();
+                                uint64_t released_refs = 0;
+                                for (const auto & eviction : completion.cache_evictions) {
+                                    released_refs += eviction.released_refs;
+                                    evictions.push_back({
+                                        {"digest", eviction.digest},
+                                        {"released_refs", eviction.released_refs},
+                                        {"file_bytes", eviction.file_bytes},
+                                    });
+                                }
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", "prune"},
+                                    {"target_disk_bytes", completion.job.target_disk_bytes},
+                                    {"disk_bytes_before", completion.prune_disk_bytes_before},
+                                    {"disk_bytes_after", completion.prune_disk_bytes_after},
+                                    {"reclaimed_bytes", completion.prune_disk_bytes_before -
+                                        completion.prune_disk_bytes_after},
+                                    {"released_refs", released_refs},
+                                    {"evictions", std::move(evictions)},
+                                    {"manifest_revision", completion.manifest_revision},
+                                    {"manifest_file_bytes", completion.manifest_file_bytes},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::head_create:
+                        case durable_io_operation::head_advance:
+                        case durable_io_operation::head_delete:
+                            {
+                                const char * action = completion.job.operation == durable_io_operation::head_create
+                                    ? "create" : completion.job.operation == durable_io_operation::head_advance
+                                        ? "advance" : "delete";
+                                const auto & head = completion.head.head;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = {
+                                    {"action", action},
+                                    {"name", head.name},
+                                    {"generation", head.generation},
+                                    {"digest", head.digest},
+                                    {"parent_digest", head.parent_digest.empty()
+                                        ? json(nullptr) : json(head.parent_digest)},
+                                    {"head_revision", head.revision},
+                                    {"manifest_revision", completion.head.revision},
+                                    {"manifest_file_bytes", completion.manifest_file_bytes},
+                                    {"deduplicated", completion.head.deduplicated},
+                                    {"timings", {
+                                        {"queue_ms", queue_ms},
+                                        {"io_ms", io_ms},
+                                        {"completion_wait_ms", completion_wait_ms},
+                                        {"total_ms", (t_complete - completion.job.enqueued_us) / 1000.0},
+                                    }},
+                                };
+                                queue_results.send(std::move(res));
+                            } break;
+                        case durable_io_operation::head_load:
+                            {
+                                if (!queue_results.is_waiting_task_id(request.id)) {
+                                    durable_io_cancelled_loads_total++;
+                                    break;
+                                }
+                                json materialized;
+                                if (!materialize_snapshot_content(
+                                        request,
+                                        completion.load.tokens,
+                                        completion.load.state,
+                                        -1,
+                                        -1,
+                                        -1,
+                                        completion.load.entry.digest,
+                                        materialized)) {
+                                    break;
+                                }
+                                durable_materialized_total++;
+                                const int64_t t_end = ggml_time_us();
+                                const auto & head = completion.head.head;
+                                materialized["action"] = "materialize_head";
+                                materialized["snapshot_id"] = nullptr;
+                                materialized["cold"] = true;
+                                materialized["head"] = {
+                                    {"name", head.name},
+                                    {"generation", head.generation},
+                                    {"digest", head.digest},
+                                    {"parent_digest", head.parent_digest.empty()
+                                        ? json(nullptr) : json(head.parent_digest)},
+                                    {"revision", head.revision},
+                                };
+                                materialized["file_bytes"] = completion.load.entry.file_bytes;
+                                materialized["timings"]["queue_ms"] = queue_ms;
+                                materialized["timings"]["load_verify_ms"] = io_ms;
+                                materialized["timings"]["completion_wait_ms"] = completion_wait_ms;
+                                materialized["timings"]["total_ms"] =
+                                    (t_end - completion.job.enqueued_us) / 1000.0;
+                                auto res = std::make_unique<server_task_result_snapshot>();
+                                res->id = request.id;
+                                res->result = std::move(materialized);
+                                queue_results.send(std::move(res));
+                            } break;
+                    }
+                } break;
+            case SERVER_TASK_TYPE_STATETREE:
+                {
+                    auto res = std::make_unique<server_task_result_statetree>();
+                    res->id = task.id;
+                    res->states = get_statetree_states_json();
+                    res->snapshots = get_statetree_snapshots_json();
+                    res->snapshot_bytes = snapshot_bytes;
+                    res->snapshot_budget_bytes = params_base.statetree_max_snapshot_bytes;
+                    res->snapshot_high_water_bytes = snapshot_high_water_bytes;
+                    res->snapshot_content_count = statetree_snapshot_contents.size();
+                    res->durable_contents = get_snapshot_store_contents_json();
+                    res->durable_manifest_refs = get_snapshot_manifest_refs_json();
+                    res->durable_managed_digests = get_snapshot_managed_digests_json();
+                    res->durable_logical_heads = get_snapshot_logical_heads_json();
+                    if (snapshot_store) {
+                        res->durable_disk_bytes = durable_store_disk_bytes;
+                        res->durable_disk_budget_bytes = durable_store_disk_budget_bytes;
+                        res->durable_disk_high_water_bytes = durable_store_disk_high_water_bytes;
+                        res->durable_recovered_temp_files = durable_store_recovered_temp_files;
+                        res->durable_ignored_corrupt_files = durable_store_ignored_corrupt_files;
+                        res->durable_runtime_integrity_failures = durable_store_runtime_integrity_failures;
+                        res->durable_orphaned_disk_bytes = durable_store_orphaned_disk_bytes;
+                        res->durable_manifest_revision = durable_manifest_revision;
+                        res->durable_manifest_file_bytes = durable_manifest_file_bytes;
+                        res->durable_manifest_budget_bytes = durable_manifest_budget_bytes;
+                        res->durable_manifest_high_water_bytes = durable_manifest_high_water_bytes;
+                        res->durable_manifest_record_count = durable_manifest_record_count;
+                        res->durable_manifest_recovered_temp_files = durable_manifest_recovered_temp_files;
+                        res->durable_manifest_recovered_tail_bytes = durable_manifest_recovered_tail_bytes;
+                        res->durable_manifest_compactions = durable_manifest_compactions;
+                        res->durable_manifest_recovered_publish_commits =
+                            durable_manifest_recovered_publish_commits;
+                        res->durable_manifest_recovered_publish_aborts =
+                            durable_manifest_recovered_publish_aborts;
+                        res->durable_managed_recovered_erases = durable_managed_recovered_erases;
+                        res->durable_managed_recovered_bytes = durable_managed_recovered_bytes;
+                    }
+                    res->durable_io_pending = durable_io_pending.load();
+                    res->durable_io_queue_high_water = durable_io_queue_high_water;
+                    res->durable_io_completed_total = durable_io_completed_total;
+                    res->durable_io_cancelled_loads_total = durable_io_cancelled_loads_total;
+                    res->durable_io_reserved_disk_bytes = durable_io_reserved_disk_bytes;
+                    res->durable_io_reserved_disk_high_water = durable_io_reserved_disk_high_water;
+                    res->durable_io_reserved_load_bytes = durable_io_reserved_load_bytes;
+                    res->durable_io_reserved_load_high_water = durable_io_reserved_load_high_water;
+                    res->journal = get_statetree_journal_json();
+                    res->journal_capacity = statetree_journal_capacity;
+                    res->journal_oldest_sequence = statetree_journal.empty()
+                        ? statetree_journal_next_sequence
+                        : statetree_journal.front().sequence;
+                    res->journal_next_sequence = statetree_journal_next_sequence;
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
@@ -2685,6 +5973,8 @@ private:
     }
 
     void update_slots() {
+        maintain_retention();
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -3627,7 +6917,13 @@ private:
 
                         GGML_ASSERT(child->state == SLOT_STATE_WAIT_OTHER);
 
-                        slot.copy_state_to(*child);
+                        const size_t child_bytes = child->prompt_state_bytes();
+                        const size_t parent_bytes = slot.prompt_state_bytes();
+                        const bool copy_prompt_state = reserve_state_bytes(parent_bytes, child_bytes, *child);
+                        if (!copy_prompt_state) {
+                            SLT_WRN(*child, "%s", "copying parent state without retained checkpoints due to byte pressure\n");
+                        }
+                        slot.copy_state_to(*child, copy_prompt_state);
                         child->state = SLOT_STATE_DONE_PROMPT;
                     }
                 }
@@ -3838,6 +7134,7 @@ private:
             }
         }
 
+        maintain_retention();
         SRV_DBG("%s", "run slots completed\n");
     }
 
@@ -3846,7 +7143,7 @@ private:
     }
 
     server_response_reader get_response_reader() {
-        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_MILLISECONDS);
     }
 };
 
@@ -3867,6 +7164,7 @@ void server_context::start_loop() {
 }
 
 void server_context::terminate() {
+    impl->stop_durable_io_worker();
     impl->queue_tasks.terminate();
 }
 
@@ -3928,8 +7226,13 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_http_res {
     server_response_reader rd;
-    server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
-            : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
+    server_res_generator(
+            server_queue & queue_tasks,
+            server_response & queue_results,
+            int sleep_idle_seconds,
+            bool bypass_sleep = false,
+            int polling_interval_ms = HTTP_POLLING_MILLISECONDS)
+            : rd(queue_tasks, queue_results, polling_interval_ms) {
         // fast path in case sleeping is disabled
         bypass_sleep |= sleep_idle_seconds < 0;
         if (!bypass_sleep) {
@@ -4070,6 +7373,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             task.id_slot = json_value(data, "id_slot", -1);
+            if (data.contains("state_id")) {
+                if (!data.at("state_id").is_number_integer()) {
+                    throw std::invalid_argument("state_id must be a non-negative integer");
+                }
+                task.state_id = data.at("state_id").get<int64_t>();
+                if (task.state_id < 0) {
+                    throw std::invalid_argument("state_id must be a non-negative integer");
+                }
+            }
+            if (data.contains("node_id")) {
+                if (!data.at("node_id").is_number_integer()) {
+                    throw std::invalid_argument("node_id must be a non-negative integer");
+                }
+                task.node_id = data.at("node_id").get<int64_t>();
+                if (task.node_id < 0) {
+                    throw std::invalid_argument("node_id must be a non-negative integer");
+                }
+            }
+            if (data.contains("fork_id")) {
+                if (!data.at("fork_id").is_number_integer()) {
+                    throw std::invalid_argument("fork_id must be a non-negative integer");
+                }
+                task.fork_id = data.at("fork_id").get<int64_t>();
+                if (task.fork_id < 0) {
+                    throw std::invalid_argument("fork_id must be a non-negative integer");
+                }
+            }
 
             // OAI-compat
             task.params.res_type          = res_type;
@@ -4266,8 +7596,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
-    return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep, int polling_interval_ms) {
+    return std::make_unique<server_res_generator>(
+            queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep, polling_interval_ms);
 }
 
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
@@ -4352,6 +7683,102 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "statetree_expired_total"},
+                    {"help",  "Number of StateTree families reclaimed after lease expiry."},
+                    {"value",  res_task->statetree_expired_total}
+            }, {
+                    {"name",  "statetree_evicted_total"},
+                    {"help",  "Number of StateTree families or idle slots reclaimed under byte pressure."},
+                    {"value",  res_task->statetree_evicted_total}
+            }, {
+                    {"name",  "statetree_reclaimed_bytes_total"},
+                    {"help",  "Exact prompt-state bytes reclaimed by StateTree retention controls."},
+                    {"value",  res_task->statetree_reclaimed_bytes_total}
+            }, {
+                    {"name",  "statetree_renewed_total"},
+                    {"help",  "Number of generation-fenced StateTree lease renewals."},
+                    {"value",  res_task->statetree_renewed_total}
+            }, {
+                    {"name",  "statetree_pressure_rejected_total"},
+                    {"help",  "Number of state-pressure events with no evictable state."},
+                    {"value",  res_task->statetree_pressure_rejected_total}
+            }, {
+                    {"name",  "statetree_snapshots_captured_total"},
+                    {"help",  "Number of immutable StateTree snapshots captured."},
+                    {"value",  res_task->statetree_snapshots_captured_total}
+            }, {
+                    {"name",  "statetree_snapshots_materialized_total"},
+                    {"help",  "Number of immutable StateTree snapshots materialized into live nodes."},
+                    {"value",  res_task->statetree_snapshots_materialized_total}
+            }, {
+                    {"name",  "statetree_snapshots_erased_total"},
+                    {"help",  "Number of immutable StateTree snapshots explicitly erased."},
+                    {"value",  res_task->statetree_snapshots_erased_total}
+            }, {
+                    {"name",  "statetree_snapshot_rejected_total"},
+                    {"help",  "Number of immutable snapshot captures rejected by the payload budget."},
+                    {"value",  res_task->statetree_snapshot_rejected_total}
+            }, {
+                    {"name",  "statetree_durable_spilled_total"},
+                    {"help",  "Number of durable snapshot spill operations completed."},
+                    {"value",  res_task->statetree_durable_spilled_total}
+            }, {
+                    {"name",  "statetree_durable_materialized_total"},
+                    {"help",  "Number of durable snapshot content objects materialized."},
+                    {"value",  res_task->statetree_durable_materialized_total}
+            }, {
+                    {"name",  "statetree_durable_erased_total"},
+                    {"help",  "Number of durable snapshot content objects explicitly erased."},
+                    {"value",  res_task->statetree_durable_erased_total}
+            }, {
+                    {"name",  "statetree_durable_rejected_total"},
+                    {"help",  "Number of durable snapshot operations rejected by disk, load, or integrity admission."},
+                    {"value",  res_task->statetree_durable_rejected_total}
+            }, {
+                    {"name",  "statetree_durable_io_completed_total"},
+                    {"help",  "Number of background durable I/O completions consumed by the state thread."},
+                    {"value",  res_task->statetree_durable_io_completed_total}
+            }, {
+                    {"name",  "statetree_durable_io_cancelled_loads_total"},
+                    {"help",  "Verified cold loads discarded because their HTTP owner disconnected."},
+                    {"value",  res_task->statetree_durable_io_cancelled_loads_total}
+            }, {
+                    {"name",  "statetree_durable_retained_total"},
+                    {"help",  "Number of durable ownership retain operations completed."},
+                    {"value",  res_task->statetree_durable_retained_total}
+            }, {
+                    {"name",  "statetree_durable_released_total"},
+                    {"help",  "Number of durable ownership release operations completed."},
+                    {"value",  res_task->statetree_durable_released_total}
+            }, {
+                    {"name",  "statetree_durable_compacted_total"},
+                    {"help",  "Number of explicit durable ownership manifest compactions completed."},
+                    {"value",  res_task->statetree_durable_compacted_total}
+            }, {
+                    {"name",  "statetree_durable_manifest_recovered_publish_commits_total"},
+                    {"help",  "Pending managed publishes verified and committed during startup recovery."},
+                    {"value",  res_task->statetree_durable_manifest_recovered_publish_commits}
+            }, {
+                    {"name",  "statetree_durable_manifest_recovered_publish_aborts_total"},
+                    {"help",  "Abandoned managed publish intents durably aborted during startup recovery."},
+                    {"value",  res_task->statetree_durable_manifest_recovered_publish_aborts}
+            }, {
+                    {"name",  "statetree_durable_cache_evicted_total"},
+                    {"help",  "Managed cache objects erased by explicit or pressure-driven reconciliation."},
+                    {"value",  res_task->statetree_durable_cache_evicted_total}
+            }, {
+                    {"name",  "statetree_durable_cache_reclaimed_bytes_total"},
+                    {"help",  "Exact managed cache object bytes reclaimed."},
+                    {"value",  res_task->statetree_durable_cache_reclaimed_bytes_total}
+            }, {
+                    {"name",  "statetree_durable_managed_recovered_erases_total"},
+                    {"help",  "Unreachable managed objects erased while completing interrupted eviction at startup."},
+                    {"value",  res_task->statetree_durable_managed_recovered_erases}
+            }, {
+                    {"name",  "statetree_durable_managed_recovered_bytes_total"},
+                    {"help",  "Exact managed object bytes erased during startup eviction recovery."},
+                    {"value",  res_task->statetree_durable_managed_recovered_bytes}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -4378,6 +7805,154 @@ void server_routes::init_routes() {
                     {"help",  "Number of requests deferred."},
                     {"value",  (uint64_t) res_task->n_tasks_deferred}
             },{
+                    {"name",  "statetree_state_bytes"},
+                    {"help",  "Exact prompt-state bytes held by all live slots."},
+                    {"value",  res_task->statetree_state_bytes}
+            },{
+                    {"name",  "statetree_retained_bytes"},
+                    {"help",  "Exact prompt-state bytes retained by idle slots."},
+                    {"value",  res_task->statetree_retained_bytes}
+            },{
+                    {"name",  "statetree_active_bytes"},
+                    {"help",  "Exact prompt-state bytes held by processing slots."},
+                    {"value",  res_task->statetree_active_bytes}
+            },{
+                    {"name",  "statetree_state_budget_bytes"},
+                    {"help",  "Configured exact live slot prompt-state byte ceiling, or zero when unlimited."},
+                    {"value",  res_task->statetree_state_budget_bytes}
+            },{
+                    {"name",  "statetree_state_high_water_bytes"},
+                    {"help",  "Largest post-enforcement live slot prompt-state byte count."},
+                    {"value",  res_task->statetree_state_high_water_bytes}
+            },{
+                    {"name",  "statetree_retained_high_water_bytes"},
+                    {"help",  "Largest post-enforcement idle retained-state byte count."},
+                    {"value",  res_task->statetree_retained_high_water_bytes}
+            },{
+                    {"name",  "statetree_snapshot_bytes"},
+                    {"help",  "Exact serialized state and token payload bytes held by immutable snapshots."},
+                    {"value",  res_task->statetree_snapshot_bytes}
+            },{
+                    {"name",  "statetree_snapshot_budget_bytes"},
+                    {"help",  "Configured immutable snapshot payload byte ceiling, or zero when disabled."},
+                    {"value",  res_task->statetree_snapshot_budget_bytes}
+            },{
+                    {"name",  "statetree_snapshot_high_water_bytes"},
+                    {"help",  "Largest immutable snapshot payload byte count."},
+                    {"value",  res_task->statetree_snapshot_high_water_bytes}
+            },{
+                    {"name",  "statetree_snapshot_count"},
+                    {"help",  "Number of immutable snapshot provenance handles retained by this server process."},
+                    {"value",  res_task->statetree_snapshot_count}
+            },{
+                    {"name",  "statetree_snapshot_content_count"},
+                    {"help",  "Number of unique digest-addressed immutable snapshot payloads."},
+                    {"value",  res_task->statetree_snapshot_content_count}
+            },{
+                    {"name",  "statetree_durable_disk_bytes"},
+                    {"help",  "Exact durable snapshot object file bytes in the active compatibility namespace."},
+                    {"value",  res_task->statetree_durable_disk_bytes}
+            },{
+                    {"name",  "statetree_durable_disk_budget_bytes"},
+                    {"help",  "Configured durable snapshot namespace file-byte ceiling."},
+                    {"value",  res_task->statetree_durable_disk_budget_bytes}
+            },{
+                    {"name",  "statetree_durable_disk_high_water_bytes"},
+                    {"help",  "Largest durable snapshot namespace file-byte count."},
+                    {"value",  res_task->statetree_durable_disk_high_water_bytes}
+            },{
+                    {"name",  "statetree_durable_content_count"},
+                    {"help",  "Number of valid durable content objects discovered in the active namespace."},
+                    {"value",  res_task->statetree_durable_content_count}
+            },{
+                    {"name",  "statetree_durable_recovered_temp_files"},
+                    {"help",  "Crash-interrupted temporary durable objects removed during discovery."},
+                    {"value",  res_task->statetree_durable_recovered_temp_files}
+            },{
+                    {"name",  "statetree_durable_ignored_corrupt_files"},
+                    {"help",  "Malformed durable objects ignored during namespace discovery."},
+                    {"value",  res_task->statetree_durable_ignored_corrupt_files}
+            },{
+                    {"name",  "statetree_durable_runtime_integrity_failures"},
+                    {"help",  "Durable objects that failed size, envelope, or digest verification when loaded."},
+                    {"value",  res_task->statetree_durable_runtime_integrity_failures}
+            },{
+                    {"name",  "statetree_durable_orphaned_disk_bytes"},
+                    {"help",  "Durable namespace bytes occupied by malformed or unindexed content files."},
+                    {"value",  res_task->statetree_durable_orphaned_disk_bytes}
+            },{
+                    {"name",  "statetree_durable_io_pending"},
+                    {"help",  "Durable I/O jobs queued, running, or awaiting state-thread completion."},
+                    {"value",  res_task->statetree_durable_io_pending}
+            },{
+                    {"name",  "statetree_durable_io_queue_high_water"},
+                    {"help",  "Largest durable I/O pending-job count."},
+                    {"value",  res_task->statetree_durable_io_queue_high_water}
+            },{
+                    {"name",  "statetree_durable_io_reserved_disk_bytes"},
+                    {"help",  "Projected object bytes reserved by in-flight unique spills."},
+                    {"value",  res_task->statetree_durable_io_reserved_disk_bytes}
+            },{
+                    {"name",  "statetree_durable_io_reserved_disk_high_water"},
+                    {"help",  "Largest in-flight durable spill disk-byte reservation."},
+                    {"value",  res_task->statetree_durable_io_reserved_disk_high_water}
+            },{
+                    {"name",  "statetree_durable_io_reserved_load_bytes"},
+                    {"help",  "Payload bytes reserved by queued or verified cold loads."},
+                    {"value",  res_task->statetree_durable_io_reserved_load_bytes}
+            },{
+                    {"name",  "statetree_durable_io_reserved_load_high_water"},
+                    {"help",  "Largest aggregate cold-load payload-byte reservation."},
+                    {"value",  res_task->statetree_durable_io_reserved_load_high_water}
+            },{
+                    {"name",  "statetree_durable_manifest_refs"},
+                    {"help",  "Number of live owner-to-content references in the durable manifest."},
+                    {"value",  res_task->statetree_durable_manifest_refs}
+            },{
+                    {"name",  "statetree_durable_managed_count"},
+                    {"help",  "Number of durable objects governed by managed lifecycle reconciliation."},
+                    {"value",  res_task->statetree_durable_managed_count}
+            },{
+                    {"name",  "statetree_durable_manifest_revision"},
+                    {"help",  "Last committed durable ownership manifest revision."},
+                    {"value",  res_task->statetree_durable_manifest_revision}
+            },{
+                    {"name",  "statetree_durable_manifest_file_bytes"},
+                    {"help",  "Current checksummed ownership WAL/checkpoint file bytes."},
+                    {"value",  res_task->statetree_durable_manifest_file_bytes}
+            },{
+                    {"name",  "statetree_durable_manifest_budget_bytes"},
+                    {"help",  "Configured ownership manifest file-byte ceiling."},
+                    {"value",  res_task->statetree_durable_manifest_budget_bytes}
+            },{
+                    {"name",  "statetree_durable_manifest_high_water_bytes"},
+                    {"help",  "Largest ownership manifest file-byte count observed by this process."},
+                    {"value",  res_task->statetree_durable_manifest_high_water_bytes}
+            },{
+                    {"name",  "statetree_durable_manifest_record_count"},
+                    {"help",  "Number of records in the current ownership WAL/checkpoint."},
+                    {"value",  res_task->statetree_durable_manifest_record_count}
+            },{
+                    {"name",  "statetree_durable_manifest_recovered_temp_files"},
+                    {"help",  "Interrupted manifest compaction files recovered during startup."},
+                    {"value",  res_task->statetree_durable_manifest_recovered_temp_files}
+            },{
+                    {"name",  "statetree_durable_manifest_recovered_tail_bytes"},
+                    {"help",  "Interrupted manifest tail bytes truncated during startup."},
+                    {"value",  res_task->statetree_durable_manifest_recovered_tail_bytes}
+            },{
+                    {"name",  "statetree_durable_manifest_compactions"},
+                    {"help",  "Manifest compactions performed by this process, including automatic compaction."},
+                    {"value",  res_task->statetree_durable_manifest_compactions}
+            },{
+                    {"name",  "statetree_families"},
+                    {"help",  "Number of live StateTree fork families."},
+                    {"value",  res_task->n_statetree_families}
+            },{
+                    {"name",  "statetree_active_families"},
+                    {"help",  "Number of StateTree families with in-flight work."},
+                    {"value",  res_task->n_statetree_active_families}
+            },{
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
@@ -4394,7 +7969,7 @@ void server_routes::init_routes() {
                 const std::string name = metric_def.at("name");
                 const std::string help = metric_def.at("help");
 
-                auto value = json_value(metric_def, "value", 0.);
+                const json & value = metric_def.at("value");
                 prometheus << "# HELP llamacpp:" << name << " " << help  << "\n"
                             << "# TYPE llamacpp:" << name << " " << type  << "\n"
                             << "llamacpp:"        << name << " " << value << "\n";
@@ -4451,6 +8026,177 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_snapshots = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.endpoint_slots) {
+            res->error(format_error_response(
+                    "This server does not support StateTree snapshots. Start it with `--slots`",
+                    ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        {
+            server_task task(SERVER_TASK_TYPE_STATETREE);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true);
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * statetree = dynamic_cast<server_task_result_statetree *>(result.get());
+        GGML_ASSERT(statetree != nullptr);
+        res->ok({
+            {"snapshots", statetree->snapshots},
+            {"snapshot_bytes", statetree->snapshot_bytes},
+            {"snapshot_budget_bytes", statetree->snapshot_budget_bytes},
+            {"snapshot_high_water_bytes", statetree->snapshot_high_water_bytes},
+            {"snapshot_content_count", statetree->snapshot_content_count},
+        });
+        return res;
+    };
+
+    this->get_snapshot_contents = [this](const server_http_req & req) {
+        auto res = create_response();
+        {
+            server_task task(SERVER_TASK_TYPE_STATETREE);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true);
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * statetree = dynamic_cast<server_task_result_statetree *>(result.get());
+        GGML_ASSERT(statetree != nullptr);
+        res->ok({
+            {"contents", statetree->durable_contents},
+            {"refs", statetree->durable_manifest_refs},
+            {"managed_digests", statetree->durable_managed_digests},
+            {"disk_bytes", statetree->durable_disk_bytes},
+            {"disk_budget_bytes", statetree->durable_disk_budget_bytes},
+            {"disk_high_water_bytes", statetree->durable_disk_high_water_bytes},
+            {"recovered_temp_files", statetree->durable_recovered_temp_files},
+            {"ignored_corrupt_files", statetree->durable_ignored_corrupt_files},
+            {"runtime_integrity_failures", statetree->durable_runtime_integrity_failures},
+            {"orphaned_disk_bytes", statetree->durable_orphaned_disk_bytes},
+            {"io_pending", statetree->durable_io_pending},
+            {"io_queue_high_water", statetree->durable_io_queue_high_water},
+            {"io_completed_total", statetree->durable_io_completed_total},
+            {"io_cancelled_loads_total", statetree->durable_io_cancelled_loads_total},
+            {"io_reserved_disk_bytes", statetree->durable_io_reserved_disk_bytes},
+            {"io_reserved_disk_high_water", statetree->durable_io_reserved_disk_high_water},
+            {"io_reserved_load_bytes", statetree->durable_io_reserved_load_bytes},
+            {"io_reserved_load_high_water", statetree->durable_io_reserved_load_high_water},
+            {"manifest_revision", statetree->durable_manifest_revision},
+            {"manifest_file_bytes", statetree->durable_manifest_file_bytes},
+            {"manifest_budget_bytes", statetree->durable_manifest_budget_bytes},
+            {"manifest_high_water_bytes", statetree->durable_manifest_high_water_bytes},
+            {"manifest_record_count", statetree->durable_manifest_record_count},
+            {"manifest_recovered_temp_files", statetree->durable_manifest_recovered_temp_files},
+            {"manifest_recovered_tail_bytes", statetree->durable_manifest_recovered_tail_bytes},
+            {"manifest_compactions", statetree->durable_manifest_compactions},
+            {"manifest_recovered_publish_commits",
+                statetree->durable_manifest_recovered_publish_commits},
+            {"manifest_recovered_publish_aborts",
+                statetree->durable_manifest_recovered_publish_aborts},
+            {"managed_recovered_erases", statetree->durable_managed_recovered_erases},
+            {"managed_recovered_bytes", statetree->durable_managed_recovered_bytes},
+        });
+        return res;
+    };
+
+    this->get_snapshot_heads = [this](const server_http_req & req) {
+        auto res = create_response();
+        server_task task(SERVER_TASK_TYPE_STATETREE);
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * statetree = dynamic_cast<server_task_result_statetree *>(result.get());
+        GGML_ASSERT(statetree != nullptr);
+        res->ok({
+            {"heads", statetree->durable_logical_heads},
+            {"manifest_revision", statetree->durable_manifest_revision},
+            {"manifest_file_bytes", statetree->durable_manifest_file_bytes},
+            {"manifest_budget_bytes", statetree->durable_manifest_budget_bytes},
+        });
+        return res;
+    };
+
+    this->get_states = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.endpoint_slots) {
+            res->error(format_error_response(
+                    "This server does not support StateTree inspection. Start it with `--slots`",
+                    ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        uint64_t journal_after = 0;
+        const std::string journal_after_str = req.get_param("journal_after");
+        if (!journal_after_str.empty()) {
+            try {
+                size_t parsed = 0;
+                journal_after = std::stoull(journal_after_str, &parsed);
+                if (parsed != journal_after_str.size()) {
+                    throw std::invalid_argument("trailing journal sequence characters");
+                }
+            } catch (const std::exception &) {
+                res->error(format_error_response(
+                        "journal_after must be a non-negative integer",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+
+        {
+            server_task task(SERVER_TASK_TYPE_STATETREE);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true);
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        auto * statetree = dynamic_cast<server_task_result_statetree *>(result.get());
+        GGML_ASSERT(statetree != nullptr);
+        if (journal_after > 0) {
+            json filtered = json::array();
+            for (const auto & entry : statetree->journal) {
+                if (entry.at("sequence").get<uint64_t>() > journal_after) {
+                    filtered.push_back(entry);
+                }
+            }
+            statetree->journal = std::move(filtered);
+        }
+        res->ok(statetree->to_json());
+        return res;
+    };
+
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
 
@@ -4480,6 +8226,9 @@ void server_routes::init_routes() {
         if (action == "commit") {
             return handle_slots_commit(req, id_slot);
         }
+        if (action == "renew") {
+            return handle_slots_renew(req, id_slot);
+        }
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
         }
@@ -4496,6 +8245,572 @@ void server_routes::init_routes() {
             return handle_slots_restore(req, id_slot);
         }
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->post_nodes = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        const std::string node_id_str = req.get_param("node_id");
+        int64_t node_id;
+        try {
+            size_t parsed = 0;
+            node_id = std::stoll(node_id_str, &parsed);
+            if (parsed != node_id_str.size() || node_id < 0) {
+                throw std::invalid_argument("invalid node ID");
+            }
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid node ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string action = req.get_param("action");
+        if (action == "fork") {
+            return handle_slots_fork(req, -1, node_id);
+        }
+        if (action == "snapshot") {
+            return handle_snapshot_capture(req, node_id);
+        }
+        if (action == "commit") {
+            return handle_slots_commit(req, -1, node_id);
+        }
+        if (action == "renew") {
+            return handle_slots_renew(req, -1, node_id);
+        }
+        if (action == "erase") {
+            return handle_slots_erase(req, -1, node_id);
+        }
+
+        res->error(format_error_response("Invalid node action", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    };
+
+    this->post_snapshots = [this](const server_http_req & req) {
+        auto res = create_response();
+        int64_t snapshot_id = -1;
+        try {
+            const std::string value = req.get_param("snapshot_id");
+            size_t parsed = 0;
+            snapshot_id = std::stoll(value, &parsed);
+            if (parsed != value.size() || snapshot_id < 0) {
+                throw std::invalid_argument("invalid snapshot ID");
+            }
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid snapshot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        int id_slot = -1;
+        std::string digest;
+        std::string owner;
+        std::string retention_class;
+        std::string head_name;
+        std::string expected_digest;
+        uint64_t expected_generation = 0;
+        bool has_expected_generation = false;
+        size_t request_field_count = 0;
+        try {
+            const json data = req.body.empty() ? json::object() : json::parse(req.body);
+            if (!data.is_object()) {
+                throw std::invalid_argument("request body must be an object");
+            }
+            request_field_count = data.size();
+            if (data.contains("digest")) {
+                if (!data.at("digest").is_string()) {
+                    throw std::invalid_argument("digest must be a string");
+                }
+                digest = data.at("digest").get<std::string>();
+            }
+            if (data.contains("id_slot")) {
+                if (!data.at("id_slot").is_number_integer()) {
+                    throw std::invalid_argument("id_slot must be an integer");
+                }
+                id_slot = data.at("id_slot").get<int>();
+                if (id_slot < 0) {
+                    throw std::invalid_argument("id_slot must be non-negative");
+                }
+            }
+            if (data.contains("owner")) {
+                if (!data.at("owner").is_string()) {
+                    throw std::invalid_argument("owner must be a string");
+                }
+                owner = data.at("owner").get<std::string>();
+                if (owner.empty() || owner.size() > 128 || !std::all_of(
+                        owner.begin(), owner.end(), [](unsigned char value) {
+                            return (value >= 'a' && value <= 'z') ||
+                                (value >= 'A' && value <= 'Z') ||
+                                (value >= '0' && value <= '9') || value == '.' || value == '_' ||
+                                value == ':' || value == '/' || value == '-';
+                        })) {
+                    throw std::invalid_argument(
+                            "owner must contain 1 to 128 portable identifier characters");
+                }
+            }
+            if (data.contains("retention_class")) {
+                if (!data.at("retention_class").is_string()) {
+                    throw std::invalid_argument("retention_class must be a string");
+                }
+                retention_class = data.at("retention_class").get<std::string>();
+                if (retention_class != "pinned" && retention_class != "cache") {
+                    throw std::invalid_argument("retention_class must be pinned or cache");
+                }
+            }
+            if (data.contains("head_name")) {
+                if (!data.at("head_name").is_string()) {
+                    throw std::invalid_argument("head_name must be a string");
+                }
+                head_name = data.at("head_name").get<std::string>();
+                if (head_name.empty() || head_name.size() > 128 || !std::all_of(
+                        head_name.begin(), head_name.end(), [](unsigned char value) {
+                            return (value >= 'a' && value <= 'z') ||
+                                (value >= 'A' && value <= 'Z') ||
+                                (value >= '0' && value <= '9') || value == '.' || value == '_' ||
+                                value == ':' || value == '/' || value == '-';
+                        })) {
+                    throw std::invalid_argument(
+                            "head_name must contain 1 to 128 portable identifier characters");
+                }
+            }
+            if (data.contains("expected_digest")) {
+                if (!data.at("expected_digest").is_string()) {
+                    throw std::invalid_argument("expected_digest must be a string");
+                }
+                expected_digest = data.at("expected_digest").get<std::string>();
+                if (expected_digest.size() != 71 || expected_digest.compare(0, 7, "sha256:") != 0 ||
+                        !std::all_of(expected_digest.begin() + 7, expected_digest.end(),
+                            [](unsigned char value) {
+                                return (value >= '0' && value <= '9') ||
+                                    (value >= 'a' && value <= 'f');
+                            })) {
+                    throw std::invalid_argument(
+                            "expected_digest must be a canonical SHA-256 digest");
+                }
+            }
+            if (data.contains("expected_generation")) {
+                if (data.at("expected_generation").is_number_unsigned()) {
+                    expected_generation = data.at("expected_generation").get<uint64_t>();
+                } else if (data.at("expected_generation").is_number_integer()) {
+                    const int64_t value = data.at("expected_generation").get<int64_t>();
+                    if (value < 0) {
+                        throw std::invalid_argument("expected_generation must be non-negative");
+                    }
+                    expected_generation = (uint64_t) value;
+                } else {
+                    throw std::invalid_argument(
+                            "expected_generation must be a non-negative integer");
+                }
+                has_expected_generation = true;
+            }
+        } catch (const std::exception & e) {
+            res->error(format_error_response(
+                    std::string("Invalid snapshot request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string action = req.get_param("action");
+        server_task_type type;
+        if (action == "materialize") {
+            if (!owner.empty() || !retention_class.empty() || !head_name.empty() ||
+                    !expected_digest.empty() || has_expected_generation) {
+                res->error(format_error_response(
+                        "Snapshot materialize does not accept ownership fields",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_MATERIALIZE;
+        } else if (action == "spill") {
+            if (id_slot >= 0 || !owner.empty() || !retention_class.empty() || !head_name.empty() ||
+                    !expected_digest.empty() || has_expected_generation) {
+                res->error(format_error_response(
+                        "Snapshot spill does not accept id_slot or ownership fields",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_SPILL;
+        } else if (action == "publish") {
+            if (id_slot >= 0 || owner.empty() || retention_class.empty() || !head_name.empty() ||
+                    !expected_digest.empty() || has_expected_generation) {
+                res->error(format_error_response(
+                        "Snapshot publish requires owner and retention_class and does not accept id_slot",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_PUBLISH;
+        } else if (action == "publish-advance") {
+            if (id_slot >= 0 || owner.empty() || retention_class.empty() || head_name.empty() ||
+                    expected_digest.empty() || !has_expected_generation || expected_generation == 0 ||
+                    request_field_count != 6) {
+                res->error(format_error_response(
+                        "Snapshot publish-advance requires only digest, owner, retention_class, head_name, expected_generation, and expected_digest",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_PUBLISH_ADVANCE;
+        } else if (action == "erase") {
+            if (id_slot >= 0 || !owner.empty() || !retention_class.empty() || !head_name.empty() ||
+                    !expected_digest.empty() || has_expected_generation) {
+                res->error(format_error_response(
+                        "Snapshot erase does not accept id_slot or ownership fields",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_ERASE;
+        } else {
+            res->error(format_error_response("Invalid snapshot action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(type);
+        task.id = res->rd.get_new_id();
+        task.slot_action.snapshot_id = snapshot_id;
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.digest = std::move(digest);
+        task.slot_action.owner = std::move(owner);
+        task.slot_action.retention_class = std::move(retention_class);
+        task.slot_action.head_name = std::move(head_name);
+        task.slot_action.expected_digest = std::move(expected_digest);
+        task.slot_action.expected_generation = expected_generation;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        GGML_ASSERT(dynamic_cast<server_task_result_snapshot *>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_snapshot_contents = [this](const server_http_req & req) {
+        auto res = create_response(false, DURABLE_IO_POLLING_MILLISECONDS);
+        const std::string digest_hex = req.get_param("digest");
+        if (digest_hex.size() != 64 || !std::all_of(
+                digest_hex.begin(), digest_hex.end(), [](unsigned char value) {
+                    return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+                })) {
+            res->error(format_error_response("Invalid snapshot content digest", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        int id_slot = -1;
+        std::string owner;
+        std::string retention_class;
+        try {
+            const json data = req.body.empty() ? json::object() : json::parse(req.body);
+            if (!data.is_object()) {
+                throw std::invalid_argument("request body must be an object");
+            }
+            if (data.contains("id_slot")) {
+                if (!data.at("id_slot").is_number_integer()) {
+                    throw std::invalid_argument("id_slot must be an integer");
+                }
+                id_slot = data.at("id_slot").get<int>();
+                if (id_slot < 0) {
+                    throw std::invalid_argument("id_slot must be non-negative");
+                }
+            }
+            if (data.contains("owner")) {
+                if (!data.at("owner").is_string()) {
+                    throw std::invalid_argument("owner must be a string");
+                }
+                owner = data.at("owner").get<std::string>();
+                if (owner.empty() || owner.size() > 128 || !std::all_of(
+                        owner.begin(), owner.end(), [](unsigned char value) {
+                            return (value >= 'a' && value <= 'z') ||
+                                (value >= 'A' && value <= 'Z') ||
+                                (value >= '0' && value <= '9') || value == '.' || value == '_' ||
+                                value == ':' || value == '/' || value == '-';
+                        })) {
+                    throw std::invalid_argument(
+                            "owner must contain 1 to 128 portable identifier characters");
+                }
+            }
+            if (data.contains("retention_class")) {
+                if (!data.at("retention_class").is_string()) {
+                    throw std::invalid_argument("retention_class must be a string");
+                }
+                retention_class = data.at("retention_class").get<std::string>();
+                if (retention_class != "pinned" && retention_class != "cache") {
+                    throw std::invalid_argument("retention_class must be pinned or cache");
+                }
+            }
+        } catch (const std::exception & e) {
+            res->error(format_error_response(
+                    std::string("Invalid snapshot content request: ") + e.what(),
+                    ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const std::string action = req.get_param("action");
+        server_task_type type;
+        if (action == "materialize") {
+            if (!owner.empty() || !retention_class.empty()) {
+                res->error(format_error_response(
+                        "Snapshot content materialize does not accept ownership fields",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_CONTENT_MATERIALIZE;
+        } else if (action == "erase") {
+            if (id_slot >= 0 || !owner.empty() || !retention_class.empty()) {
+                res->error(format_error_response(
+                        "Snapshot content erase does not accept id_slot or ownership fields",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_CONTENT_ERASE;
+        } else if (action == "retain") {
+            if (id_slot >= 0 || owner.empty() || retention_class.empty()) {
+                res->error(format_error_response(
+                        "Snapshot content retain requires owner and retention_class and does not accept id_slot",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RETAIN;
+        } else if (action == "release") {
+            if (id_slot >= 0 || owner.empty() || !retention_class.empty()) {
+                res->error(format_error_response(
+                        "Snapshot content release requires owner and does not accept id_slot or retention_class",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RELEASE;
+        } else {
+            res->error(format_error_response("Invalid snapshot content action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(type);
+        task.id = res->rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.digest = "sha256:" + digest_hex;
+        task.slot_action.owner = std::move(owner);
+        task.slot_action.retention_class = std::move(retention_class);
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        GGML_ASSERT(dynamic_cast<server_task_result_snapshot *>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_snapshot_manifest = [this](const server_http_req & req) {
+        auto res = create_response(false, DURABLE_IO_POLLING_MILLISECONDS);
+        const std::string action = req.get_param("action");
+        server_task_type type;
+        uint64_t target_disk_bytes = 0;
+        try {
+            const json data = req.body.empty() ? json::object() : json::parse(req.body);
+            if (!data.is_object()) {
+                throw std::invalid_argument("request body must be an object");
+            }
+            if (action == "compact") {
+                if (!data.empty()) {
+                    throw std::invalid_argument("compact request body must be empty");
+                }
+                type = SERVER_TASK_TYPE_SNAPSHOT_MANIFEST_COMPACT;
+            } else if (action == "prune") {
+                if (data.size() != 1 || !data.contains("target_disk_bytes") ||
+                        (!data.at("target_disk_bytes").is_number_unsigned() &&
+                         !data.at("target_disk_bytes").is_number_integer())) {
+                    throw std::invalid_argument(
+                            "prune requires only a non-negative integer target_disk_bytes");
+                }
+                if (data.at("target_disk_bytes").is_number_unsigned()) {
+                    target_disk_bytes = data.at("target_disk_bytes").get<uint64_t>();
+                } else {
+                    const int64_t signed_target = data.at("target_disk_bytes").get<int64_t>();
+                    if (signed_target < 0) {
+                        throw std::invalid_argument("target_disk_bytes must be non-negative");
+                    }
+                    target_disk_bytes = (uint64_t) signed_target;
+                }
+                type = SERVER_TASK_TYPE_SNAPSHOT_MANIFEST_PRUNE;
+            } else {
+                throw std::invalid_argument("unknown action");
+            }
+        } catch (const std::exception & e) {
+            res->error(format_error_response(
+                    std::string("Invalid snapshot manifest request: ") + e.what(),
+                    ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(type);
+        task.id = res->rd.get_new_id();
+        task.slot_action.target_bytes = target_disk_bytes;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        GGML_ASSERT(dynamic_cast<server_task_result_snapshot *>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_snapshot_heads = [this](const server_http_req & req) {
+        auto res = create_response(false, DURABLE_IO_POLLING_MILLISECONDS);
+        const std::string head_name = req.get_param("head");
+        const std::string action = req.get_param("action");
+        if (head_name.empty() || head_name.size() > 128 || !std::all_of(
+                head_name.begin(), head_name.end(), [](unsigned char value) {
+                    return (value >= 'a' && value <= 'z') ||
+                        (value >= 'A' && value <= 'Z') ||
+                        (value >= '0' && value <= '9') || value == '.' || value == '_' ||
+                        value == ':' || value == '/' || value == '-';
+                })) {
+            res->error(format_error_response(
+                    "Invalid logical head name", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::string digest;
+        std::string expected_digest;
+        uint64_t expected_generation = 0;
+        bool has_expected_generation = false;
+        int id_slot = -1;
+        try {
+            const json data = req.body.empty() ? json::object() : json::parse(req.body);
+            if (!data.is_object()) {
+                throw std::invalid_argument("request body must be an object");
+            }
+            const auto only_keys = [&](std::initializer_list<const char *> allowed) {
+                for (auto item = data.begin(); item != data.end(); ++item) {
+                    if (std::none_of(allowed.begin(), allowed.end(), [&](const char * key) {
+                            return item.key() == key;
+                        })) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if ((action == "create" && !only_keys({"digest"})) ||
+                    (action == "advance" && !only_keys({
+                        "digest", "expected_digest", "expected_generation"})) ||
+                    (action == "delete" && !only_keys({
+                        "expected_digest", "expected_generation"})) ||
+                    (action == "materialize" && !only_keys({
+                        "expected_digest", "expected_generation", "id_slot"}))) {
+                throw std::invalid_argument("request contains fields unsupported by this action");
+            }
+            const auto read_digest = [&](const char * key, std::string & value) {
+                if (!data.contains(key) || !data.at(key).is_string()) {
+                    return false;
+                }
+                value = data.at(key).get<std::string>();
+                if (value.size() != 71 || value.compare(0, 7, "sha256:") != 0 ||
+                        !std::all_of(value.begin() + 7, value.end(), [](unsigned char byte) {
+                            return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+                        })) {
+                    throw std::invalid_argument(std::string(key) + " must be a canonical SHA-256 digest");
+                }
+                return true;
+            };
+            read_digest("digest", digest);
+            read_digest("expected_digest", expected_digest);
+            if (data.contains("expected_generation")) {
+                if (data.at("expected_generation").is_number_unsigned()) {
+                    expected_generation = data.at("expected_generation").get<uint64_t>();
+                } else if (data.at("expected_generation").is_number_integer()) {
+                    const int64_t value = data.at("expected_generation").get<int64_t>();
+                    if (value < 0) {
+                        throw std::invalid_argument("expected_generation must be non-negative");
+                    }
+                    expected_generation = (uint64_t) value;
+                } else {
+                    throw std::invalid_argument("expected_generation must be a non-negative integer");
+                }
+                has_expected_generation = true;
+            }
+            if (data.contains("id_slot")) {
+                if (!data.at("id_slot").is_number_integer()) {
+                    throw std::invalid_argument("id_slot must be an integer");
+                }
+                id_slot = data.at("id_slot").get<int>();
+                if (id_slot < 0) {
+                    throw std::invalid_argument("id_slot must be non-negative");
+                }
+            }
+        } catch (const std::exception & e) {
+            res->error(format_error_response(
+                    std::string("Invalid logical head request: ") + e.what(),
+                    ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task_type type;
+        if (action == "create") {
+            if (digest.empty() || !expected_digest.empty() || has_expected_generation || id_slot >= 0) {
+                res->error(format_error_response(
+                        "Head create requires only digest", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_HEAD_CREATE;
+        } else if (action == "advance") {
+            if (digest.empty() || expected_digest.empty() || !has_expected_generation || id_slot >= 0) {
+                res->error(format_error_response(
+                        "Head advance requires digest, expected_digest, and expected_generation",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_HEAD_ADVANCE;
+        } else if (action == "delete") {
+            if (!digest.empty() || expected_digest.empty() || !has_expected_generation || id_slot >= 0) {
+                res->error(format_error_response(
+                        "Head delete requires expected_digest and expected_generation",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_HEAD_DELETE;
+        } else if (action == "materialize") {
+            if (!digest.empty() || expected_digest.empty() || !has_expected_generation) {
+                res->error(format_error_response(
+                        "Head materialize requires expected_digest and expected_generation",
+                        ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            type = SERVER_TASK_TYPE_SNAPSHOT_HEAD_MATERIALIZE;
+        } else {
+            res->error(format_error_response("Invalid logical head action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        server_task task(type);
+        task.id = res->rd.get_new_id();
+        task.slot_action.head_name = head_name;
+        task.slot_action.digest = std::move(digest);
+        task.slot_action.expected_digest = std::move(expected_digest);
+        task.slot_action.expected_generation = expected_generation;
+        task.slot_action.id_slot = id_slot;
+        res->rd.post_task(std::move(task));
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        GGML_ASSERT(dynamic_cast<server_task_result_snapshot *>(result.get()) != nullptr);
+        res->ok(result->to_json());
         return res;
     };
 
@@ -4531,6 +8846,42 @@ void server_routes::init_routes() {
             { "endpoint_slots",              params.endpoint_slots },
             { "endpoint_props",              params.endpoint_props },
             { "endpoint_metrics",            params.endpoint_metrics },
+            { "statetree",                    json {
+                {"lease_ms", params.statetree_lease_ms},
+                {"max_state_bytes", params.statetree_max_state_bytes},
+                {"byte_scope", "all_live_slot_prompt_state"},
+                {"state_identity_scope", "server_process"},
+                {"node_identity_scope", "server_process"},
+                {"node_semantics", "immutable_branch_incarnation"},
+                {"node_mutations", json::array({"fork", "snapshot", "commit", "renew", "erase"})},
+                {"snapshot_enabled", params.statetree_max_snapshot_bytes > 0},
+                {"max_snapshot_bytes", params.statetree_max_snapshot_bytes},
+                {"snapshot_digest", "sha256:turbo-statetree-snapshot-v1"},
+                {"snapshot_admission", "reject"},
+                {"snapshot_storage", "digest_deduplicated_immutable_payloads"},
+                {"durable_snapshot_enabled", !params.statetree_snapshot_store.empty()},
+                {"durable_snapshot_compatibility_id", params.statetree_snapshot_compat_id.empty()
+                    ? json(nullptr)
+                    : json(params.statetree_snapshot_compat_id)},
+                {"max_snapshot_disk_bytes", params.statetree_max_snapshot_disk_bytes},
+                {"max_snapshot_load_bytes", params.statetree_max_snapshot_load_bytes},
+                {"max_snapshot_manifest_bytes", params.statetree_max_snapshot_manifest_bytes},
+                {"snapshot_manifest_format", "turbo-statetree-manifest-v1"},
+                {"snapshot_manifest_checkpoint_schema", "atomic-publish-advance-v3"},
+                {"durable_snapshot_publish", "intent_object_commit_reconciled"},
+                {"durable_cache_reclamation", "managed_cache_only_oldest_revision"},
+                {"durable_cache_pressure_publish", true},
+                {"durable_logical_heads", "generation_digest_cas"},
+                {"durable_logical_head_parent_edge", "previous_digest"},
+                {"durable_logical_head_delete", "retry_safe_retired_name_tombstone"},
+                {"durable_publish_advance", "intent_object_atomic_owner_head_commit"},
+                {"snapshot_retention_classes", json::array({"pinned", "cache"})},
+                {"durable_snapshot_format", "turbo-statetree-cold-v1"},
+                {"durable_snapshot_admission", "reject"},
+                {"durable_snapshot_io", "single_ordered_worker_two_phase"},
+                {"durable_snapshot_load_budget_scope", "aggregate_queued_and_verified_payloads"},
+                {"journal_capacity", SERVER_STATETREE_JOURNAL_CAPACITY},
+            } },
             // New keys
             { "ui",                           params.ui },
             { "ui_settings",                  meta->json_ui_settings },
@@ -5079,8 +9430,17 @@ json server_routes::get_model_info() const {
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
     auto res = create_response();
-    const json request_data = json::parse(req.body);
-    std::string filename = request_data.at("filename");
+    std::string filename;
+    int64_t fork_id = -1;
+    try {
+        const json request_data = json::parse(req.body);
+        filename = request_data.at("filename");
+        fork_id = server_optional_fork_id(request_data);
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid slot save request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     if (!fs_validate_filename(filename)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -5092,6 +9452,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
         task.id = rd.get_new_id();
         task.slot_action.id_slot  = id_slot;
+        task.slot_action.fork_id  = fork_id;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
         rd.post_task(std::move(task));
@@ -5115,8 +9476,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const server_http_req & req, int id_slot) {
     auto res = create_response();
-    const json request_data = json::parse(req.body);
-    std::string filename = request_data.at("filename");
+    std::string filename;
+    int64_t fork_id = -1;
+    try {
+        const json request_data = json::parse(req.body);
+        filename = request_data.at("filename");
+        fork_id = server_optional_fork_id(request_data);
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid slot restore request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     if (!fs_validate_filename(filename)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -5128,6 +9498,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
         task.id = rd.get_new_id();
         task.slot_action.id_slot  = id_slot;
+        task.slot_action.fork_id  = fork_id;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
         rd.post_task(std::move(task));
@@ -5150,13 +9521,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const server_http_req & req, int id_slot) {
+std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(
+        const server_http_req & req, int id_slot, int64_t node_id) {
     auto res = create_response();
+    int64_t fork_id = -1;
+    int64_t state_id = -1;
+    try {
+        const json request_data = req.body.empty() ? json::object() : json::parse(req.body);
+        fork_id = server_optional_fork_id(request_data);
+        state_id = server_optional_state_id(request_data);
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid slot erase request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.state_id = state_id;
+        task.slot_action.node_id = node_id;
+        task.slot_action.fork_id = fork_id;
         rd.post_task(std::move(task));
     }
 
@@ -5177,11 +9563,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const server_http_req & req, int id_slot) {
+std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(
+        const server_http_req & req, int id_slot, int64_t node_id) {
     auto res = create_response();
 
     std::vector<int> destinations;
-    int fork_id = -1;
+    int64_t fork_id = -1;
+    int64_t state_id = -1;
     try {
         const json request_data = json::parse(req.body);
         if (!request_data.is_object() ||
@@ -5206,13 +9594,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
                         "Slot fork fork_id must be an integer", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            fork_id = request_data.at("fork_id").get<int>();
+            fork_id = request_data.at("fork_id").get<int64_t>();
             if (fork_id < 0) {
                 res->error(format_error_response(
                         "Slot fork fork_id must be non-negative", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
         }
+        state_id = server_optional_state_id(request_data);
     } catch (const std::exception & e) {
         res->error(format_error_response(
                 std::string("Invalid slot fork request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -5230,6 +9619,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
         server_task task(SERVER_TASK_TYPE_SLOT_FORK);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.state_id = state_id;
+        task.slot_action.node_id = node_id;
         task.slot_action.fork_id = fork_id;
         task.slot_action.destinations = std::move(destinations);
         rd.post_task(std::move(task));
@@ -5251,29 +9642,61 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_fork(const ser
     return res;
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_slots_commit(const server_http_req & req, int id_slot) {
+std::unique_ptr<server_res_generator> server_routes::handle_snapshot_capture(
+        const server_http_req & req, int64_t node_id) {
     auto res = create_response();
 
-    int fork_id;
+    int64_t fork_id = -1;
+    int64_t state_id = -1;
     try {
-        const json request_data = json::parse(req.body);
-        if (!request_data.is_object() ||
-                !request_data.contains("fork_id") ||
-                !request_data.at("fork_id").is_number_integer()) {
+        const json data = req.body.empty() ? json::object() : json::parse(req.body);
+        fork_id = server_optional_fork_id(data);
+        state_id = server_optional_state_id(data);
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid snapshot capture request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    server_task task(SERVER_TASK_TYPE_SNAPSHOT_CAPTURE);
+    task.id = res->rd.get_new_id();
+    task.slot_action.node_id = node_id;
+    task.slot_action.state_id = state_id;
+    task.slot_action.fork_id = fork_id;
+    res->rd.post_task(std::move(task));
+
+    auto result = res->rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    GGML_ASSERT(dynamic_cast<server_task_result_snapshot *>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_commit(
+        const server_http_req & req, int id_slot, int64_t node_id) {
+    auto res = create_response();
+
+    int64_t fork_id = -1;
+    int64_t state_id = -1;
+    try {
+        const json request_data = req.body.empty() ? json::object() : json::parse(req.body);
+        fork_id = server_optional_fork_id(request_data);
+        state_id = server_optional_state_id(request_data);
+        if (node_id < 0 && fork_id < 0) {
             res->error(format_error_response(
                     "Slot commit requires an integer fork_id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        fork_id = request_data.at("fork_id").get<int>();
     } catch (const std::exception & e) {
         res->error(format_error_response(
                 std::string("Invalid slot commit request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
-        return res;
-    }
-
-    if (fork_id < 0) {
-        res->error(format_error_response(
-                "Slot commit requires a non-negative fork_id", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
 
@@ -5282,6 +9705,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_commit(const s
         server_task task(SERVER_TASK_TYPE_SLOT_COMMIT);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.state_id = state_id;
+        task.slot_action.node_id = node_id;
         task.slot_action.fork_id = fork_id;
         rd.post_task(std::move(task));
     }
@@ -5298,6 +9723,53 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_commit(const s
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_commit *>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_renew(
+        const server_http_req & req, int id_slot, int64_t node_id) {
+    auto res = create_response();
+
+    int64_t fork_id = -1;
+    int64_t state_id = -1;
+    try {
+        const json request_data = req.body.empty() ? json::object() : json::parse(req.body);
+        fork_id = server_optional_fork_id(request_data);
+        state_id = server_optional_state_id(request_data);
+        if (node_id < 0 && fork_id < 0) {
+            res->error(format_error_response(
+                    "Slot renew requires an integer fork_id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    } catch (const std::exception & e) {
+        res->error(format_error_response(
+                std::string("Invalid slot renew request: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_RENEW);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.state_id = state_id;
+        task.slot_action.node_id = node_id;
+        task.slot_action.fork_id = fork_id;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_renew *>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

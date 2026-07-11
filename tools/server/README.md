@@ -1116,6 +1116,10 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 ```json
 {
     "id_slot": 0,
+    "state_id": 7,
+    "node_id": 19,
+    "parent_node_id": 11,
+    "fork_id": 42,
     "n_erased": 1745
 }
 ```
@@ -1129,9 +1133,11 @@ array of idle destination slot IDs:
 {"destinations": [1, 2, 3]}
 ```
 
-The response includes an opaque `fork_id`. The source and destinations remain
-reserved from automatic scheduling and may be used with explicit `id_slot`
-requests.
+The response includes an opaque `fork_id`, a process-scoped logical `state_id`,
+and a unique `node_id` for every returned branch. `fork_id` fences one
+generation, `state_id` survives winner migration and re-fork, and `node_id`
+names one immutable branch incarnation. Re-fork creates new nodes whose
+`parent_node_id` is the committed winner node.
 
 ### POST `/slots/{id_slot}?action=commit`: Commit a fork winner in place.
 
@@ -1148,14 +1154,263 @@ slot. A committed singleton can be forked again, which creates a new
 generation; that fork request must include the singleton's current `fork_id`.
 Use `action=erase` to destroy and release the protected state.
 
+A committed singleton can be continued without knowing its physical slot by
+passing both logical identity and generation to the completion request:
+
+```json
+{"prompt":"...", "state_id":7, "fork_id":42, "cache_prompt":true}
+```
+
+An open fork has multiple heads, so logical continuation also requires the
+exact branch `id_slot` until a winner is committed. `state_id` is not an
+authorization token and does not replace the generation fence.
+
+An open or committed branch can be continued without a physical slot by using
+its node identity:
+
+```json
+{"prompt":"...", "node_id":19, "cache_prompt":true}
+```
+
+Node IDs are generation-specific and never recycled within the server process.
+Optional `state_id`, `fork_id`, and `id_slot` values must match the node.
+
+### POST `/nodes/{node_id}?action=fork|snapshot|commit|renew|erase`: Mutate or freeze an exact StateTree node.
+
+Node-addressed fork, commit, renew, and erase do not require a physical slot
+URL. Re-fork requires a destinations array:
+
+```json
+{"state_id": 7, "destinations": [0, 2, 3]}
+```
+
+Commit, renew, and erase may use an empty body. For every action, `state_id`
+and `fork_id` are optional identity assertions. The process-scoped nonrecycled
+node ID is sufficient as the exact generation fence. Re-fork is accepted only
+for a committed singleton and returns fresh nodes whose `parent_node_id` is the
+addressed node. A stale, expired, erased, busy, open-family, or mismatched node
+returns HTTP 503. Erase returns the destroyed state, node, parent, and
+generation identity alongside `id_slot` and `n_erased`.
+
+The physical slot actions remain compatible. Save and restore still require
+`/slots/{id_slot}`.
+
+With `--statetree-max-snapshot-bytes N`, `action=snapshot` captures an exact
+idle node as an immutable process-local content object. Optional `state_id` and
+`fork_id` fields are identity assertions. The response includes a nonrecycled
+`snapshot_id`, a canonical SHA-256 digest, source provenance, exact serialized
+state/token payload bytes, and whether the digest-addressed payload was
+deduplicated.
+
+### GET/POST `/snapshots`: Inspect, materialize, or erase immutable content.
+
+`GET /snapshots` returns provenance handles, unique content bytes, budget,
+content count, and high-water bytes. Identical handles share one immutable
+payload and the budget counts that payload once. New unique content is rejected
+rather than evicting an existing handle.
+
+```http
+POST /snapshots/3?action=materialize
+Content-Type: application/json
+
+{"digest":"sha256:...","id_slot":2}
+```
+
+`id_slot` is optional; without it the server chooses the lowest available
+slot. Materialization restores the complete sequence and creates a protected
+singleton with a fresh node and fork generation. `action=erase` removes one
+handle and frees shared content only when its final handle is gone. Snapshot
+state is host memory, process-local, and disabled by default.
+
+### GET/POST `/snapshot-contents`: Persist and restore immutable content.
+
+Durable cold content is enabled only when all of these are supplied together:
+
+```text
+--statetree-snapshot-store PATH
+--statetree-snapshot-compat-id ID
+--statetree-max-snapshot-disk-bytes N
+--statetree-max-snapshot-load-bytes N
+--statetree-max-snapshot-manifest-bytes N
+```
+
+The directory must exist and the byte ceilings must be positive. The explicit
+compatibility ID selects an isolated hashed namespace and should bind the exact
+model and runtime serialization contract.
+
+```http
+POST /snapshots/3?action=spill
+GET /snapshot-contents
+POST /snapshot-contents/0123...cdef?action=materialize
+Content-Type: application/json
+
+{"id_slot":2}
+```
+
+Retain or release a durable owner reference, and compact the ownership WAL:
+
+```http
+POST /snapshot-contents/0123...cdef?action=retain
+{"owner":"campaign/run-42","retention_class":"pinned"}
+
+POST /snapshot-contents/0123...cdef?action=release
+{"owner":"campaign/run-42"}
+
+POST /snapshot-manifest?action=compact
+{}
+```
+
+Owner identifiers are portable strings and retention class is `pinned` or
+`cache`. Erase is fenced while any owner remains. The checksummed, revisioned
+manifest syncs each mutation before applying it in memory; compaction publishes
+one checkpoint with temp-file, file, rename, and directory durability. Startup
+recovers incomplete tails but fails closed for complete-record corruption,
+revision discontinuity, or a live reference to missing content. The separate
+manifest ceiling triggers bounded compaction before rejecting a mutation whose
+live set cannot fit.
+
+`cache` is an enforceable managed lifecycle class. Prune to an exact object
+byte target with:
+
+```http
+POST /snapshot-manifest?action=prune
+{"target_disk_bytes":134217728}
+```
+
+The reconciler evicts only managed cache-only objects, oldest by newest owner
+revision then digest. A single WAL transition removes all cache owners before
+object deletion; a final forget transition closes managed reachability. Startup
+finishes an interrupted deletion. Pinned or mixed-owner content, pending
+publishes, and raw `action=spill` objects are hard fences. Managed publish runs
+this same policy automatically under exact disk pressure and fails with HTTP
+503 when no safe victim can satisfy admission.
+
+The checkpoint explicitly records managed digests. A pre-reachability
+checkpoint is rejected; use a new compatibility ID for this lifecycle schema.
+This avoids silently reclassifying raw retained objects during upgrade.
+
+### GET/POST `/snapshot-heads`: Name and atomically advance durable content.
+
+```http
+POST /snapshot-heads/campaign-main?action=create
+{"digest":"sha256:..."}
+
+GET /snapshot-heads
+
+POST /snapshot-heads/campaign-main?action=advance
+{"digest":"sha256:...new","expected_generation":1,"expected_digest":"sha256:...old"}
+
+POST /snapshot-heads/campaign-main?action=materialize
+{"expected_generation":2,"expected_digest":"sha256:...new","id_slot":2}
+
+POST /snapshot-heads/campaign-main?action=delete
+{"expected_generation":2,"expected_digest":"sha256:...new"}
+```
+
+Create assigns generation 1. Advance is a generation-plus-digest CAS, stores
+the replaced digest as the non-owning `parent_digest`, and increments the
+generation. The current digest is a hard erase and cache-reclamation fence.
+Materialization rechecks the requested generation and digest in the ordered
+worker before loading, so a queued request cannot cross an advance. Exact
+create, advance, and delete retries deduplicate without a new WAL revision.
+
+Delete durably retires the name. Its tombstone survives compaction and restart,
+does not retain the deleted content, and prevents generation-reset ABA by
+rejecting recreation of the same name. Active heads and retired-name tombstones
+are checkpoint schema `atomic-publish-advance-v3`; change the compatibility ID
+when upgrading from an earlier checkpoint.
+
+Publish a hot snapshot and advance a head with one manifest commit using:
+
+```http
+POST /snapshots/7?action=publish-advance
+{"digest":"sha256:...new","owner":"campaign/run-42","retention_class":"pinned","head_name":"campaign-main","expected_generation":2,"expected_digest":"sha256:...old"}
+```
+
+The ordered worker syncs a combined intent, publishes and verifies the object,
+then writes one record that creates the owner and advances the head at the same
+revision. Startup commits a verified present object or aborts an absent/corrupt
+object. Exact retries deduplicate; changed or partial transaction state
+conflicts. Manifest admission reserves terminal commit/abort space before begin.
+The strict disk ceiling requires old and new objects to coexist until commit.
+
+Spill publishes a versioned object with crash-safe file and directory syncing
+on Linux, then verifies a full read-back before success. Disk admission is
+reject-only and counts valid plus malformed object bytes. Startup recovers
+interrupted temporary files and indexes only compatible, structurally valid
+objects. Materialization verifies exact size and canonical SHA-256 content;
+its indexed payload size must fit the cold-load ceiling before allocation.
+Failure returns HTTP 503 without reserving or mutating a slot.
+
+Use `action=publish` to combine durable object publication with the first owner:
+
+```http
+POST /snapshots/3?action=publish
+{"digest":"sha256:...","owner":"campaign/run-42","retention_class":"pinned"}
+```
+
+This is a three-stage WAL transaction: synced intent, verified object publish,
+then synced owner commit. Manifest admission guarantees room for commit or
+abort before beginning. Startup reconciles a crash between stages by verifying
+and committing a present object or aborting an intent whose object is absent;
+it removes a corrupt pending object. Managed publish payloads must fit the
+configured recovery load ceiling.
+
+All durable object and ownership work runs on one ordered background worker. The state thread
+reserves exact disk or aggregate transient-load bytes, dispatches the job, and
+consumes an internal completion before publishing API results or restoring a
+slot. Store catalog reads use the last completed snapshot, so inspection and
+metrics do not wait on fsync or hashing. A disconnected cold-load owner is
+dropped before slot mutation; shutdown wakes queued owners, joins the active
+operation, and leaves no partial object. Responses split `queue_ms`, `io_ms`,
+`completion_wait_ms`, and total timing, while StateTree and Prometheus telemetry
+expose pending jobs, high water, completions, cancellations, and reservations.
+
+A restored object receives fresh process-local state/fork/node IDs and exposes
+its digest through `materialized_content_digest`; old graph parentage and hot
+snapshot handles are intentionally not durable. Use
+`POST /snapshot-contents/{digest}?action=erase` for explicit durable deletion.
+
+### POST `/slots/{id_slot}?action=renew`: Renew a StateTree fork generation.
+
+```json
+{"fork_id": 42}
+```
+
+`--statetree-lease-ms` leases the whole fork generation. Busy families are
+pinned and receive a fresh idle lease after their last request releases.
+`--statetree-max-state-bytes` applies an exact global ceiling to prompt data and
+checkpoint payloads across all live slots. Under pressure, whole StateTree
+families or ordinary idle slot state are reclaimed in deterministic
+least-recently-touched order.
+
+When either option is enabled, explicit completion, save, restore, and erase
+requests against reserved slots must include the matching `fork_id`.
+
 `GET /slots` also exposes exact host-side recurrent prompt-state accounting:
 
 - `n_prompt_data_bytes`: current serialized prompt-state bytes.
 - `n_prompt_checkpoint_bytes`: bytes retained by context checkpoints.
 - `n_prompt_state_bytes`: the sum of prompt data and checkpoint bytes.
+- `lease_remaining_ms`: monotonic time remaining for a StateTree family, or
+  `-1` when leases are disabled or the family is pinned by in-flight work.
 
 These fields do not include the preallocated device KV pool. They are intended
 for transaction memory budgets and benchmark reclamation checks.
+
+### GET `/states`: Inspect logical StateTree lineages and transitions.
+
+This experimental endpoint requires `--slots`. It returns current logical
+lineages plus a process-local, 1024-entry transition journal. Journal entries
+record fork, commit, explicit renew, expiry, pressure eviction, erase, and
+restore-driven release. Use `journal_after=N` for an incremental read.
+
+Logical IDs, node IDs, hot snapshot IDs, and journal sequences are monotonic within one server
+process and are not durable across restart. Durable snapshot content is
+addressed separately by its digest. State rows expose live branch
+`heads` and `canonical_node_id`; journal entries retain affected nodes and
+parent edges. The response reports the oldest retained and next journal
+sequences so clients can detect ring-buffer truncation.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

@@ -2433,7 +2433,12 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             for (llama_seq_id cur = 0; cur < (int) n_seq_max; ++cur) {
                 if (cur == seq_id || seq_id == -1) {
                     if (cells.seq_has(i, cur)) {
-                        seq_ids.push_back(cur);
+                        // A sequence-specific state is restored into an explicit
+                        // destination and state_read_meta() deliberately discards
+                        // this stored ID. Keep the wire payload independent of its
+                        // physical source sequence; whole-cache state still records
+                        // every real sequence ID.
+                        seq_ids.push_back(seq_id == -1 ? cur : 0);
                     }
                 }
             }

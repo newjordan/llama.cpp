@@ -5,12 +5,16 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 set(TARGET server-context)
 
 add_library(${TARGET} STATIC
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
     server-chat.cpp
     server-chat.h
     server-task.cpp
     server-task.h
     server-queue.cpp
     server-queue.h
+    server-snapshot-store.cpp
+    server-snapshot-manifest.cpp
+    server-snapshot-store.h
     server-common.cpp
     server-common.h
     server-context.cpp
@@ -25,7 +29,10 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps)
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS})
 
 # llama-server-impl: server logic, reusable by app
 

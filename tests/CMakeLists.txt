@@ -236,6 +236,15 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 
 llama_build_and_test(test-arg-parser.cpp)
 
+llama_build_and_test(
+    test-sha256.cpp
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
+)
+target_include_directories(test-sha256 PRIVATE
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256
+    ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps
+)
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)

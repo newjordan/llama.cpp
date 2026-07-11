@@ -1,0 +1,132 @@
+{
+  "kind": "turbo-statetree-retention-isolated-summary",
+  "schema_version": 1,
+  "date": "2026-07-10",
+  "status": "passed",
+  "parent": {
+    "commit": "6051ddf31740cfefe085e80dd65d78dadd870f8e",
+    "llama_server_sha256": "5fec3526c50f5c149f2af605e81ec5f29dddeecb41f030ebee6d0c973b739e60",
+    "libllama_server_impl_sha256": "dd604217b92d31538c896b154b60e61efd71fb52e23bfbaa46bd187ac932e79b"
+  },
+  "candidate": {
+    "base_commit": "70acde5e61b92a44884fb45f056f591fb4ab5390",
+    "tree": "dirty",
+    "llama_server_sha256": "ebb3971448bfa7db2252256ab923202fe6f2d6fe90d07d961c822d0cce495c0a",
+    "libllama_server_impl_sha256": "5b0cfa65ed14c3d5478656bd2269a3e3ceb00445647085ae65bbcd1fb187a5b5"
+  },
+  "build": {
+    "type": "Release",
+    "c_compiler": "/usr/bin/cc",
+    "cxx_compiler": "/usr/bin/c++",
+    "ggml_sycl": false,
+    "ggml_native": true,
+    "ggml_openmp": true,
+    "ggml_ccache": false
+  },
+  "model": {
+    "path": "/home/frosty40/models/Qwen3.5-0.8B-draft/Qwen3.5-0.8B-Q8_0.gguf",
+    "size_bytes": 811843840,
+    "checkpoint_bytes": 20201932
+  },
+  "comparison": {
+    "prefix_tokens": [128, 1024, 8192],
+    "repeats": 5,
+    "parent_samples": 30,
+    "candidate_samples": 60,
+    "failed_samples": 0,
+    "dense_checks_passed": 9,
+    "dense_checks_total": 9,
+    "fragmented_checks_passed": 9,
+    "fragmented_checks_total": 9,
+    "dense": {
+      "128": {
+        "parent_fork_p50_ms": 0.15,
+        "candidate_fork_p50_ms": 0.139,
+        "parent_branch_p50_tps": 60.02822718591464,
+        "candidate_branch_p50_tps": 60.24423929397486
+      },
+      "1024": {
+        "parent_fork_p50_ms": 0.255,
+        "candidate_fork_p50_ms": 0.238,
+        "parent_branch_p50_tps": 58.20972286392873,
+        "candidate_branch_p50_tps": 59.502483376635006
+      },
+      "8192": {
+        "parent_fork_p50_ms": 1.204,
+        "candidate_fork_p50_ms": 1.42,
+        "parent_branch_p50_tps": 41.3246116130294,
+        "candidate_branch_p50_tps": 42.556467264220274
+      }
+    },
+    "fragmented": {
+      "128": {
+        "parent_fork_p50_ms": 0.172,
+        "candidate_fork_p50_ms": 0.172,
+        "parent_branch_p50_tps": 60.451253075335494,
+        "candidate_branch_p50_tps": 61.60755559524018
+      },
+      "1024": {
+        "parent_fork_p50_ms": 0.267,
+        "candidate_fork_p50_ms": 0.308,
+        "parent_branch_p50_tps": 58.30604971693898,
+        "candidate_branch_p50_tps": 69.57705970904217
+      },
+      "8192": {
+        "parent_fork_p50_ms": 1.357,
+        "candidate_fork_p50_ms": 1.257,
+        "parent_branch_p50_tps": 42.66229821603736,
+        "candidate_branch_p50_tps": 42.6433368969209
+      }
+    }
+  },
+  "retention": {
+    "lease_ms": 100,
+    "state_budget_bytes": 60605796,
+    "pressure_evictions": 2,
+    "pressure_reclaimed_bytes": 60605796,
+    "pressure_high_water_bytes": 60605796,
+    "rejection_budget_bytes": 20201931,
+    "rejection_count": 1,
+    "rejection_high_water_bytes": 0,
+    "expiry_samples": 20,
+    "expiry_jitter_ms": {
+      "min": -0.004817033186554909,
+      "p50": 0.4785470082424581,
+      "p95": 2.5185897335177287,
+      "max": 2.5564320385456085,
+      "mean": 0.9748375217895955
+    },
+    "boundary_races": {
+      "samples": 20,
+      "continued": 8,
+      "expired": 12,
+      "invariant_failures": 0
+    },
+    "churn": {
+      "iterations": 50,
+      "committed_reforked": 40,
+      "expired": 10,
+      "final_state_bytes": 0,
+      "final_reserved_slots": 0,
+      "high_water_bytes": 60605796,
+      "budget_bytes": 60605796
+    },
+    "pressure_width_smoke": {
+      "widths": [1, 2, 4],
+      "passed": true,
+      "full_width_evictions": 0,
+      "full_width_rejections": 2,
+      "full_width_zero_checkpoint_members": 1
+    }
+  },
+  "verification": {
+    "test_arg_parser": "passed",
+    "benchmark_unit_tests": "29 passed",
+    "slot_fork_server_tests": "20 passed",
+    "python_compile": "passed",
+    "git_diff_check": "passed"
+  },
+  "raw_artifact_root": "/home/frosty40/turbo/results/statetree-retention-isolated/20260710T0253-cpu",
+  "production_touched": false,
+  "b70_gate_complete": false
+}

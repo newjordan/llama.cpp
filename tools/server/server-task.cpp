@@ -1947,8 +1947,12 @@ json server_task_result_slot_save_load::to_json() {
 //
 json server_task_result_slot_erase::to_json() {
     return json {
-        { "id_slot",  id_slot },
-        { "n_erased", n_erased },
+        { "id_slot",        id_slot },
+        { "state_id",       state_id },
+        { "node_id",        node_id },
+        { "parent_node_id", parent_node_id },
+        { "fork_id",        fork_id },
+        { "n_erased",       n_erased },
     };
 }
 
@@ -1956,9 +1960,13 @@ json server_task_result_slot_erase::to_json() {
 // server_task_result_slot_fork
 //
 json server_task_result_slot_fork::to_json() {
-    return json {
+    json result = {
         { "id_slot",        id_slot },
+        { "state_id",       state_id },
+        { "node_id",        node_id },
+        { "parent_node_id", parent_node_id },
         { "fork_id",        fork_id },
+        { "nodes",          nodes },
         { "destinations",   destinations },
         { "n_destinations", destinations.size() },
         { "n_tokens",       n_tokens },
@@ -1966,22 +1974,119 @@ json server_task_result_slot_fork::to_json() {
             { "fork_ms", t_ms },
         }},
     };
+    if (retention_enabled) {
+        result["retention"] = {
+            { "lease_remaining_ms", lease_remaining_ms },
+            { "state_bytes", state_bytes },
+            { "retained_bytes", retained_bytes },
+            { "state_budget_bytes", state_budget_bytes },
+        };
+    }
+    return result;
 }
 
 //
 // server_task_result_slot_commit
 //
 json server_task_result_slot_commit::to_json() {
-    return json {
+    json result = {
         { "id_slot",    id_slot },
+        { "state_id",   state_id },
+        { "node_id",    node_id },
+        { "parent_node_id", parent_node_id },
         { "source_id",  source_id },
         { "fork_id",    fork_id },
+        { "nodes",      nodes },
         { "released",   released },
         { "n_released", released.size() },
         { "n_cached_tokens", n_tokens },
         { "timings", {
             { "commit_ms", t_ms },
         }},
+    };
+    if (retention_enabled) {
+        result["retention"] = {
+            { "lease_remaining_ms", lease_remaining_ms },
+            { "state_bytes", state_bytes },
+            { "retained_bytes", retained_bytes },
+            { "state_budget_bytes", state_budget_bytes },
+        };
+    }
+    return result;
+}
+
+//
+// server_task_result_slot_renew
+//
+json server_task_result_slot_renew::to_json() {
+    return json {
+        { "id_slot", id_slot },
+        { "state_id", state_id },
+        { "node_id", node_id },
+        { "parent_node_id", parent_node_id },
+        { "source_id", source_id },
+        { "fork_id", fork_id },
+        { "nodes", nodes },
+        { "members", members },
+        { "n_members", members.size() },
+        { "retention", {
+            { "lease_remaining_ms", lease_remaining_ms },
+            { "state_bytes", state_bytes },
+            { "retained_bytes", retained_bytes },
+            { "state_budget_bytes", state_budget_bytes },
+        }},
+        { "timings", {
+            { "renew_ms", t_ms },
+        }},
+    };
+}
+
+//
+// server_task_result_statetree
+//
+json server_task_result_statetree::to_json() {
+    return json {
+        { "states", states },
+        { "snapshots", snapshots },
+        { "snapshot_bytes", snapshot_bytes },
+        { "snapshot_budget_bytes", snapshot_budget_bytes },
+        { "snapshot_high_water_bytes", snapshot_high_water_bytes },
+        { "snapshot_content_count", snapshot_content_count },
+        { "durable_contents", durable_contents },
+        { "durable_manifest_refs", durable_manifest_refs },
+        { "durable_managed_digests", durable_managed_digests },
+        { "durable_logical_heads", durable_logical_heads },
+        { "durable_disk_bytes", durable_disk_bytes },
+        { "durable_disk_budget_bytes", durable_disk_budget_bytes },
+        { "durable_disk_high_water_bytes", durable_disk_high_water_bytes },
+        { "durable_recovered_temp_files", durable_recovered_temp_files },
+        { "durable_ignored_corrupt_files", durable_ignored_corrupt_files },
+        { "durable_runtime_integrity_failures", durable_runtime_integrity_failures },
+        { "durable_orphaned_disk_bytes", durable_orphaned_disk_bytes },
+        { "durable_io_pending", durable_io_pending },
+        { "durable_io_queue_high_water", durable_io_queue_high_water },
+        { "durable_io_completed_total", durable_io_completed_total },
+        { "durable_io_cancelled_loads_total", durable_io_cancelled_loads_total },
+        { "durable_io_reserved_disk_bytes", durable_io_reserved_disk_bytes },
+        { "durable_io_reserved_disk_high_water", durable_io_reserved_disk_high_water },
+        { "durable_io_reserved_load_bytes", durable_io_reserved_load_bytes },
+        { "durable_io_reserved_load_high_water", durable_io_reserved_load_high_water },
+        { "durable_manifest_revision", durable_manifest_revision },
+        { "durable_manifest_file_bytes", durable_manifest_file_bytes },
+        { "durable_manifest_budget_bytes", durable_manifest_budget_bytes },
+        { "durable_manifest_high_water_bytes", durable_manifest_high_water_bytes },
+        { "durable_manifest_record_count", durable_manifest_record_count },
+        { "durable_manifest_recovered_temp_files", durable_manifest_recovered_temp_files },
+        { "durable_manifest_recovered_tail_bytes", durable_manifest_recovered_tail_bytes },
+        { "durable_manifest_compactions", durable_manifest_compactions },
+        { "durable_manifest_recovered_publish_commits", durable_manifest_recovered_publish_commits },
+        { "durable_manifest_recovered_publish_aborts", durable_manifest_recovered_publish_aborts },
+        { "durable_managed_recovered_erases", durable_managed_recovered_erases },
+        { "durable_managed_recovered_bytes", durable_managed_recovered_bytes },
+        { "journal", journal },
+        { "journal_capacity", journal_capacity },
+        { "journal_oldest_sequence", journal_oldest_sequence },
+        { "journal_next_sequence", journal_next_sequence },
     };
 }
 

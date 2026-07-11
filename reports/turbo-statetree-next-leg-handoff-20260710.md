@@ -1,8 +1,44 @@
 # Turbo StateTree Next-Leg Handoff - 2026-07-10
 
+## Follow-On Status
+
+This handoff has now been executed in the uncommitted working tree. Bounded
+leases, exact global live prompt-state budgeting, generation-fenced retained
+slot access, telemetry, benchmark hardening, and focused/full development
+verification are implemented. Continue from
+`reports/turbo-statetree-retention-implementation-20260710.md`; preserve the
+material below as the design and acceptance checklist that drove the work.
+
+The bounded-retention slice is now an accepted R&D baseline. The full isolated
+matrix, matched B70 matrix, and production-scale pressure gate pass. See
+`reports/turbo-statetree-retention-isolated-20260710.md` and
+`reports/turbo-statetree-retention-b70-acceptance-20260710.md`. A later logical
+`state_id` and transaction-journal slice and the subsequent immutable
+branch-node slice are also accepted R&D baselines after their B70 gates. See
+`reports/turbo-statetree-node-identity-b70-acceptance-20260710.md`. The next
+node-addressed mutation slice is accepted as well: commit, renew, and erase can
+resolve an exact live node without a physical slot URL. See
+`reports/turbo-statetree-node-mutation-b70-acceptance-20260710.md`.
+Node-addressed re-fork is now accepted too, so a committed transaction can
+create its next structural generation without rediscovering a physical slot.
+See `reports/turbo-statetree-node-refork-b70-acceptance-20260710.md`.
+The following immutable-content slice is implemented and B70-gated as well:
+node-addressed capture creates a separately budgeted SHA-256 content object,
+identical payloads deduplicate behind provenance handles, and materialization
+creates a fresh protected node without re-evaluating the prompt. See
+`reports/turbo-statetree-immutable-snapshot-b70-acceptance-20260710.md`.
+
+Current operational state overrides the historical production section below:
+the user explicitly requested the 35B model be stopped for R&D. Unit
+`turbo-head-a2edfe66f-rollback-8093.service` is inactive and ports 8093/8098 are
+clear. Do not restart it without explicit approval.
+
 ## Start Here
 
-This is the current fresh-session entry point. Read these files in order:
+This was the pre-implementation fresh-session entry point. For current work,
+read `reports/turbo-statetree-retention-isolated-20260710.md` first, then
+`reports/turbo-statetree-retention-implementation-20260710.md`, then
+use the following order for accepted-baseline context:
 
 1. `AGENTS.md`
 2. `TURBO_RND.md`
@@ -10,6 +46,7 @@ This is the current fresh-session entry point. Read these files in order:
 4. `docs/turbo-statetree.md`
 5. `docs/turbo-statetree-benchmark.md`
 6. This handoff
+7. `reports/turbo-statetree-node-identity-b70-acceptance-20260710.md`
 
 Do not reconstruct the previous conversation. The first StateTree transaction
 slice is implemented, correctness-tested, production-size benchmarked, and
@@ -65,6 +102,23 @@ idle sleep.
 This remains a physical-slot StateTree slice. It does not yet provide durable
 logical DAG handles, cold spill, persistence across process restart, or a
 distributed state namespace.
+
+Later 2026-07-10 work supersedes the cold-spill portion of that boundary:
+selected immutable content now has an explicit compatibility-fenced durable
+namespace, crash-safe Linux publication, restart discovery, runtime integrity
+verification, exact disk accounting, and a pre-allocation cold-load ceiling.
+The final two-process B70 gate passed with exact continuation parity. Graph
+identity and provenance edges remain process-local, so this is not yet a
+persistent DAG. See
+`reports/turbo-statetree-durable-content-b70-acceptance-20260710.md`.
+
+The subsequent asynchronous-I/O slice removes durable file work from the
+state thread. One ordered worker owns spill/load/erase, exact state-thread
+reservations bound disk and aggregate transient payloads, canceled owners are
+discarded before slot mutation, and shutdown drains without partial objects.
+The B70 overlap gate kept `/states` below 0.6 ms during 165.829 ms spill I/O and
+completed an independent inference before the spill queue drained. See
+`reports/turbo-statetree-async-io-b70-acceptance-20260710.md`.
 
 ## Accepted B70 Result
 
@@ -162,14 +216,16 @@ systemctl --user status turbo-head-a2edfe66f-rollback-8093.service --no-pager
 Do not stop or replace production without a fresh maintenance plan, exact
 rollback capture, an automatic rollback timer, and explicit approval.
 
-## Next Architecture Leg
+## Implemented Architecture Leg
 
-Build bounded StateTree retention: leases plus an authoritative byte budget.
+Bounded StateTree retention now implements leases plus an authoritative byte
+budget. The exact decisions and verification evidence are recorded in
+`reports/turbo-statetree-retention-implementation-20260710.md`.
 
 The goal is not merely an expiration timer. The server must make retained state
 bounded, observable, race-safe, and useful under pressure.
 
-Minimum contract questions to settle before code:
+The original design checklist was:
 
 1. What receives a lease: protected root, whole fork generation, or logical
    state handle?
@@ -235,7 +291,11 @@ B70 gate only after the fast gate passes:
 - Do not modify stale Hydra metadata during StateTree implementation work.
 - Do not push to public `origin` or `fork` from this R&D lane.
 
-## Fresh-Session Prompt
+## Historical Fresh-Session Prompt
+
+The prompt below produced the bounded-retention implementation and is retained
+for provenance. New sessions should start from the isolated-gate report and
+finish the remaining B70 gate rather than reimplementing this leg.
 
 ```text
 Work in /home/frosty40/turbo/turbo-combined on branch turbo-combined.

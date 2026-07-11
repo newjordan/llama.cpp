@@ -610,6 +610,14 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t statetree_lease_ms  = 0;     // lease duration for StateTree fork families, 0 = no expiry
+    uint64_t statetree_max_state_bytes = 0; // exact live slot prompt-state budget, 0 = no limit
+    uint64_t statetree_max_snapshot_bytes = 0; // immutable snapshot payload budget, 0 = snapshots disabled
+    std::string statetree_snapshot_store; // durable content store base directory, empty = disabled
+    std::string statetree_snapshot_compat_id; // explicit model/runtime compatibility fence
+    uint64_t statetree_max_snapshot_disk_bytes = 0; // durable namespace file-byte budget
+    uint64_t statetree_max_snapshot_load_bytes = 0; // transient cold-load payload ceiling
+    uint64_t statetree_max_snapshot_manifest_bytes = 0; // durable ownership WAL/checkpoint ceiling
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import shlex
 import signal
@@ -23,7 +24,42 @@ from typing import Any
 DEFAULT_BIN = "/home/frosty40/turbo/turbo-combined/build/bin/llama-server"
 DEFAULT_MODEL = "/home/frosty40/models/Qwen3.5-0.8B-draft/Qwen3.5-0.8B-Q8_0.gguf"
 DEFAULT_OUT_DIR = "/tmp/turbo-statetree-bench"
-RESULT_SCHEMA_VERSION = 2
+RESULT_SCHEMA_VERSION = 3
+
+BUILD_CACHE_KEYS = (
+    "GGML_SYCL",
+    "GGML_SYCL_DNN",
+    "GGML_SYCL_F16",
+    "GGML_SYCL_GRAPH",
+    "GGML_SYCL_HOST_MEM_FALLBACK",
+    "GGML_SYCL_TARGET",
+    "CMAKE_BUILD_TYPE",
+    "CMAKE_C_COMPILER",
+    "CMAKE_CXX_COMPILER",
+)
+
+# Binary identity, port, attach mode, cleanup modes, and candidate-only
+# retention controls intentionally differ between the accepted parent and a
+# bounded-retention candidate. Every other recorded config field is part of
+# the comparable workload.
+NON_WORKLOAD_CONFIG_KEYS = frozenset({
+    "bin",
+    "port",
+    "attach",
+    "modes",
+    "statetree_lease_ms",
+    "statetree_max_state_bytes",
+})
+MANDATORY_COMPARISON_METRICS = (
+    "fork_server_ms",
+    "branch_aggregate_predicted_tps",
+)
+CONTROLLED_SERVER_OPTIONS = frozenset({
+    "-m", "--model", "--model-url", "-c", "--ctx-size", "-np", "--parallel",
+    "--host", "--port", "-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified",
+    "--slots", "--no-slots", "--metrics", "--no-metrics",
+    "--statetree-lease-ms", "--statetree-max-state-bytes",
+})
 
 
 class HttpStatusError(RuntimeError):
@@ -80,6 +116,17 @@ def resolve_family_ids(parallel: int, fanout: int, layout: str) -> list[int]:
     return family_ids
 
 
+def transaction_slot_plan(family_ids: list[int], repeat: int) -> tuple[int, list[int], int]:
+    if not family_ids:
+        raise ValueError("StateTree transaction requires at least one family slot")
+    source_id = family_ids[repeat % len(family_ids)]
+    destinations = [slot_id for slot_id in family_ids if slot_id != source_id]
+    # Manual loser erasure leaves only the original fork root reforkable. By
+    # rotating the root itself, manual and commit lanes use the same physical
+    # winner without sacrificing slot-position coverage.
+    return source_id, destinations, source_id
+
+
 def percentile(values: list[float], quantile: float) -> float | None:
     if not values:
         return None
@@ -102,6 +149,23 @@ def summarize_values(values: list[float]) -> dict[str, Any]:
         "max": max(values) if values else None,
         "mean": statistics.mean(values) if values else None,
     }
+
+
+def required_nonnegative_number(data: dict[str, Any], key: str, label: str) -> float:
+    value = data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{label} is missing or is not numeric")
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise RuntimeError(f"{label} must be finite and non-negative")
+    return parsed
+
+
+def required_nonnegative_int(data: dict[str, Any], key: str, label: str) -> int:
+    value = data.get(key)
+    if type(value) is not int or value < 0:
+        raise RuntimeError(f"{label} is missing or is not a non-negative integer")
+    return value
 
 
 def http_json(
@@ -184,6 +248,53 @@ def stop_process(proc: subprocess.Popen[Any] | None) -> None:
         proc.wait(timeout=20)
 
 
+def file_identity(path: str, include_sha256: bool = False) -> dict[str, Any] | None:
+    resolved = Path(path).expanduser().resolve()
+    try:
+        stat = resolved.stat()
+    except OSError:
+        return None
+    result: dict[str, Any] = {"realpath": str(resolved), "size_bytes": stat.st_size}
+    if include_sha256:
+        digest = hashlib.sha256()
+        with resolved.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        result["sha256"] = digest.hexdigest()
+    return result
+
+
+def bundled_runtime_identities(binary: str) -> dict[str, dict[str, Any]]:
+    binary_dir = Path(binary).expanduser().resolve().parent
+    result: dict[str, dict[str, Any]] = {}
+    for candidate in sorted(binary_dir.glob("*.so")):
+        if candidate.name == "libllama-bench-impl.so":
+            continue
+        identity = file_identity(str(candidate), include_sha256=True)
+        if identity is not None:
+            result[candidate.name] = identity
+    return result
+
+
+def cmake_cache_identity(binary: str) -> dict[str, str] | None:
+    resolved = Path(binary).expanduser().resolve()
+    cache_path = next(
+        (parent / "CMakeCache.txt" for parent in resolved.parents if (parent / "CMakeCache.txt").is_file()),
+        None,
+    )
+    if cache_path is None:
+        return None
+    values: dict[str, str] = {}
+    for line in cache_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        key_and_type, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key = key_and_type.split(":", 1)[0]
+        if key in BUILD_CACHE_KEYS:
+            values[key] = value
+    return values
+
+
 def launch_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[Any]:
     if port_open(args.port):
         raise RuntimeError(f"port {args.port} is already listening")
@@ -210,6 +321,10 @@ def launch_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[
         "--no-cache-idle-slots",
         "-a", f"turbo-statetree-bench-{args.label}",
     ]
+    if args.statetree_lease_ms > 0:
+        command.extend(["--statetree-lease-ms", str(args.statetree_lease_ms)])
+    if args.statetree_max_state_bytes > 0:
+        command.extend(["--statetree-max-state-bytes", str(args.statetree_max_state_bytes)])
     if args.extra_server_args:
         command.extend(shlex.split(args.extra_server_args))
 
@@ -351,6 +466,13 @@ def summarize_slots(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "is_reserved",
         "fork_source_id",
         "fork_id",
+        "state_id",
+        "node_id",
+        "parent_node_id",
+        "retention_touch",
+        "lease_pinned",
+        "lease_remaining_ms",
+        "lease_expired",
         "n_prompt_checkpoints",
         "n_prompt_tokens",
         *byte_keys,
@@ -377,6 +499,9 @@ def capture_snapshot(port: int, pid: int | None, family_ids: list[int]) -> dict[
     if not isinstance(body, list) or any(not isinstance(row, dict) for row in body):
         raise RuntimeError("slots response is not an array of objects")
     rows = list(body)
+    slot_ids = [row.get("id") for row in rows]
+    if any(type(slot_id) is not int for slot_id in slot_ids) or len(set(slot_ids)) != len(slot_ids):
+        raise RuntimeError("slots response has missing or duplicate integer IDs")
     family = [row for row in rows if int(row.get("id", -1)) in family_ids]
     metrics = parse_prometheus(http_text(f"http://127.0.0.1:{port}/metrics"))
     return {
@@ -392,6 +517,19 @@ def capture_snapshot(port: int, pid: int | None, family_ids: list[int]) -> dict[
                 "requests_processing",
                 "requests_deferred",
                 "requests_reserved",
+                "statetree_state_bytes",
+                "statetree_retained_bytes",
+                "statetree_active_bytes",
+                "statetree_state_budget_bytes",
+                "statetree_state_high_water_bytes",
+                "statetree_retained_high_water_bytes",
+                "statetree_families",
+                "statetree_active_families",
+                "statetree_expired_total",
+                "statetree_evicted_total",
+                "statetree_reclaimed_bytes_total",
+                "statetree_renewed_total",
+                "statetree_pressure_rejected_total",
             )
             if key in metrics
         },
@@ -431,6 +569,7 @@ def completion(
     n_predict: int,
     seed: int,
     timeout: float,
+    fork_id: int | None = None,
 ) -> dict[str, Any]:
     payload = {
         "prompt": prompt,
@@ -445,6 +584,8 @@ def completion(
         "stream": False,
         "return_tokens": True,
     }
+    if fork_id is not None:
+        payload["fork_id"] = fork_id
     timed = timed_json(
         "POST",
         f"http://127.0.0.1:{port}/completion",
@@ -462,14 +603,20 @@ def completion(
     tokens = body.get("tokens", [])
     if not isinstance(tokens, list) or any(type(token) is not int for token in tokens):
         raise RuntimeError("completion response is missing integer tokens")
-    predicted_n = int(timings.get("predicted_n") or 0)
+    prompt_n = required_nonnegative_int(timings, "prompt_n", "completion prompt_n")
+    cache_n = required_nonnegative_int(timings, "cache_n", "completion cache_n")
+    predicted_n = required_nonnegative_int(timings, "predicted_n", "completion predicted_n")
+    # Native completion with n_predict=0 still samples the mandatory prompt
+    # logit token, while retaining only the evaluated prompt in the slot.
+    if n_predict > 0 and predicted_n != n_predict:
+        raise RuntimeError(f"completion predicted {predicted_n} tokens, expected {n_predict}")
     if len(tokens) != predicted_n:
         raise RuntimeError(f"completion returned {len(tokens)} tokens, timings reported {predicted_n}")
     return {
         "client_ms": timed["client_ms"],
         "slot_id": slot_id,
-        "prompt_n": int(timings.get("prompt_n") or 0),
-        "cache_n": int(timings.get("cache_n") or 0),
+        "prompt_n": prompt_n,
+        "cache_n": cache_n,
         "predicted_n": predicted_n,
         "prompt_tps": float(timings["prompt_per_second"]) if timings.get("prompt_per_second") is not None else None,
         "predicted_tps": float(timings["predicted_per_second"]) if timings.get("predicted_per_second") is not None else None,
@@ -498,11 +645,17 @@ def fork_slot(
         raise RuntimeError("fork response is not an object")
     if body.get("id_slot") != source_id or body.get("destinations") != destinations:
         raise RuntimeError("fork response does not match requested slots")
+    timings = body.get("timings")
+    if not isinstance(timings, dict):
+        raise RuntimeError("fork response is missing timings")
+    fork_id_response = body.get("fork_id")
+    if fork_id_response is not None and type(fork_id_response) is not int:
+        raise RuntimeError("fork response generation is not an integer")
     return {
         "client_ms": timed["client_ms"],
-        "server_ms": float(body.get("timings", {}).get("fork_ms") or 0.0),
-        "fork_id": body.get("fork_id"),
-        "n_tokens": int(body.get("n_tokens") or 0),
+        "server_ms": required_nonnegative_number(timings, "fork_ms", "fork server timing"),
+        "fork_id": fork_id_response,
+        "n_tokens": required_nonnegative_int(body, "n_tokens", "fork n_tokens"),
         "response": body,
     }
 
@@ -517,27 +670,67 @@ def commit_slot(port: int, winner_id: int, fork_id: int, timeout: float) -> dict
     body = timed["response"]
     if not isinstance(body, dict):
         raise RuntimeError("commit response is not an object")
+    if body.get("id_slot") != winner_id or body.get("fork_id") != fork_id:
+        raise RuntimeError("commit response does not match the requested winner generation")
+    timings = body.get("timings")
+    if not isinstance(timings, dict):
+        raise RuntimeError("commit response is missing timings")
     return {
         "client_ms": timed["client_ms"],
-        "server_ms": float(body.get("timings", {}).get("commit_ms") or 0.0),
+        "server_ms": required_nonnegative_number(timings, "commit_ms", "commit server timing"),
         "response": body,
     }
 
 
-def erase_slot(port: int, slot_id: int, timeout: float) -> dict[str, Any]:
+def erase_slot(
+    port: int,
+    slot_id: int,
+    timeout: float,
+    fork_id: int | None = None,
+) -> dict[str, Any]:
+    payload = {"fork_id": fork_id} if fork_id is not None else {}
     return timed_json(
         "POST",
         f"http://127.0.0.1:{port}/slots/{slot_id}?action=erase",
-        {},
+        payload,
         timeout=timeout,
     )
 
 
-def erase_slots(port: int, slot_ids: list[int], timeout: float) -> dict[str, Any]:
+def erase_slots(
+    port: int,
+    slot_ids: list[int],
+    timeout: float,
+    fork_id: int | None = None,
+) -> dict[str, Any]:
     started = time.perf_counter()
     operations = []
     for slot_id in slot_ids:
-        operation = erase_slot(port, slot_id, timeout)
+        operation = erase_slot(port, slot_id, timeout, fork_id=fork_id)
+        operations.append({"slot_id": slot_id, "client_ms": operation["client_ms"]})
+    return {
+        "client_ms": (time.perf_counter() - started) * 1000.0,
+        "operations": operations,
+    }
+
+
+def erase_current_slots(port: int, slot_ids: list[int], timeout: float) -> dict[str, Any]:
+    rows = http_json("GET", f"http://127.0.0.1:{port}/slots", timeout=timeout)
+    if not isinstance(rows, list):
+        raise RuntimeError("slots response is not an array")
+    fork_ids = {
+        int(row["id"]): int(row["fork_id"])
+        for row in rows
+        if isinstance(row, dict)
+        and type(row.get("id")) is int
+        and row.get("is_reserved") is True
+        and type(row.get("fork_id")) is int
+        and int(row["fork_id"]) >= 0
+    }
+    started = time.perf_counter()
+    operations = []
+    for slot_id in slot_ids:
+        operation = erase_slot(port, slot_id, timeout, fork_id=fork_ids.get(slot_id))
         operations.append({"slot_id": slot_id, "client_ms": operation["client_ms"]})
     return {
         "client_ms": (time.perf_counter() - started) * 1000.0,
@@ -553,6 +746,7 @@ def branch_wave(
     n_predict: int,
     seed: int,
     timeout: float,
+    fork_id: int | None = None,
 ) -> dict[str, Any]:
     barrier = threading.Barrier(len(family_ids))
 
@@ -565,6 +759,7 @@ def branch_wave(
             n_predict,
             seed + slot_id,
             timeout,
+            fork_id,
         )
 
     started = time.perf_counter()
@@ -603,6 +798,35 @@ def validate_sample(sample: dict[str, Any]) -> list[str]:
     prefix_tokens = sample["prefix_tokens"]
     snapshots = sample["snapshots"]
 
+    for snapshot_name, snapshot in snapshots.items():
+        if not isinstance(snapshot, dict) or "all_slots" not in snapshot:
+            continue
+        rows = snapshot["all_slots"].get("by_id", {})
+        for slot_id, row in rows.items():
+            byte_values = [row.get(key) for key in (
+                "n_prompt_data_bytes", "n_prompt_checkpoint_bytes", "n_prompt_state_bytes"
+            )]
+            if all(type(value) is int for value in byte_values):
+                data_bytes, checkpoint_bytes, state_bytes = byte_values
+                if min(data_bytes, checkpoint_bytes, state_bytes) < 0:
+                    failures.append(f"snapshot {snapshot_name} slot {slot_id} reported negative state bytes")
+                if state_bytes != data_bytes + checkpoint_bytes:
+                    failures.append(f"snapshot {snapshot_name} slot {slot_id} state byte accounting is inconsistent")
+
+        metrics = snapshot.get("server_metrics", {})
+        metric_state = metrics.get("statetree_state_bytes")
+        exact_state = snapshot["all_slots"].get("prompt_state_bytes")
+        if isinstance(metric_state, (int, float)) and isinstance(exact_state, int):
+            if int(metric_state) != exact_state:
+                failures.append(f"snapshot {snapshot_name} StateTree state gauge disagrees with slot bytes")
+        budget = metrics.get("statetree_state_budget_bytes")
+        high_water = metrics.get("statetree_state_high_water_bytes")
+        if isinstance(budget, (int, float)) and budget > 0:
+            if isinstance(metric_state, (int, float)) and metric_state > budget:
+                failures.append(f"snapshot {snapshot_name} exceeded the StateTree state budget")
+            if isinstance(high_water, (int, float)) and high_water > budget:
+                failures.append(f"snapshot {snapshot_name} StateTree high-water exceeded the state budget")
+
     if snapshots["after_fork"]["family_slots"]["reserved"] != len(family_ids):
         failures.append("fork did not reserve the exact family")
     if sample["branch_wave"]["min_cache_n"] < prefix_tokens - 1:
@@ -620,17 +844,24 @@ def validate_sample(sample: dict[str, Any]) -> list[str]:
         if key in before and before.get(key) != after.get(key):
             failures.append(f"winner {key} changed across cleanup")
 
+    loser_ids = sorted(slot_id for slot_id in family_ids if slot_id != winner_id)
     if sample["cleanup_mode"] == "commit":
         released = sample["cleanup"]["response"].get("released")
-        expected = sorted(slot_id for slot_id in family_ids if slot_id != winner_id)
-        if sorted(released or []) != expected:
+        if sorted(released or []) != loser_ids:
             failures.append("commit released the wrong slot set")
-        for slot_id in expected:
-            loser = slot_row(snapshots["after_cleanup"], slot_id)
-            if int(loser.get("n_prompt_tokens") or 0) != 0:
-                failures.append(f"loser slot {slot_id} retained prompt tokens")
-            if int(loser.get("n_prompt_state_bytes") or 0) != 0:
-                failures.append(f"loser slot {slot_id} retained prompt state bytes")
+
+    retained_fields = (
+        ("n_prompt_tokens", "prompt tokens"),
+        ("n_prompt_checkpoints", "prompt checkpoints"),
+        ("n_prompt_data_bytes", "prompt data bytes"),
+        ("n_prompt_checkpoint_bytes", "prompt checkpoint bytes"),
+        ("n_prompt_state_bytes", "prompt state bytes"),
+    )
+    for slot_id in loser_ids:
+        loser = slot_row(snapshots["after_cleanup"], slot_id)
+        for key, description in retained_fields:
+            if int(loser.get(key) or 0) != 0:
+                failures.append(f"loser slot {slot_id} retained {description}")
 
     refork = sample.get("refork")
     if refork and isinstance(refork.get("fork_id"), int):
@@ -638,8 +869,25 @@ def validate_sample(sample: dict[str, Any]) -> list[str]:
             failures.append("refork did not advance the generation")
 
     final_snapshot = snapshots.get("final")
-    if final_snapshot and final_snapshot["family_slots"]["reserved"] != 0:
-        failures.append("final cleanup left reserved slots")
+    if final_snapshot:
+        if final_snapshot["family_slots"]["reserved"] != 0:
+            failures.append("final cleanup left reserved slots")
+        family_summary = final_snapshot["family_slots"]
+        summary_keys = {
+            "n_prompt_tokens": "prompt_tokens",
+            "n_prompt_checkpoints": "prompt_checkpoints",
+            "n_prompt_data_bytes": "prompt_data_bytes",
+            "n_prompt_checkpoint_bytes": "prompt_checkpoint_bytes",
+            "n_prompt_state_bytes": "prompt_state_bytes",
+        }
+        for key, description in retained_fields:
+            summary_value = family_summary.get(summary_keys[key])
+            row_has_state = any(
+                int(slot_row(final_snapshot, slot_id).get(key) or 0) != 0
+                for slot_id in family_ids
+            )
+            if int(summary_value or 0) != 0 or row_has_state:
+                failures.append(f"final cleanup left {description}")
     return failures
 
 
@@ -653,9 +901,7 @@ def run_sample(
     cleanup_mode: str,
     pid: int | None,
 ) -> dict[str, Any]:
-    source_id = family_ids[0]
-    destinations = family_ids[1:]
-    winner_id = source_id if cleanup_mode == "manual" else family_ids[-1]
+    source_id, destinations, winner_id = transaction_slot_plan(family_ids, repeat)
     sample: dict[str, Any] = {
         "repeat": repeat,
         "prefix_tokens": len(prefix),
@@ -670,7 +916,7 @@ def run_sample(
 
     persistent_fragmentation = args.layout == "fragmented" and args.persistent_fragmentation
     reset_ids = family_ids if persistent_fragmentation else list(range(args.parallel))
-    erase_slots(args.port, reset_ids, args.request_timeout)
+    erase_current_slots(args.port, reset_ids, args.request_timeout)
     try:
         if args.layout == "fragmented":
             fill_requests = []
@@ -724,6 +970,7 @@ def run_sample(
                 args.branch_tokens,
                 args.seed + repeat * 1000 + 100,
                 args.request_timeout,
+                fork_id if isinstance(fork_id, int) else None,
             )
             sample["snapshots"]["before_cleanup"] = capture_snapshot(args.port, pid, family_ids)
             sample["failures"] = validate_sample(sample)
@@ -737,6 +984,7 @@ def run_sample(
             args.branch_tokens,
             args.seed + repeat * 1000 + 100,
             args.request_timeout,
+            fork_id if isinstance(fork_id, int) else None,
         )
         sample["snapshots"]["before_cleanup"] = capture_snapshot(args.port, pid, family_ids)
         sample["expected_shared_kv_cells_before_cleanup"] = expected_shared_kv_cells(
@@ -747,7 +995,9 @@ def run_sample(
             sample["cleanup"] = commit_slot(args.port, winner_id, fork_id, args.request_timeout)
         else:
             losers = [slot_id for slot_id in family_ids if slot_id != winner_id]
-            sample["cleanup"] = erase_slots(args.port, losers, args.request_timeout)
+            sample["cleanup"] = erase_slots(
+                args.port, losers, args.request_timeout, fork_id=fork_id if isinstance(fork_id, int) else None
+            )
         sample["snapshots"]["after_cleanup"] = capture_snapshot(args.port, pid, family_ids)
         sample["expected_shared_kv_cells_after_cleanup"] = expected_shared_kv_cells(
             sample["snapshots"]["after_cleanup"], len(prefix), family_ids
@@ -763,10 +1013,10 @@ def run_sample(
                 fork_id=fork_id,
             )
             sample["snapshots"]["after_refork"] = capture_snapshot(args.port, pid, family_ids)
+            next_fork_id = sample["refork"].get("fork_id")
+            if not isinstance(next_fork_id, int):
+                raise RuntimeError("refork response is missing a generation")
             if cleanup_mode == "commit":
-                next_fork_id = sample["refork"].get("fork_id")
-                if not isinstance(next_fork_id, int):
-                    raise RuntimeError("refork response is missing a generation")
                 sample["second_cleanup"] = commit_slot(
                     args.port,
                     winner_id,
@@ -778,17 +1028,18 @@ def run_sample(
                     args.port,
                     [slot_id for slot_id in family_ids if slot_id != winner_id],
                     args.request_timeout,
+                    fork_id=next_fork_id,
                 )
         else:
             sample["refork"] = None
             sample["refork_unsupported_reason"] = "parent fork families cannot be reforked in place"
 
-        erase_slots(args.port, family_ids, args.request_timeout)
+        erase_current_slots(args.port, family_ids, args.request_timeout)
         sample["snapshots"]["final"] = capture_snapshot(args.port, pid, family_ids)
         sample["failures"] = validate_sample(sample)
         return sample
     finally:
-        erase_slots(args.port, reset_ids, args.request_timeout)
+        erase_current_slots(args.port, reset_ids, args.request_timeout)
 
 
 def nested_value(value: dict[str, Any], path: str) -> Any:
@@ -833,7 +1084,13 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
             for sample in samples
             if sample["prefix_tokens"] == prefix_tokens and sample["cleanup_mode"] == cleanup_mode
         ]
-        usable = [sample for sample in selected if sample.get("supported", True) and not sample.get("error")]
+        usable = [
+            sample
+            for sample in selected
+            if sample.get("supported", True)
+            and not sample.get("error")
+            and not sample.get("failures")
+        ]
         metrics: dict[str, Any] = {}
         for name, path in metric_paths.items():
             values = [nested_value(sample, path) for sample in usable]
@@ -847,14 +1104,17 @@ def summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "failed_samples": sum(bool(sample.get("error") or sample.get("failures")) for sample in selected),
             "metrics": metrics,
         }
+    commit_samples = [sample for sample in samples if sample["cleanup_mode"] == "commit"]
     return {
         "groups": groups,
         "samples": len(samples),
         "supported_samples": sum(sample.get("supported", True) for sample in samples),
         "failed_samples": sum(bool(sample.get("error") or sample.get("failures")) for sample in samples),
-        "commit_supported": any(
-            sample["cleanup_mode"] == "commit" and sample.get("supported", True)
-            for sample in samples
+        "commit_supported": bool(commit_samples) and all(
+            sample.get("supported", True)
+            and not sample.get("error")
+            and not sample.get("failures")
+            for sample in commit_samples
         ),
     }
 
@@ -874,10 +1134,43 @@ def compare_results(
     vram_slack_mib: float,
 ) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
+    compatibility_errors: list[str] = []
     baseline_groups = baseline.get("summary", {}).get("groups", {})
     candidate_groups = candidate.get("summary", {}).get("groups", {})
-    common_manual = sorted(set(baseline_groups) & set(candidate_groups))
-    common_manual = [group for group in common_manual if group.endswith(":manual")]
+
+    if baseline.get("kind") != candidate.get("kind"):
+        compatibility_errors.append(
+            f"result kind mismatch: baseline={baseline.get('kind')!r}, candidate={candidate.get('kind')!r}"
+        )
+    if baseline.get("schema_version") != candidate.get("schema_version"):
+        compatibility_errors.append(
+            "result schema mismatch: "
+            f"baseline={baseline.get('schema_version')!r}, candidate={candidate.get('schema_version')!r}"
+        )
+
+    baseline_config = baseline.get("config") if isinstance(baseline.get("config"), dict) else {}
+    candidate_config = candidate.get("config") if isinstance(candidate.get("config"), dict) else {}
+    config_keys = sorted((set(baseline_config) | set(candidate_config)) - NON_WORKLOAD_CONFIG_KEYS)
+    for key in config_keys:
+        baseline_has_key = key in baseline_config
+        candidate_has_key = key in candidate_config
+        if baseline_has_key != candidate_has_key or baseline_config.get(key) != candidate_config.get(key):
+            compatibility_errors.append(
+                f"workload config mismatch for {key}: "
+                f"baseline={baseline_config.get(key)!r}, candidate={candidate_config.get(key)!r}"
+            )
+
+    baseline_manual = sorted(group for group in baseline_groups if group.endswith(":manual"))
+    common_manual = [group for group in baseline_manual if group in candidate_groups]
+    for group in baseline_manual:
+        if group not in candidate_groups:
+            compatibility_errors.append(f"candidate is missing baseline manual group {group}")
+            continue
+        for metric in MANDATORY_COMPARISON_METRICS:
+            if metric_p50(baseline, group, metric) is None:
+                compatibility_errors.append(f"baseline group {group} is missing mandatory metric {metric}")
+            if metric_p50(candidate, group, metric) is None:
+                compatibility_errors.append(f"candidate group {group} is missing mandatory metric {metric}")
 
     for group in common_manual:
         base_fork = metric_p50(baseline, group, "fork_server_ms")
@@ -966,9 +1259,14 @@ def compare_results(
             "vram_slack_mib": vram_slack_mib,
         },
         "checks": checks,
+        "compatibility": {
+            "passed": not compatibility_errors,
+            "errors": compatibility_errors,
+        },
         "commit_vs_manual": commit_deltas,
         "candidate_commit_supported": bool(candidate.get("summary", {}).get("commit_supported")),
         "passed": bool(checks)
+            and not compatibility_errors
             and all(check["passed"] for check in checks)
             and baseline.get("summary", {}).get("failed_samples", 0) == 0
             and candidate.get("summary", {}).get("failed_samples", 0) == 0
@@ -997,6 +1295,15 @@ def run_benchmark(args: argparse.Namespace) -> int:
         raise SystemExit("--attach erases slot state; add --allow-destructive-attach for an isolated server")
     if args.port == 8093:
         raise SystemExit("refusing production port 8093; use an isolated managed server")
+    controlled_overrides = sorted({
+        token.split("=", 1)[0]
+        for token in shlex.split(getattr(args, "extra_server_args", ""))
+        if token.split("=", 1)[0] in CONTROLLED_SERVER_OPTIONS
+    })
+    if controlled_overrides:
+        raise SystemExit(
+            "--extra-server-args cannot override controlled options: " + ", ".join(controlled_overrides)
+        )
     if args.persistent_fragmentation and args.layout != "fragmented":
         raise SystemExit("--persistent-fragmentation requires --layout fragmented")
     try:
@@ -1019,6 +1326,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     proc: subprocess.Popen[Any] | None = None
     samples: list[dict[str, Any]] = []
     server_ready = False
+    live_props: dict[str, Any] | None = None
     persistent_setup: dict[str, Any] | None = None
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -1031,11 +1339,18 @@ def run_benchmark(args: argparse.Namespace) -> int:
             wait_healthy(args.port, proc, args.startup_timeout)
             pid = proc.pid
         server_ready = True
+        props = http_json("GET", f"http://127.0.0.1:{args.port}/props", timeout=30.0)
+        if isinstance(props, dict):
+            live_props = {
+                key: props.get(key)
+                for key in ("build_info", "model_alias", "model_path", "total_slots", "statetree")
+            }
+            live_props["n_ctx"] = nested_value(props, "default_generation_settings.n_ctx")
 
-        erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+        erase_current_slots(args.port, list(range(args.parallel)), args.request_timeout)
         warmup_tokens = exact_tokens(args.port, min(32, min(args.prefix_tokens)), "warmup")
         completion(args.port, warmup_tokens, 0, min(2, args.branch_tokens), args.seed, args.request_timeout)
-        erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+        erase_current_slots(args.port, list(range(args.parallel)), args.request_timeout)
 
         prefix_pool = exact_tokens(args.port, max(args.prefix_tokens), "prefix")
         suffixes = {
@@ -1049,7 +1364,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
         } if args.layout == "fragmented" else {}
 
         if args.layout == "fragmented" and args.persistent_fragmentation:
-            erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+            erase_current_slots(args.port, list(range(args.parallel)), args.request_timeout)
             fill_requests = []
             for slot_id in range(args.parallel):
                 fill_requests.append(completion(
@@ -1107,7 +1422,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     finally:
         if server_ready:
             try:
-                erase_slots(args.port, list(range(args.parallel)), args.request_timeout)
+                erase_current_slots(args.port, list(range(args.parallel)), args.request_timeout)
             except Exception as exc:  # noqa: BLE001
                 print(f"warning: final slot cleanup failed: {exc}", file=sys.stderr, flush=True)
         if not args.attach:
@@ -1138,14 +1453,31 @@ def run_benchmark(args: argparse.Namespace) -> int:
             "branch_tokens": args.branch_tokens,
             "repeats": args.repeats,
             "modes": args.modes,
+            "seed": args.seed,
+            "batch": args.batch,
+            "ubatch": args.ubatch,
+            "threads": args.threads,
             "ngl": args.ngl,
             "ncmoe": args.ncmoe,
+            "cache_type_k": args.cache_type_k,
+            "cache_type_v": args.cache_type_v,
+            "flash_attn": args.flash_attn,
+            "extra_server_args": args.extra_server_args,
+            "source_oneapi": args.source_oneapi,
+            "ggml_sycl_enable_fusion": "1",
+            "statetree_lease_ms": args.statetree_lease_ms,
+            "statetree_max_state_bytes": args.statetree_max_state_bytes,
+            "model_identity": file_identity(args.model),
+            "cmake_cache": cmake_cache_identity(args.bin),
             "attach": args.attach,
         },
         "server": {
             "version": server_version(args),
             "commit": args.commit,
             "log_path": str(log_path) if not args.attach else None,
+            "binary_identity": file_identity(args.bin, include_sha256=True),
+            "bundled_runtime_identities": bundled_runtime_identities(args.bin),
+            "live_props": live_props,
         },
         "persistent_fragmentation_setup": persistent_setup,
         "summary": summary,
@@ -1213,6 +1545,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--request-timeout", type=float, default=900.0)
     run.add_argument("--startup-timeout", type=float, default=900.0)
     run.add_argument("--extra-server-args", default="")
+    run.add_argument("--statetree-lease-ms", type=non_negative_int, default=0)
+    run.add_argument("--statetree-max-state-bytes", type=non_negative_int, default=0)
     run.add_argument("--source-oneapi", action=argparse.BooleanOptionalAction, default=True)
     run.add_argument("--attach", action="store_true")
     run.add_argument("--server-pid", type=positive_int)

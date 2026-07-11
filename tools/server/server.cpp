@@ -167,6 +167,15 @@ int llama_server(int argc, char ** argv) {
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
+        routes.post_nodes                  = models_routes->proxy_post;
+        routes.get_snapshots               = models_routes->proxy_get;
+        routes.post_snapshots              = models_routes->proxy_post;
+        routes.get_snapshot_contents       = models_routes->proxy_get;
+        routes.post_snapshot_contents      = models_routes->proxy_post;
+        routes.post_snapshot_manifest      = models_routes->proxy_post;
+        routes.get_snapshot_heads          = models_routes->proxy_get;
+        routes.post_snapshot_heads         = models_routes->proxy_post;
+        routes.get_states                  = models_routes->proxy_get;
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -217,6 +226,15 @@ int llama_server(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    ctx_http.post("/nodes/:node_id",           ex_wrapper(routes.post_nodes));
+    ctx_http.get ("/snapshots",                ex_wrapper(routes.get_snapshots));
+    ctx_http.post("/snapshots/:snapshot_id",   ex_wrapper(routes.post_snapshots));
+    ctx_http.get ("/snapshot-contents",         ex_wrapper(routes.get_snapshot_contents));
+    ctx_http.post("/snapshot-contents/:digest", ex_wrapper(routes.post_snapshot_contents));
+    ctx_http.post("/snapshot-manifest",         ex_wrapper(routes.post_snapshot_manifest));
+    ctx_http.get ("/snapshot-heads",            ex_wrapper(routes.get_snapshot_heads));
+    ctx_http.post("/snapshot-heads/:head",      ex_wrapper(routes.post_snapshot_heads));
+    ctx_http.get ("/states",                   ex_wrapper(routes.get_states));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();

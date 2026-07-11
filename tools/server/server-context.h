@@ -105,6 +105,15 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    server_http_context::handler_t post_nodes;
+    server_http_context::handler_t get_snapshots;
+    server_http_context::handler_t post_snapshots;
+    server_http_context::handler_t get_snapshot_contents;
+    server_http_context::handler_t post_snapshot_contents;
+    server_http_context::handler_t post_snapshot_manifest;
+    server_http_context::handler_t get_snapshot_heads;
+    server_http_context::handler_t post_snapshot_heads;
+    server_http_context::handler_t get_states;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;
@@ -140,9 +149,16 @@ private:
             task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
-    std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
-    std::unique_ptr<server_res_generator> handle_slots_fork(const server_http_req & req, int id_slot);
-    std::unique_ptr<server_res_generator> handle_slots_commit(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_erase(
+            const server_http_req & req, int id_slot, int64_t node_id = -1);
+    std::unique_ptr<server_res_generator> handle_slots_fork(
+            const server_http_req & req, int id_slot, int64_t node_id = -1);
+    std::unique_ptr<server_res_generator> handle_slots_commit(
+            const server_http_req & req, int id_slot, int64_t node_id = -1);
+    std::unique_ptr<server_res_generator> handle_slots_renew(
+            const server_http_req & req, int id_slot, int64_t node_id = -1);
+    std::unique_ptr<server_res_generator> handle_snapshot_capture(
+            const server_http_req & req, int64_t node_id);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
 
@@ -154,5 +170,5 @@ private:
 
     server_queue & queue_tasks;
     server_response & queue_results;
-    std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+    std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false, int polling_interval_ms = 1000);
 };

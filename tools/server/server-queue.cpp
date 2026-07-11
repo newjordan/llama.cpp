@@ -3,6 +3,7 @@
 
 #include "log.h"
 
+#include <algorithm>
 #include <chrono>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -22,6 +23,14 @@
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    if (terminating) {
+        const int task_id = task.id;
+        lock.unlock();
+        if (callback_terminated_task) {
+            callback_terminated_task(std::move(task));
+        }
+        return task_id;
+    }
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -40,6 +49,18 @@ int server_queue::post(server_task && task, bool front) {
 
 int server_queue::post(std::vector<server_task> && tasks, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (terminating) {
+        lock.unlock();
+        if (callback_terminated_task) {
+            for (auto & task : tasks) {
+                if (task.id == -1) {
+                    task.id = get_new_id();
+                }
+                callback_terminated_task(std::move(task));
+            }
+        }
+        return 0;
+    }
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
@@ -62,6 +83,13 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
+    if (terminating) {
+        lock.unlock();
+        if (callback_terminated_task) {
+            callback_terminated_task(std::move(task));
+        }
+        return;
+    }
     QUE_DBG("defer task, id = %d\n", task.id);
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
@@ -76,24 +104,30 @@ int server_queue::get_new_id() {
 
 void server_queue::pop_deferred_task(int id_slot) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    if (!queue_tasks_deferred.empty()) {
-        // try to find a task that uses the specified slot
-        bool found = false;
-        for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
-            if (it->id_slot == id_slot) {
-                QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
-                queue_tasks.emplace_front(std::move(*it));
-                queue_tasks_deferred.erase(it);
-                found = true;
-                break;
-            }
+    if (queue_tasks_deferred.empty()) {
+        return;
+    }
+    // try to find a task that uses the specified slot
+    bool found = false;
+    for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+        const bool uses_slot = it->id_slot == id_slot ||
+            ((it->type == SERVER_TASK_TYPE_SLOT_SAVE ||
+              it->type == SERVER_TASK_TYPE_SLOT_RESTORE ||
+              it->type == SERVER_TASK_TYPE_SLOT_ERASE) &&
+             it->slot_action.id_slot == id_slot);
+        if (uses_slot) {
+            QUE_DBG("pop deferred task (use slot %d), id_task = %d\n", id_slot, it->id);
+            queue_tasks.emplace_front(std::move(*it));
+            queue_tasks_deferred.erase(it);
+            found = true;
+            break;
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
-        if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
-            queue_tasks_deferred.pop_front();
-        }
+    }
+    // if not tasks found using the slot, just pop the first deferred task (default behavior)
+    if (!found) {
+        QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
+        queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
+        queue_tasks_deferred.pop_front();
     }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
@@ -117,16 +151,36 @@ void server_queue::wait_until_no_sleep() {
 }
 
 void server_queue::terminate() {
-    std::unique_lock<std::mutex> lock(mutex_tasks);
-    running = false;
+    std::deque<server_task> cancelled;
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        running = false;
+        terminating = true;
+        cancelled.swap(queue_tasks);
+        while (!queue_tasks_deferred.empty()) {
+            cancelled.push_back(std::move(queue_tasks_deferred.front()));
+            queue_tasks_deferred.pop_front();
+        }
+    }
+    if (callback_terminated_task) {
+        for (auto & task : cancelled) {
+            callback_terminated_task(std::move(task));
+        }
+    }
     condition_tasks.notify_all();
 }
 
 void server_queue::start_loop(int64_t idle_sleep_ms) {
-    running = true;
-    time_last_task = ggml_time_ms();
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        if (terminating) {
+            return;
+        }
+        running = true;
+        time_last_task = ggml_time_ms();
+    }
 
-    constexpr auto max_wait_time = std::chrono::seconds(1);
+    constexpr int64_t max_wait_ms = 1000;
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0 ||
@@ -197,8 +251,18 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
             } else {
-                // wait for new tasks or timeout for checking sleeping condition
-                bool res = condition_tasks.wait_for(lock, max_wait_time, [&]{
+                int64_t wait_ms = max_wait_ms;
+                if (callback_idle) {
+                    lock.unlock();
+                    wait_ms = std::clamp<int64_t>(callback_idle(), 1, max_wait_ms);
+                    lock.lock();
+                    if (!running || !queue_tasks.empty()) {
+                        break;
+                    }
+                }
+
+                // wait for new tasks or timeout for maintenance and sleeping checks
+                bool res = condition_tasks.wait_for(lock, std::chrono::milliseconds(wait_ms), [&]{
                     return (!queue_tasks.empty() || !running);
                 });
                 if (res) {
@@ -215,12 +279,18 @@ void server_queue::cleanup_pending_task(int id_target) {
     auto rm_func = [id_target](const server_task & task) {
         return task.id == id_target;
     };
+    const size_t queued_before = queue_tasks.size() + queue_tasks_deferred.size();
     queue_tasks.erase(
         std::remove_if(queue_tasks.begin(),          queue_tasks.end(),          rm_func),
         queue_tasks.end());
     queue_tasks_deferred.erase(
         std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), rm_func),
         queue_tasks_deferred.end());
+    const bool removed = queue_tasks.size() + queue_tasks_deferred.size() < queued_before;
+    if (removed && !queue_tasks_deferred.empty()) {
+        queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
+        queue_tasks_deferred.pop_front();
+    }
 }
 
 //
@@ -288,7 +358,7 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
     // should never reach here
 }
 
-server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
+server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout_ms) {
     while (true) {
         std::unique_lock<std::mutex> lock(mutex_results);
 
@@ -300,7 +370,7 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
             }
         }
 
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
+        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::milliseconds(timeout_ms));
         if (!running) {
             RES_DBG("%s : queue result stop\n", __func__);
             std::terminate(); // we cannot return here since the caller is HTTP code
@@ -331,6 +401,11 @@ void server_response::send(server_task_result_ptr && result) {
             return;
         }
     }
+}
+
+bool server_response::is_waiting_task_id(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    return waiting_task_ids.find(id_task) != waiting_task_ids.end();
 }
 
 void server_response::terminate() {
@@ -379,7 +454,7 @@ bool server_response_reader::has_next() const {
 // note: if one error is received, it will stop further processing and return error result
 server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
     while (true) {
-        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
+        server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_ms);
         if (result == nullptr) {
             // timeout, check stop condition
             if (should_stop()) {

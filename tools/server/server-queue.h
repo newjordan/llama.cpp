@@ -14,6 +14,7 @@ struct server_queue {
 private:
     int id = 0;
     bool running  = false;
+    bool terminating = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
@@ -28,8 +29,10 @@ private:
     // callback functions
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
+    std::function<int64_t(void)>        callback_idle;
     std::function<void(bool)>           callback_sleeping_state;
     std::function<bool(void)>           callback_idle_sleep_inhibited;
+    std::function<void(server_task &&)> callback_terminated_task;
 
 public:
     // Add a new task to the end of the queue
@@ -96,6 +99,12 @@ public:
         callback_update_slots = std::move(callback);
     }
 
+    // Called on the queue thread while no work is pending. The callback may
+    // perform maintenance and returns the maximum delay before its next call.
+    void on_idle(std::function<int64_t(void)> callback) {
+        callback_idle = std::move(callback);
+    }
+
     // Register callback for sleeping state change; multiple callbacks are allowed
     // note: when entering sleeping state, the callback is called AFTER sleeping is set to true
     //       when leaving sleeping state, the callback is called BEFORE sleeping is set to false
@@ -113,6 +122,10 @@ public:
 
     void on_idle_sleep_inhibited(std::function<bool(void)> callback) {
         callback_idle_sleep_inhibited = std::move(callback);
+    }
+
+    void on_terminated_task(std::function<void(server_task &&)> callback) {
+        callback_terminated_task = std::move(callback);
     }
 
 private:
@@ -151,13 +164,16 @@ public:
 
     // same as recv(), but have timeout in seconds
     // if timeout is reached, nullptr is returned
-    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
+    server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout_ms);
 
     // single-task version of recv()
     server_task_result_ptr recv(int id_task);
 
     // Send a new result to a waiting id_task
     void send(server_task_result_ptr && result);
+
+    // True while an HTTP reader still owns this task ID.
+    bool is_waiting_task_id(int id_task);
 
     // terminate the waiting loop
     void terminate();
@@ -172,15 +188,15 @@ struct server_response_reader {
     server_response & queue_results;
     size_t received_count = 0;
     bool cancelled = false;
-    int polling_interval_seconds;
+    int polling_interval_ms;
 
     // tracking generation state and partial tool calls
     // only used by streaming completions
     std::vector<task_result_state> states;
 
-    // should_stop function will be called each polling_interval_seconds
-    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
-        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
+    // should_stop function will be called each polling_interval_ms
+    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_ms)
+        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_ms(polling_interval_ms) {}
     ~server_response_reader() {
         stop();
     }

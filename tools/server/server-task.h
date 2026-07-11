@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -27,6 +28,25 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_SLOT_FORK,
     SERVER_TASK_TYPE_SLOT_COMMIT,
+    SERVER_TASK_TYPE_SLOT_RENEW,
+    SERVER_TASK_TYPE_SNAPSHOT_CAPTURE,
+    SERVER_TASK_TYPE_SNAPSHOT_MATERIALIZE,
+    SERVER_TASK_TYPE_SNAPSHOT_ERASE,
+    SERVER_TASK_TYPE_SNAPSHOT_SPILL,
+    SERVER_TASK_TYPE_SNAPSHOT_PUBLISH,
+    SERVER_TASK_TYPE_SNAPSHOT_PUBLISH_ADVANCE,
+    SERVER_TASK_TYPE_SNAPSHOT_CONTENT_MATERIALIZE,
+    SERVER_TASK_TYPE_SNAPSHOT_CONTENT_ERASE,
+    SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RETAIN,
+    SERVER_TASK_TYPE_SNAPSHOT_CONTENT_RELEASE,
+    SERVER_TASK_TYPE_SNAPSHOT_MANIFEST_COMPACT,
+    SERVER_TASK_TYPE_SNAPSHOT_MANIFEST_PRUNE,
+    SERVER_TASK_TYPE_SNAPSHOT_HEAD_CREATE,
+    SERVER_TASK_TYPE_SNAPSHOT_HEAD_ADVANCE,
+    SERVER_TASK_TYPE_SNAPSHOT_HEAD_DELETE,
+    SERVER_TASK_TYPE_SNAPSHOT_HEAD_MATERIALIZE,
+    SERVER_TASK_TYPE_DURABLE_IO_COMPLETE,
+    SERVER_TASK_TYPE_STATETREE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -141,6 +161,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
+    int64_t fork_id = -1; // expected StateTree generation for an explicit slot request
+    int64_t state_id = -1; // logical StateTree lineage, independent of its physical slot
+    int64_t node_id = -1; // immutable branch incarnation within a StateTree lineage
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -161,13 +184,24 @@ struct server_task {
     server_task_type type;
 
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE,
-    // SERVER_TASK_TYPE_SLOT_FORK, SERVER_TASK_TYPE_SLOT_COMMIT
+    // SERVER_TASK_TYPE_SLOT_FORK, SERVER_TASK_TYPE_SLOT_COMMIT, SERVER_TASK_TYPE_SLOT_RENEW
     struct slot_action {
         int id_slot = -1;
-        int fork_id = -1;
+        int64_t state_id = -1;
+        int64_t node_id = -1;
+        int64_t fork_id = -1;
+        int64_t snapshot_id = -1;
         std::vector<int> destinations;
+        std::string digest;
+        std::string owner;
+        std::string retention_class;
+        std::string head_name;
+        std::string expected_digest;
+        uint64_t expected_generation = 0;
         std::string filename;
         std::string filepath;
+        uint64_t durable_io_id = 0;
+        uint64_t target_bytes = 0;
     };
     slot_action slot_action;
 
@@ -538,6 +572,68 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t statetree_state_bytes             = 0;
+    uint64_t statetree_retained_bytes          = 0;
+    uint64_t statetree_active_bytes            = 0;
+    uint64_t statetree_state_budget_bytes      = 0;
+    uint64_t statetree_state_high_water_bytes  = 0;
+    uint64_t statetree_retained_high_water_bytes = 0;
+    uint64_t statetree_expired_total           = 0;
+    uint64_t statetree_evicted_total           = 0;
+    uint64_t statetree_reclaimed_bytes_total   = 0;
+    uint64_t statetree_renewed_total           = 0;
+    uint64_t statetree_pressure_rejected_total = 0;
+    uint64_t statetree_snapshot_bytes          = 0;
+    uint64_t statetree_snapshot_budget_bytes   = 0;
+    uint64_t statetree_snapshot_high_water_bytes = 0;
+    uint64_t statetree_snapshot_count          = 0;
+    uint64_t statetree_snapshot_content_count  = 0;
+    uint64_t statetree_snapshots_captured_total = 0;
+    uint64_t statetree_snapshots_materialized_total = 0;
+    uint64_t statetree_snapshots_erased_total  = 0;
+    uint64_t statetree_snapshot_rejected_total = 0;
+    uint64_t statetree_durable_disk_bytes = 0;
+    uint64_t statetree_durable_disk_budget_bytes = 0;
+    uint64_t statetree_durable_disk_high_water_bytes = 0;
+    uint64_t statetree_durable_content_count = 0;
+    uint64_t statetree_durable_spilled_total = 0;
+    uint64_t statetree_durable_materialized_total = 0;
+    uint64_t statetree_durable_erased_total = 0;
+    uint64_t statetree_durable_rejected_total = 0;
+    uint64_t statetree_durable_recovered_temp_files = 0;
+    uint64_t statetree_durable_ignored_corrupt_files = 0;
+    uint64_t statetree_durable_runtime_integrity_failures = 0;
+    uint64_t statetree_durable_orphaned_disk_bytes = 0;
+    uint64_t statetree_durable_io_pending = 0;
+    uint64_t statetree_durable_io_queue_high_water = 0;
+    uint64_t statetree_durable_io_completed_total = 0;
+    uint64_t statetree_durable_io_cancelled_loads_total = 0;
+    uint64_t statetree_durable_io_reserved_disk_bytes = 0;
+    uint64_t statetree_durable_io_reserved_disk_high_water = 0;
+    uint64_t statetree_durable_io_reserved_load_bytes = 0;
+    uint64_t statetree_durable_io_reserved_load_high_water = 0;
+    uint64_t statetree_durable_manifest_refs = 0;
+    uint64_t statetree_durable_manifest_revision = 0;
+    uint64_t statetree_durable_manifest_file_bytes = 0;
+    uint64_t statetree_durable_manifest_budget_bytes = 0;
+    uint64_t statetree_durable_manifest_high_water_bytes = 0;
+    uint64_t statetree_durable_manifest_record_count = 0;
+    uint64_t statetree_durable_manifest_recovered_temp_files = 0;
+    uint64_t statetree_durable_manifest_recovered_tail_bytes = 0;
+    uint64_t statetree_durable_manifest_compactions = 0;
+    uint64_t statetree_durable_manifest_recovered_publish_commits = 0;
+    uint64_t statetree_durable_manifest_recovered_publish_aborts = 0;
+    uint64_t statetree_durable_managed_count = 0;
+    uint64_t statetree_durable_cache_evicted_total = 0;
+    uint64_t statetree_durable_cache_reclaimed_bytes_total = 0;
+    uint64_t statetree_durable_managed_recovered_erases = 0;
+    uint64_t statetree_durable_managed_recovered_bytes = 0;
+    uint64_t statetree_durable_retained_total = 0;
+    uint64_t statetree_durable_released_total = 0;
+    uint64_t statetree_durable_compacted_total = 0;
+    int      n_statetree_families               = 0;
+    int      n_statetree_active_families        = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
@@ -557,30 +653,126 @@ struct server_task_result_slot_save_load : server_task_result {
 };
 
 struct server_task_result_slot_erase : server_task_result {
+    int64_t state_id;
+    int64_t node_id;
+    int64_t parent_node_id;
+    int64_t fork_id;
     size_t n_erased;
 
     virtual json to_json() override;
 };
 
 struct server_task_result_slot_fork : server_task_result {
-    int fork_id;
+    int64_t state_id;
+    int64_t node_id;
+    int64_t parent_node_id;
+    int64_t fork_id;
+    json nodes = json::array();
     std::vector<int> destinations;
 
     size_t n_tokens;
     double t_ms;
 
+    bool retention_enabled = false;
+    int64_t lease_remaining_ms = -1;
+    uint64_t state_bytes = 0;
+    uint64_t retained_bytes = 0;
+    uint64_t state_budget_bytes = 0;
+
     virtual json to_json() override;
 };
 
 struct server_task_result_slot_commit : server_task_result {
+    int64_t state_id;
+    int64_t node_id;
+    int64_t parent_node_id;
     int source_id;
-    int fork_id;
+    int64_t fork_id;
+    json nodes = json::array();
     std::vector<int> released;
 
     size_t n_tokens;
     double t_ms;
 
+    bool retention_enabled = false;
+    int64_t lease_remaining_ms = -1;
+    uint64_t state_bytes = 0;
+    uint64_t retained_bytes = 0;
+    uint64_t state_budget_bytes = 0;
+
     virtual json to_json() override;
+};
+
+struct server_task_result_slot_renew : server_task_result {
+    int64_t state_id;
+    int64_t node_id;
+    int64_t parent_node_id;
+    int source_id;
+    int64_t fork_id;
+    json nodes = json::array();
+    std::vector<int> members;
+
+    int64_t lease_remaining_ms;
+    uint64_t state_bytes;
+    uint64_t retained_bytes;
+    uint64_t state_budget_bytes;
+    double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_statetree : server_task_result {
+    json states = json::array();
+    json snapshots = json::array();
+    json journal = json::array();
+    uint64_t snapshot_bytes = 0;
+    uint64_t snapshot_budget_bytes = 0;
+    uint64_t snapshot_high_water_bytes = 0;
+    uint64_t snapshot_content_count = 0;
+    json durable_contents = json::array();
+    json durable_manifest_refs = json::array();
+    json durable_managed_digests = json::array();
+    json durable_logical_heads = json::array();
+    uint64_t durable_disk_bytes = 0;
+    uint64_t durable_disk_budget_bytes = 0;
+    uint64_t durable_disk_high_water_bytes = 0;
+    uint64_t durable_recovered_temp_files = 0;
+    uint64_t durable_ignored_corrupt_files = 0;
+    uint64_t durable_runtime_integrity_failures = 0;
+    uint64_t durable_orphaned_disk_bytes = 0;
+    uint64_t durable_io_pending = 0;
+    uint64_t durable_io_queue_high_water = 0;
+    uint64_t durable_io_completed_total = 0;
+    uint64_t durable_io_cancelled_loads_total = 0;
+    uint64_t durable_io_reserved_disk_bytes = 0;
+    uint64_t durable_io_reserved_disk_high_water = 0;
+    uint64_t durable_io_reserved_load_bytes = 0;
+    uint64_t durable_io_reserved_load_high_water = 0;
+    uint64_t durable_manifest_revision = 0;
+    uint64_t durable_manifest_file_bytes = 0;
+    uint64_t durable_manifest_budget_bytes = 0;
+    uint64_t durable_manifest_high_water_bytes = 0;
+    uint64_t durable_manifest_record_count = 0;
+    uint64_t durable_manifest_recovered_temp_files = 0;
+    uint64_t durable_manifest_recovered_tail_bytes = 0;
+    uint64_t durable_manifest_compactions = 0;
+    uint64_t durable_manifest_recovered_publish_commits = 0;
+    uint64_t durable_manifest_recovered_publish_aborts = 0;
+    uint64_t durable_managed_recovered_erases = 0;
+    uint64_t durable_managed_recovered_bytes = 0;
+    uint64_t journal_capacity = 0;
+    uint64_t journal_oldest_sequence = 0;
+    uint64_t journal_next_sequence = 0;
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_snapshot : server_task_result {
+    json result = json::object();
+
+    virtual json to_json() override {
+        return result;
+    }
 };
 
 struct server_task_result_control : server_task_result {
