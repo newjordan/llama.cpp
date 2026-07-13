@@ -34,6 +34,7 @@ struct probe_args {
     std::vector<named_vector> probe_vectors;
     std::vector<float>        probe_strengths;
     std::vector<char *>       common_argv;
+    bool                      include_residual_vector = false;
     bool                      self_test = false;
 };
 
@@ -103,6 +104,23 @@ static bool capture_residual_norm(ggml_tensor * tensor, bool ask, void * user_da
     capture->rms = std::sqrt(sum_squares / static_cast<double>(capture->dimension));
     capture->captured = true;
     return true;
+}
+
+static json residual_capture_to_json(
+        const residual_norm_capture & capture,
+        size_t                        position,
+        bool                          include_values) {
+    json result = {
+        { "tensor", capture.tensor_name },
+        { "position", position },
+        { "dimension", capture.dimension },
+        { "l2", capture.l2 },
+        { "rms", capture.rms },
+    };
+    if (include_values) {
+        result["values"] = capture.values;
+    }
+    return result;
 }
 
 static std::string trim(const std::string & value) {
@@ -204,6 +222,10 @@ static probe_args preprocess_args(int argc, char ** argv) {
             result.self_test = true;
             continue;
         }
+        if (arg == "--include-residual-vector") {
+            result.include_residual_vector = true;
+            continue;
+        }
 
         if (arg == "--token-ids") {
             if (++i >= argc) {
@@ -285,6 +307,8 @@ static void print_usage(int, char ** argv) {
     std::printf("                           named control vector to sweep; may be repeated\n");
     std::printf("  --probe-strengths S,S,...\n");
     std::printf("                           shared finite strengths for every probe vector\n");
+    std::printf("  --include-residual-vector\n");
+    std::printf("                           include the final post-block residual values in JSON\n");
     std::printf("  --self-test            run the model-independent deterministic smoke test\n\n");
 }
 
@@ -308,6 +332,20 @@ static int run_self_test() {
     const auto vector = parse_named_vector("joy=/tmp/joy.gguf");
     if (vector.name != "joy" || vector.path != "/tmp/joy.gguf") {
         throw std::runtime_error("named vector parser self-test failed");
+    }
+
+    residual_norm_capture residual;
+    residual.tensor_name = "l_out-39";
+    residual.values = { 1.0f, -2.0f };
+    residual.dimension = 2;
+    residual.l2 = std::sqrt(5.0);
+    residual.rms = std::sqrt(2.5);
+    residual.captured = true;
+    const json norm_only = residual_capture_to_json(residual, 7, false);
+    const json with_values = residual_capture_to_json(residual, 7, true);
+    if (norm_only.contains("values") || !with_values.contains("values") ||
+            with_values.at("values") != json({ 1.0f, -2.0f })) {
+        throw std::runtime_error("residual-vector JSON self-test failed");
     }
 
     json output = {
@@ -395,7 +433,8 @@ static json evaluate_prompt(
         const llama_vocab *                vocab,
         const std::vector<llama_token> &   prompt_tokens,
         const std::vector<llama_token> &   requested_ids,
-        residual_norm_capture &            residual_capture) {
+        residual_norm_capture &            residual_capture,
+        bool                               include_residual_vector) {
     // Qwen3.6 is hybrid recurrent/attention. Clearing data, not only metadata,
     // resets both its KV cache and recurrent/GDN state between paired doses.
     llama_synchronize(ctx);
@@ -435,13 +474,8 @@ static json evaluate_prompt(
 
     json result;
     result["logsumexp"] = log_z;
-    result["residual"] = {
-        { "tensor", residual_capture.tensor_name },
-        { "position", prompt_tokens.size() - 1 },
-        { "dimension", residual_capture.dimension },
-        { "l2", residual_capture.l2 },
-        { "rms", residual_capture.rms },
-    };
+    result["residual"] = residual_capture_to_json(
+            residual_capture, prompt_tokens.size() - 1, include_residual_vector);
     result["tokens"] = json::array();
     for (llama_token id : requested_ids) {
         const double logit = logits[id];
@@ -565,7 +599,8 @@ static int run_probe(common_params & params, const probe_args & probe) {
         }
     }
     apply_control_vector(ctx, base_cvec_ptr, layer_start, layer_end, cvec_full_size);
-    const json baseline = evaluate_prompt(ctx, vocab, prompt_tokens, requested_ids, residual_capture);
+    const json baseline = evaluate_prompt(
+            ctx, vocab, prompt_tokens, requested_ids, residual_capture, probe.include_residual_vector);
 
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
@@ -625,7 +660,8 @@ static int run_probe(common_params & params, const probe_args & probe) {
                 const auto composed = compose_control_vectors(
                         base_cvec_ptr, loaded.data, strength, cvec_full_size);
                 apply_control_vector(ctx, &composed, layer_start, layer_end, cvec_full_size);
-                result = evaluate_prompt(ctx, vocab, prompt_tokens, requested_ids, residual_capture);
+                result = evaluate_prompt(
+                        ctx, vocab, prompt_tokens, requested_ids, residual_capture, probe.include_residual_vector);
             }
 
             json run = {

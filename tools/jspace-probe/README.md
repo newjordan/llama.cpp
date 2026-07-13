@@ -19,6 +19,7 @@ normal control-vector loader, including scaled vectors and layer ranges:
   --probe-vector joy=/path/to/joy.gguf \
   --probe-vector sadness=/path/to/sadness.gguf \
   --probe-strengths=-2,-1,0,1,2 \
+  --include-residual-vector \
   --control-vector-layer-range 39 39 \
   > mood-dose-sweep.json
 ```
@@ -39,6 +40,8 @@ Residual collection uses a selective evaluation callback: it transfers only
 the final column of the last `l_out` tensor, rather than retaining complete
 layer activations. Baseline and every nonzero dose include `residual.l2`,
 `residual.rms`, `residual.dimension`, and the exact tensor name in JSON.
+`--include-residual-vector` additionally emits that exact column under
+`residual.values`; it is omitted by default to keep ordinary sweep JSON compact.
 
 A failed or incompatible control vector makes the command fail instead of
 returning an unsteered result.
