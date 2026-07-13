@@ -19,6 +19,7 @@ normal control-vector loader, including scaled vectors and layer ranges:
   --probe-vector joy=/path/to/joy.gguf \
   --probe-vector sadness=/path/to/sadness.gguf \
   --probe-strengths=-2,-1,0,1,2 \
+  --fibonacci-pool-max 144 \
   --include-residual-vector \
   --control-vector-layer-range 39 39 \
   > mood-dose-sweep.json
@@ -36,12 +37,60 @@ data, resetting Qwen3.6 KV and recurrent/GDN state. Standard
 `--control-vector-scaled FILE:SCALE,...` vectors remain supported and form the
 base intervention for the baseline and every sweep run.
 
-Residual collection uses a selective evaluation callback: it transfers only
-the final column of the last `l_out` tensor, rather than retaining complete
-layer activations. Baseline and every nonzero dose include `residual.l2`,
-`residual.rms`, `residual.dimension`, and the exact tensor name in JSON.
+Residual collection uses a selective evaluation callback. By default it
+transfers only the final column of the last `l_out` tensor. Fibonacci pooling
+retains only its largest complete suffix, capped at 144 columns (1.125 MiB for
+Qwen3.6), rather than retaining complete layer activations. Baseline and every
+nonzero dose include `residual.l2`, `residual.rms`, `residual.dimension`, and
+the exact tensor name in JSON.
 `--include-residual-vector` additionally emits that exact column under
 `residual.values`; it is omitted by default to keep ordinary sweep JSON compact.
+
+`--fibonacci-pool-max N` adds an opt-in offline causal suffix extractor over the
+post-final-block residual columns. `N` is capped at 144 tokens. The probe emits
+complete uniform suffix means at the unique horizons
+`1, 2, 3, 5, 8, 13, ... <= min(N, prompt_tokens)`. The Fibonacci values choose
+only the horizon schedule; they are not used as mystical coordinate weights.
+Each row is nonnegative, causal, and sums to one, so constants and linear
+coordinate closure are preserved. The evaluator itself accepts any strictly
+increasing suffix-horizon schedule; Fibonacci is a separate generator, so
+logarithmic and linear controls can reuse identical pooling arithmetic.
+
+The sparse matrix row for horizon `h` has weight `1/h` on the final `h` prompt
+columns and zero elsewhere. The JSON matrix shape covers the full tokenized
+prompt domain; `retained_suffix` separately records the bounded residual buffer
+and its global prompt-position offset. Writing `u_k` for the unnormalized
+suffix sum (the reported mean is `u_k/F_k`), its non-overlapping Fibonacci
+factorization is:
+
+```text
+u_k(t) = u_(k-1)(t) + u_(k-2)(t - F_(k-1)),
+F_k    = F_(k-1) + F_(k-2).
+```
+
+The delay in the second term is required; combining two overlapping suffix
+means at the same position would double-count recent tokens. A streaming
+Phase-1 controller can later use the equivalent sliding update
+`u_h(t) = u_h(t-1) + x_t - x_(t-h)` with one ring buffer per logical sequence.
+That per-sequence streaming state is not implemented by this diagnostic probe.
+
+Pooling JSON records its sparse support, prompt positions, L2/RMS, token-domain
+semantics, and exact column accounting. With `--include-residual-vector`, every
+pooled row also includes its 2048 values; otherwise only compact diagnostics are
+serialized. Horizon one is checked for exact equality with the existing final
+residual. Multi-batch or future graph changes that expose a different number of
+columns fail closed instead of silently returning a misaligned pool.
+
+This is an observer candidate, not evidence that Fibonacci spacing is better.
+The required falsification compares equal feature counts and tuning budgets;
+boxcar controls also match maximum support, while EMA controls match mean age
+and effective sample size. If those tie, the honest result is only that causal
+multiscale pooling helps.
+
+The broader sensor/actuator/controller design and frozen evidence boundary are
+documented in [`docs/treebeard-jspace-steering.md`](../../docs/treebeard-jspace-steering.md).
+The exact-Qwen3.6 multi-batch pooling smoke is recorded in
+[`reports/treebeard-jspace-fibonacci-smoke-20260713.md`](../../reports/treebeard-jspace-fibonacci-smoke-20260713.md).
 
 The baseline full-vocabulary logits stay in-process (about 1 MiB for Qwen3.6)
 and are not serialized. Each sweep run reports full-vocabulary

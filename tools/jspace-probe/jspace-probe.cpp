@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "fibonacci-pool.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
@@ -35,20 +36,28 @@ struct probe_args {
     std::vector<float>        probe_strengths;
     std::vector<char *>       common_argv;
     bool                      include_residual_vector = false;
+    size_t                    fibonacci_pool_max_tokens = 0;
     bool                      self_test = false;
 };
 
 struct residual_norm_capture {
-    std::string        tensor_name;
-    std::vector<float> values;
-    std::string        error;
-    double             l2        = 0.0;
-    double             rms       = 0.0;
-    int64_t            dimension = 0;
-    bool               captured  = false;
+    std::string                     tensor_name;
+    std::vector<float>              values;
+    std::vector<std::vector<float>> recent_columns;
+    std::string                     error;
+    size_t                          max_columns = 0;
+    size_t                          expected_columns = 0;
+    size_t                          columns_seen = 0;
+    double                          l2        = 0.0;
+    double                          rms       = 0.0;
+    int64_t                         dimension = 0;
+    bool                            captured  = false;
 
     void reset() {
+        values.clear();
+        recent_columns.clear();
         error.clear();
+        columns_seen = 0;
         l2 = 0.0;
         rms = 0.0;
         dimension = 0;
@@ -74,28 +83,55 @@ static bool capture_residual_norm(ggml_tensor * tensor, bool ask, void * user_da
         return true;
     }
     if (tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
-            tensor->nb[0] != sizeof(float)) {
+            tensor->nb[0] != sizeof(float) ||
+            tensor->nb[1] < static_cast<size_t>(tensor->ne[0]) * sizeof(float)) {
         capture->error = "residual tensor " + capture->tensor_name + " has an unsupported layout";
         return true;
     }
 
     const size_t width = static_cast<size_t>(tensor->ne[0]);
-    const size_t offset = static_cast<size_t>(tensor->ne[1] - 1) * tensor->nb[1];
     const size_t nbytes = width * sizeof(float);
-    if (offset + nbytes > ggml_nbytes(tensor)) {
-        capture->error = "last column of residual tensor " + capture->tensor_name + " is out of bounds";
-        return true;
-    }
-
-    capture->values.resize(width);
-    ggml_backend_tensor_get(tensor, capture->values.data(), offset, nbytes);
-
-    double sum_squares = 0.0;
-    for (float value : capture->values) {
-        if (!std::isfinite(value)) {
-            capture->error = "residual tensor " + capture->tensor_name + " contains a non-finite value";
+    const size_t column_count = static_cast<size_t>(tensor->ne[1]);
+    const bool pool_enabled = capture->max_columns > 0;
+    for (size_t column = 0; column < column_count; ++column) {
+        const size_t global_column = capture->columns_seen + column;
+        const bool retained_pool_column = pool_enabled &&
+                global_column < capture->expected_columns &&
+                global_column + capture->max_columns >= capture->expected_columns;
+        const bool final_column = pool_enabled ?
+                global_column + 1 == capture->expected_columns :
+                column + 1 == column_count;
+        if (!retained_pool_column && !final_column) {
+            continue;
+        }
+        const size_t offset = column * tensor->nb[1];
+        if (offset + nbytes > ggml_nbytes(tensor)) {
+            capture->error = "column of residual tensor " + capture->tensor_name + " is out of bounds";
             return true;
         }
+
+        std::vector<float> values(width);
+        ggml_backend_tensor_get(tensor, values.data(), offset, nbytes);
+        for (float value : values) {
+            if (!std::isfinite(value)) {
+                capture->error = "residual tensor " + capture->tensor_name + " contains a non-finite value";
+                return true;
+            }
+        }
+        if (final_column) {
+            capture->values = values;
+        }
+        if (retained_pool_column) {
+            capture->recent_columns.push_back(std::move(values));
+        }
+    }
+
+    capture->columns_seen += column_count;
+    if (capture->values.empty()) {
+        return true;
+    }
+    double sum_squares = 0.0;
+    for (float value : capture->values) {
         sum_squares += static_cast<double>(value) * value;
     }
 
@@ -109,7 +145,8 @@ static bool capture_residual_norm(ggml_tensor * tensor, bool ask, void * user_da
 static json residual_capture_to_json(
         const residual_norm_capture & capture,
         size_t                        position,
-        bool                          include_values) {
+        bool                          include_values,
+        size_t                        fibonacci_pool_max_tokens) {
     json result = {
         { "tensor", capture.tensor_name },
         { "position", position },
@@ -119,6 +156,60 @@ static json residual_capture_to_json(
     };
     if (include_values) {
         result["values"] = capture.values;
+    }
+    if (fibonacci_pool_max_tokens > 0) {
+        if (capture.expected_columns < capture.recent_columns.size()) {
+            throw std::logic_error(
+                    "Fibonacci retained suffix exceeds the prompt-token domain");
+        }
+        const size_t retained_start =
+                capture.expected_columns - capture.recent_columns.size();
+        const auto horizons = jspace::fibonacci_horizons_up_to(
+                fibonacci_pool_max_tokens);
+        const auto rows = jspace::suffix_boxcar_pool(
+                capture.recent_columns, horizons);
+        json row_records = json::array();
+        for (const auto & row : rows) {
+            json record = {
+                { "horizon_tokens", row.horizon },
+                { "start_position", position + 1 - row.horizon },
+                { "end_position_exclusive", position + 1 },
+                { "dimension", capture.dimension },
+                { "matrix_weight", 1.0 / static_cast<double>(row.horizon) },
+                { "l2", row.l2 },
+                { "rms", row.rms },
+            };
+            if (include_values) {
+                record["values"] = row.values;
+            }
+            row_records.push_back(std::move(record));
+        }
+        result["fibonacci_pool"] = {
+            { "status", "diagnostic_observer_candidate_only" },
+            { "algorithm", "nested_uniform_suffix_mean_v1" },
+            { "basis", "causal row-stochastic boxcars at Fibonacci horizons" },
+            { "seed_lengths", { 1, 2 } },
+            { "requested_max_tokens", fibonacci_pool_max_tokens },
+            { "available_prompt_tokens", capture.expected_columns },
+            { "largest_horizon_tokens", rows.empty() ? 0 : rows.back().horizon },
+            { "captured_columns", capture.recent_columns.size() },
+            { "retained_bytes", capture.recent_columns.size() *
+                    static_cast<size_t>(capture.dimension) * sizeof(float) },
+            { "columns_seen", capture.columns_seen },
+            { "token_domain", "tokenized prompt including added special tokens" },
+            { "matrix", {
+                { "shape", { rows.size(), capture.expected_columns } },
+                { "storage", "sparse_suffix_boxcar" },
+                { "column_basis", "zero_based_prompt_token" },
+                { "row_sum", 1.0 },
+            } },
+            { "retained_suffix", {
+                { "shape", { capture.recent_columns.size(), capture.dimension } },
+                { "start_position", retained_start },
+                { "end_position_exclusive", capture.expected_columns },
+            } },
+            { "rows", std::move(row_records) },
+        };
     }
     return result;
 }
@@ -190,6 +281,19 @@ static std::vector<float> parse_strength_list(const std::string & value) {
     return result;
 }
 
+static size_t parse_fibonacci_pool_max_tokens(const std::string & value) {
+    const std::string item = trim(value);
+    errno = 0;
+    char * parse_end = nullptr;
+    const unsigned long long parsed = std::strtoull(item.c_str(), &parse_end, 10);
+    if (item.empty() || errno == ERANGE || parse_end == item.c_str() || *parse_end != '\0' ||
+            parsed == 0 || parsed > 144) {
+        throw std::invalid_argument(
+                "--fibonacci-pool-max must be an integer from 1 through 144");
+    }
+    return static_cast<size_t>(parsed);
+}
+
 static probe_args::named_vector parse_named_vector(const std::string & value) {
     const size_t separator = value.find('=');
     if (separator == std::string::npos) {
@@ -214,6 +318,7 @@ static probe_args preprocess_args(int argc, char ** argv) {
     constexpr const char * token_prefix = "--token-ids=";
     constexpr const char * vector_prefix = "--probe-vector=";
     constexpr const char * strength_prefix = "--probe-strengths=";
+    constexpr const char * fibonacci_prefix = "--fibonacci-pool-max=";
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
@@ -224,6 +329,18 @@ static probe_args preprocess_args(int argc, char ** argv) {
         }
         if (arg == "--include-residual-vector") {
             result.include_residual_vector = true;
+            continue;
+        }
+        if (arg == "--fibonacci-pool-max") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--fibonacci-pool-max requires an integer value");
+            }
+            result.fibonacci_pool_max_tokens = parse_fibonacci_pool_max_tokens(argv[i]);
+            continue;
+        }
+        if (arg.compare(0, std::strlen(fibonacci_prefix), fibonacci_prefix) == 0) {
+            result.fibonacci_pool_max_tokens = parse_fibonacci_pool_max_tokens(
+                    arg.substr(std::strlen(fibonacci_prefix)));
             continue;
         }
 
@@ -387,6 +504,8 @@ static void print_usage(int, char ** argv) {
     std::printf("                           shared finite strengths for every probe vector\n");
     std::printf("  --include-residual-vector\n");
     std::printf("                           include the final post-block residual values in JSON\n");
+    std::printf("  --fibonacci-pool-max N\n");
+    std::printf("                           pool residual columns over 1,2,3,5,... token horizons\n");
     std::printf("  --self-test            run the model-independent deterministic smoke test\n\n");
 }
 
@@ -407,6 +526,18 @@ static int run_self_test() {
     if (strengths != std::vector<float>({ -2.0f, -1.0f, 0.0f, 1.0f, 2.0f })) {
         throw std::runtime_error("strength parser self-test failed");
     }
+    if (parse_fibonacci_pool_max_tokens("144") != 144) {
+        throw std::runtime_error("Fibonacci pool-max parser self-test failed");
+    }
+    bool rejected_bad_pool_max = false;
+    try {
+        (void) parse_fibonacci_pool_max_tokens("145");
+    } catch (const std::invalid_argument &) {
+        rejected_bad_pool_max = true;
+    }
+    if (!rejected_bad_pool_max) {
+        throw std::runtime_error("Fibonacci pool-max bound self-test failed");
+    }
     const auto vector = parse_named_vector("joy=/tmp/joy.gguf");
     if (vector.name != "joy" || vector.path != "/tmp/joy.gguf") {
         throw std::runtime_error("named vector parser self-test failed");
@@ -419,11 +550,90 @@ static int run_self_test() {
     residual.l2 = std::sqrt(5.0);
     residual.rms = std::sqrt(2.5);
     residual.captured = true;
-    const json norm_only = residual_capture_to_json(residual, 7, false);
-    const json with_values = residual_capture_to_json(residual, 7, true);
+    const json norm_only = residual_capture_to_json(residual, 7, false, 0);
+    const json with_values = residual_capture_to_json(residual, 7, true, 0);
     if (norm_only.contains("values") || !with_values.contains("values") ||
             with_values.at("values") != json({ 1.0f, -2.0f })) {
         throw std::runtime_error("residual-vector JSON self-test failed");
+    }
+    residual.recent_columns = { { 3.0f, 2.0f }, residual.values };
+    residual.max_columns = 2;
+    residual.expected_columns = 5;
+    residual.columns_seen = 5;
+    const json pool_norm_only = residual_capture_to_json(residual, 4, false, 2);
+    const json pool_with_values = residual_capture_to_json(residual, 4, true, 2);
+    const auto & pool_rows = pool_norm_only.at("fibonacci_pool").at("rows");
+    const auto & pool_value_rows = pool_with_values.at("fibonacci_pool").at("rows");
+    if (pool_rows.size() != 2 || pool_rows[0].contains("values") ||
+            !pool_value_rows[0].contains("values") ||
+            pool_value_rows[0].at("values") != with_values.at("values") ||
+            pool_norm_only.at("fibonacci_pool").at("matrix").at("shape") !=
+                    json({ 2, 5 }) ||
+            pool_norm_only.at("fibonacci_pool").at("retained_suffix").at("shape") !=
+                    json({ 2, 2 }) ||
+            pool_norm_only.at("fibonacci_pool").at("retained_suffix").at("start_position") != 3 ||
+            pool_rows[0].at("start_position") != 4 ||
+            pool_rows[1].at("start_position") != 3) {
+        throw std::runtime_error("Fibonacci pooling JSON/vector-gating self-test failed");
+    }
+
+    const auto horizons = jspace::fibonacci_horizons(6);
+    if (horizons != std::vector<size_t>({ 1, 2, 3, 5, 8, 13 })) {
+        throw std::runtime_error("Fibonacci horizon self-test failed");
+    }
+    if (jspace::fibonacci_horizons_up_to(10) !=
+            std::vector<size_t>({ 1, 2, 3, 5, 8 })) {
+        throw std::runtime_error("bounded Fibonacci horizon self-test failed");
+    }
+    std::vector<std::vector<float>> pool_columns;
+    for (int value = 1; value <= 8; ++value) {
+        pool_columns.push_back({ static_cast<float>(value), 2.0f });
+    }
+    const auto pooled = jspace::fibonacci_suffix_pool(pool_columns, 5);
+    const std::vector<double> expected_means = { 8.0, 7.5, 7.0, 6.0, 4.5 };
+    if (pooled.size() != expected_means.size()) {
+        throw std::runtime_error("Fibonacci pooling row-count self-test failed");
+    }
+    for (size_t i = 0; i < pooled.size(); ++i) {
+        if (std::abs(pooled[i].values[0] - expected_means[i]) > 1e-6 ||
+                std::abs(pooled[i].values[1] - 2.0f) > 1e-6) {
+            throw std::runtime_error("Fibonacci pooling mean/constant-preservation self-test failed");
+        }
+    }
+    // At t=7, the five-sample suffix sum [4,5,6,7,8] factors into
+    // the newest three [6,7,8] and the delayed older two [4,5].
+    const double recursive_five =
+            (pooled[2].values[0] * 3.0) + ((4.0 + 5.0));
+    if (std::abs(recursive_five - pooled[3].values[0] * 5.0) > 1e-12) {
+        throw std::runtime_error("delayed Fibonacci block-recursion self-test failed");
+    }
+    const auto comparator_pool = jspace::suffix_boxcar_pool(
+            pool_columns, { 1, 4, 8 });
+    if (comparator_pool.size() != 3 ||
+            std::abs(comparator_pool[0].values[0] - 8.0f) > 1e-6 ||
+            std::abs(comparator_pool[1].values[0] - 6.5f) > 1e-6 ||
+            std::abs(comparator_pool[2].values[0] - 4.5f) > 1e-6) {
+        throw std::runtime_error("generic suffix-boxcar self-test failed");
+    }
+    bool rejected_bad_horizons = false;
+    try {
+        (void) jspace::suffix_boxcar_pool(pool_columns, { 1, 3, 3 });
+    } catch (const std::invalid_argument &) {
+        rejected_bad_horizons = true;
+    }
+    if (!rejected_bad_horizons) {
+        throw std::runtime_error("suffix-boxcar horizon-validation self-test failed");
+    }
+    auto nonfinite_columns = pool_columns;
+    nonfinite_columns.back()[0] = std::numeric_limits<float>::quiet_NaN();
+    bool rejected_nonfinite_pool = false;
+    try {
+        (void) jspace::fibonacci_suffix_pool(nonfinite_columns, 5);
+    } catch (const std::invalid_argument &) {
+        rejected_nonfinite_pool = true;
+    }
+    if (!rejected_nonfinite_pool) {
+        throw std::runtime_error("non-finite Fibonacci input self-test failed");
     }
 
     const std::vector<float> distribution_a = {
@@ -539,7 +749,8 @@ static evaluation_result evaluate_prompt(
         const std::vector<llama_token> &   prompt_tokens,
         const std::vector<llama_token> &   requested_ids,
         residual_norm_capture &            residual_capture,
-        bool                               include_residual_vector) {
+        bool                               include_residual_vector,
+        size_t                             fibonacci_pool_max_tokens) {
     // Qwen3.6 is hybrid recurrent/attention. Clearing data, not only metadata,
     // resets both its KV cache and recurrent/GDN state between paired doses.
     llama_synchronize(ctx);
@@ -576,13 +787,38 @@ static evaluation_result evaluate_prompt(
     if (!residual_capture.captured) {
         throw std::runtime_error("evaluation did not expose residual tensor " + residual_capture.tensor_name);
     }
+    if (fibonacci_pool_max_tokens > 0) {
+        if (residual_capture.columns_seen != prompt_tokens.size()) {
+            throw std::runtime_error(
+                    "Fibonacci pooling saw " + std::to_string(residual_capture.columns_seen) +
+                    " residual columns for a " + std::to_string(prompt_tokens.size()) +
+                    "-token prompt");
+        }
+        if (residual_capture.recent_columns.size() != residual_capture.max_columns) {
+            throw std::runtime_error(
+                    "Fibonacci pooling retained an unexpected number of residual columns");
+        }
+        const auto pooled = jspace::suffix_boxcar_pool(
+                residual_capture.recent_columns,
+                jspace::fibonacci_horizons_up_to(fibonacci_pool_max_tokens));
+        if (pooled.empty() || pooled.front().horizon != 1 ||
+                pooled.front().values != residual_capture.values ||
+                pooled.front().l2 != residual_capture.l2 ||
+                pooled.front().rms != residual_capture.rms) {
+            throw std::runtime_error(
+                    "Fibonacci horizon-one pool does not exactly match the final residual");
+        }
+    }
 
     evaluation_result result;
     result.log_z = log_z;
     result.logits.assign(logits, logits + n_vocab);
     result.output["logsumexp"] = log_z;
     result.output["residual"] = residual_capture_to_json(
-            residual_capture, prompt_tokens.size() - 1, include_residual_vector);
+            residual_capture,
+            prompt_tokens.size() - 1,
+            include_residual_vector,
+            fibonacci_pool_max_tokens);
     result.output["tokens"] = json::array();
     for (llama_token id : requested_ids) {
         const double logit = logits[id];
@@ -651,6 +887,12 @@ static int run_probe(common_params & params, const probe_args & probe) {
     if (n_batch == 0) {
         throw std::runtime_error("context reports a zero logical batch size");
     }
+    if (probe.fibonacci_pool_max_tokens > 0) {
+        const auto horizons = jspace::fibonacci_horizons_up_to(
+                std::min(prompt_tokens.size(), probe.fibonacci_pool_max_tokens));
+        residual_capture.expected_columns = prompt_tokens.size();
+        residual_capture.max_columns = horizons.back();
+    }
 
     const bool has_any_control = !control_vectors.empty() || !probe.probe_vectors.empty();
     int32_t layer_start = params.control_vector_layer_start;
@@ -707,7 +949,13 @@ static int run_probe(common_params & params, const probe_args & probe) {
     }
     apply_control_vector(ctx, base_cvec_ptr, layer_start, layer_end, cvec_full_size);
     const evaluation_result baseline = evaluate_prompt(
-            ctx, vocab, prompt_tokens, requested_ids, residual_capture, probe.include_residual_vector);
+            ctx,
+            vocab,
+            prompt_tokens,
+            requested_ids,
+            residual_capture,
+            probe.include_residual_vector,
+            probe.fibonacci_pool_max_tokens);
 
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
@@ -735,6 +983,16 @@ static int run_probe(common_params & params, const probe_args & probe) {
         { "residual_tensor", residual_capture.tensor_name },
         { "state_reset", "llama_memory_clear(data=true) before every evaluation" },
     };
+    if (probe.fibonacci_pool_max_tokens > 0) {
+        output["probe"]["fibonacci_pool"] = {
+            { "requested_max_tokens", probe.fibonacci_pool_max_tokens },
+            { "requested_horizons", jspace::fibonacci_horizons_up_to(
+                    probe.fibonacci_pool_max_tokens) },
+            { "emitted_horizons", jspace::fibonacci_horizons_up_to(
+                    std::min(prompt_tokens.size(), probe.fibonacci_pool_max_tokens)) },
+            { "domain", "post-final-block residual columns" },
+        };
+    }
 
     json vectors = json::array();
     for (const auto & info : control_vectors) {
@@ -769,7 +1027,13 @@ static int run_probe(common_params & params, const probe_args & probe) {
                         base_cvec_ptr, loaded.data, strength, cvec_full_size);
                 apply_control_vector(ctx, &composed, layer_start, layer_end, cvec_full_size);
                 auto result = evaluate_prompt(
-                        ctx, vocab, prompt_tokens, requested_ids, residual_capture, probe.include_residual_vector);
+                        ctx,
+                        vocab,
+                        prompt_tokens,
+                        requested_ids,
+                        residual_capture,
+                        probe.include_residual_vector,
+                        probe.fibonacci_pool_max_tokens);
                 divergence = distribution_divergence(
                         baseline.logits, baseline.log_z, result.logits, result.log_z);
                 result_json = std::move(result.output);
