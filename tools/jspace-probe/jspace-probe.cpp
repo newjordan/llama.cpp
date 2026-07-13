@@ -298,6 +298,84 @@ static double logits_logsumexp(const float * logits, size_t count) {
     return max_logit + std::log(sum);
 }
 
+struct divergence_metrics {
+    double kl_base_to_run = 0.0;
+    double kl_run_to_base = 0.0;
+    double jensen_shannon = 0.0;
+};
+
+static double logaddexp(double lhs, double rhs) {
+    if (!std::isfinite(lhs)) {
+        return rhs;
+    }
+    if (!std::isfinite(rhs)) {
+        return lhs;
+    }
+    const double maximum = std::max(lhs, rhs);
+    return maximum + std::log(std::exp(lhs - maximum) + std::exp(rhs - maximum));
+}
+
+static divergence_metrics distribution_divergence(
+        const std::vector<float> & baseline_logits,
+        double                     baseline_log_z,
+        const std::vector<float> & run_logits,
+        double                     run_log_z) {
+    if (baseline_logits.size() != run_logits.size()) {
+        throw std::runtime_error("cannot compare logit distributions with different vocabulary sizes");
+    }
+
+    divergence_metrics result;
+    constexpr double log_two = 0.693147180559945309417232121458176568;
+
+    for (size_t i = 0; i < baseline_logits.size(); ++i) {
+        const double log_p = std::isfinite(baseline_logits[i]) ? baseline_logits[i] - baseline_log_z :
+                -std::numeric_limits<double>::infinity();
+        const double log_q = std::isfinite(run_logits[i]) ? run_logits[i] - run_log_z :
+                -std::numeric_limits<double>::infinity();
+        const double p = std::isfinite(log_p) ? std::exp(log_p) : 0.0;
+        const double q = std::isfinite(log_q) ? std::exp(log_q) : 0.0;
+
+        if (p > 0.0) {
+            result.kl_base_to_run += std::isfinite(log_q) ? p * (log_p - log_q) :
+                    std::numeric_limits<double>::infinity();
+        }
+        if (q > 0.0) {
+            result.kl_run_to_base += std::isfinite(log_p) ? q * (log_q - log_p) :
+                    std::numeric_limits<double>::infinity();
+        }
+        if (p > 0.0 || q > 0.0) {
+            const double log_m = logaddexp(log_p, log_q) - log_two;
+            if (p > 0.0) {
+                result.jensen_shannon += 0.5 * p * (log_p - log_m);
+            }
+            if (q > 0.0) {
+                result.jensen_shannon += 0.5 * q * (log_q - log_m);
+            }
+        }
+    }
+
+    if (std::isfinite(result.kl_base_to_run)) {
+        result.kl_base_to_run = std::max(0.0, result.kl_base_to_run);
+    }
+    if (std::isfinite(result.kl_run_to_base)) {
+        result.kl_run_to_base = std::max(0.0, result.kl_run_to_base);
+    }
+    result.jensen_shannon = std::max(0.0, result.jensen_shannon);
+    return result;
+}
+
+static json divergence_to_json(const divergence_metrics & metrics) {
+    auto finite_number = [](double value) -> json {
+        return std::isfinite(value) ? json(value) : json(nullptr);
+    };
+    return {
+        { "units", "nats" },
+        { "kl_base_to_run", finite_number(metrics.kl_base_to_run) },
+        { "kl_run_to_base", finite_number(metrics.kl_run_to_base) },
+        { "jensen_shannon", finite_number(metrics.jensen_shannon) },
+    };
+}
+
 static void print_usage(int, char ** argv) {
     std::printf("\nJ-Space causal logit probe:\n");
     std::printf("\n  %s -m model.gguf -p PROMPT --token-ids ID,ID,... [common options]\n", argv[0]);
@@ -346,6 +424,27 @@ static int run_self_test() {
     if (norm_only.contains("values") || !with_values.contains("values") ||
             with_values.at("values") != json({ 1.0f, -2.0f })) {
         throw std::runtime_error("residual-vector JSON self-test failed");
+    }
+
+    const std::vector<float> distribution_a = {
+        static_cast<float>(std::log(0.8)),
+        static_cast<float>(std::log(0.2)),
+    };
+    const std::vector<float> distribution_b = {
+        static_cast<float>(std::log(0.5)),
+        static_cast<float>(std::log(0.5)),
+    };
+    const auto same_divergence = distribution_divergence(distribution_a, 0.0, distribution_a, 0.0);
+    const auto forward_divergence = distribution_divergence(distribution_a, 0.0, distribution_b, 0.0);
+    const auto reverse_divergence = distribution_divergence(distribution_b, 0.0, distribution_a, 0.0);
+    if (same_divergence.kl_base_to_run > 1e-12 || same_divergence.kl_run_to_base > 1e-12 ||
+            same_divergence.jensen_shannon > 1e-12 ||
+            std::abs(forward_divergence.kl_base_to_run - reverse_divergence.kl_run_to_base) > 1e-12 ||
+            std::abs(forward_divergence.kl_run_to_base - reverse_divergence.kl_base_to_run) > 1e-12 ||
+            std::abs(forward_divergence.kl_base_to_run - 0.1927447570217575) > 1e-7 ||
+            std::abs(forward_divergence.kl_run_to_base - 0.2231435513142097) > 1e-7 ||
+            std::abs(forward_divergence.jensen_shannon - 0.0506718369855659) > 1e-7) {
+        throw std::runtime_error("distribution-divergence self-test failed");
     }
 
     json output = {
@@ -428,7 +527,13 @@ static common_control_vector_data compose_control_vectors(
     return result;
 }
 
-static json evaluate_prompt(
+struct evaluation_result {
+    json               output;
+    std::vector<float> logits;
+    double             log_z = 0.0;
+};
+
+static evaluation_result evaluate_prompt(
         llama_context *                    ctx,
         const llama_vocab *                vocab,
         const std::vector<llama_token> &   prompt_tokens,
@@ -472,11 +577,13 @@ static json evaluate_prompt(
         throw std::runtime_error("evaluation did not expose residual tensor " + residual_capture.tensor_name);
     }
 
-    json result;
-    result["logsumexp"] = log_z;
-    result["residual"] = residual_capture_to_json(
+    evaluation_result result;
+    result.log_z = log_z;
+    result.logits.assign(logits, logits + n_vocab);
+    result.output["logsumexp"] = log_z;
+    result.output["residual"] = residual_capture_to_json(
             residual_capture, prompt_tokens.size() - 1, include_residual_vector);
-    result["tokens"] = json::array();
+    result.output["tokens"] = json::array();
     for (llama_token id : requested_ids) {
         const double logit = logits[id];
         json item = {
@@ -490,7 +597,7 @@ static json evaluate_prompt(
             item["logit"] = nullptr;
             item["logprob"] = nullptr;
         }
-        result["tokens"].push_back(std::move(item));
+        result.output["tokens"].push_back(std::move(item));
     }
     return result;
 }
@@ -599,7 +706,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
         }
     }
     apply_control_vector(ctx, base_cvec_ptr, layer_start, layer_end, cvec_full_size);
-    const json baseline = evaluate_prompt(
+    const evaluation_result baseline = evaluate_prompt(
             ctx, vocab, prompt_tokens, requested_ids, residual_capture, probe.include_residual_vector);
 
     char description[512] = {};
@@ -641,7 +748,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
         { "layer_start", has_any_control ? json(layer_start) : json(nullptr) },
         { "layer_end", has_any_control ? json(layer_end) : json(nullptr) },
     };
-    output["baseline"] = baseline;
+    output["baseline"] = baseline.output;
     output["sweeps"] = json::array();
 
     for (const auto & loaded : loaded_vectors) {
@@ -652,24 +759,29 @@ static int run_probe(common_params & params, const probe_args & probe) {
         };
 
         for (float strength : probe.probe_strengths) {
-            json result;
+            json result_json;
+            divergence_metrics divergence;
             bool reused_baseline = strength == 0.0f;
             if (reused_baseline) {
-                result = baseline;
+                result_json = baseline.output;
             } else {
                 const auto composed = compose_control_vectors(
                         base_cvec_ptr, loaded.data, strength, cvec_full_size);
                 apply_control_vector(ctx, &composed, layer_start, layer_end, cvec_full_size);
-                result = evaluate_prompt(
+                auto result = evaluate_prompt(
                         ctx, vocab, prompt_tokens, requested_ids, residual_capture, probe.include_residual_vector);
+                divergence = distribution_divergence(
+                        baseline.logits, baseline.log_z, result.logits, result.log_z);
+                result_json = std::move(result.output);
             }
 
             json run = {
                 { "strength", strength },
                 { "reused_baseline", reused_baseline },
-                { "logsumexp", result.at("logsumexp") },
-                { "residual", result.at("residual") },
-                { "tokens", result.at("tokens") },
+                { "logsumexp", result_json.at("logsumexp") },
+                { "collateral", divergence_to_json(divergence) },
+                { "residual", result_json.at("residual") },
+                { "tokens", result_json.at("tokens") },
             };
             sweep["runs"].push_back(std::move(run));
         }

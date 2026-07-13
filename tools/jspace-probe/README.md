@@ -43,6 +43,11 @@ layer activations. Baseline and every nonzero dose include `residual.l2`,
 `--include-residual-vector` additionally emits that exact column under
 `residual.values`; it is omitted by default to keep ordinary sweep JSON compact.
 
+The baseline full-vocabulary logits stay in-process (about 1 MiB for Qwen3.6)
+and are not serialized. Each sweep run reports full-vocabulary
+`collateral.kl_base_to_run`, `collateral.kl_run_to_base`, and
+`collateral.jensen_shannon` in nats. A zero-dose run reports exact zeros.
+
 A failed or incompatible control vector makes the command fail instead of
 returning an unsteered result.
 
