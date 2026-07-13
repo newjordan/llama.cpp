@@ -132,6 +132,62 @@ static llama_kv_page_probe_stats llama_kv_page_probe_collect(const llama_kv_cell
 // llama_kv_cache
 //
 
+llama_kv_ragged_plan llama_kv_build_ragged_plan(
+        const llama_kv_cells & cells,
+        const std::vector<llama_seq_id> & seqs,
+        uint32_t n_pad) {
+    llama_kv_ragged_plan plan;
+    if (seqs.size() < 2 || cells.size() == 0) {
+        return plan;
+    }
+
+    std::set<llama_seq_id> unique;
+    for (const auto seq : seqs) {
+        if (seq < 0 || seq >= LLAMA_MAX_SEQ || !unique.insert(seq).second) {
+            return plan;
+        }
+    }
+
+    std::vector<std::vector<uint32_t>> rows(seqs.size());
+    for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+
+        uint32_t overlap = 0;
+        for (uint32_t s = 0; s < seqs.size(); ++s) {
+            if (cells.seq_has(i, seqs[s])) {
+                rows[s].push_back(i);
+                ++overlap;
+            }
+        }
+
+        plan.union_rows += overlap > 0;
+        plan.has_shared_prefix |= overlap > 1;
+    }
+
+    uint32_t max_visible = 0;
+    for (const auto & seq_rows : rows) {
+        max_visible = std::max<uint32_t>(max_visible, seq_rows.size());
+    }
+    if (max_visible == 0) {
+        return plan;
+    }
+
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    plan.n_kv = std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(max_visible, n_pad_cur)));
+    plan.dense_n_kv = std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur)));
+    plan.reduces_columns = plan.has_shared_prefix && plan.n_kv < plan.dense_n_kv;
+
+    const uint32_t invalid = std::numeric_limits<uint32_t>::max();
+    plan.rows.assign(seqs.size()*plan.n_kv, invalid);
+    for (uint32_t s = 0; s < rows.size(); ++s) {
+        std::copy(rows[s].begin(), rows[s].end(), plan.rows.begin() + s*plan.n_kv);
+    }
+
+    return plan;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -359,6 +415,29 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // The indexed FATTN ABI used by the ragged StateTree path is currently a
+    // SYCL capability. Keep the automatic path fail-closed on every other
+    // backend and on cache formats that would need a different kernel.
+    tree_ragged_capable = unified && !v_trans && type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16 && !layers.empty();
+    for (const auto & layer : layers) {
+        if (!tree_ragged_capable || !layer.k || !layer.k->buffer || !layer.v || !layer.v->buffer) {
+            tree_ragged_capable = false;
+            break;
+        }
+
+        auto * dev_k = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.k->buffer));
+        auto * dev_v = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layer.v->buffer));
+        const char * name_k = dev_k ? ggml_backend_dev_name(dev_k) : "";
+        const char * name_v = dev_v ? ggml_backend_dev_name(dev_v) : "";
+        if (strncmp(name_k, "SYCL", 4) != 0 || strncmp(name_v, "SYCL", 4) != 0) {
+            tree_ragged_capable = false;
+            break;
+        }
+    }
+    if (tree_ragged_capable) {
+        LLAMA_LOG_INFO("%s: Treebeard sequence-ragged indexed attention available\n", __func__);
     }
 
     {
@@ -857,14 +936,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        auto sinfo_new = find_slot(ubatch, false);
         if (sinfo_new.empty()) {
             success = false;
             break;
         }
-
-        // remember the position that we found
-        res.push_back(sinfo_new);
 
         // store the old state of the cells in the recovery stack
         {
@@ -881,6 +957,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
+
+        // Keep the post-placement attention plan. It includes the rows written
+        // by this ubatch and is rebuilt when the real placement is applied.
+        res.push_back(std::move(sinfo_new));
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1064,12 +1144,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         n_tokens = n_tokens / n_seqs;
     }
 
-    slot_info res = {
-        /*.s0   =*/ LLAMA_MAX_SEQ,
-        /*.s1   =*/ 0,
-        /*.strm =*/ { },
-        /*.idxs =*/ { },
-    };
+    slot_info res;
+    res.s0 = LLAMA_MAX_SEQ;
+    res.s1 = 0;
 
     res.resize(n_seqs);
 
@@ -1182,10 +1259,30 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+    // A unified decode ubatch normally has one token per active sequence. Keep
+    // that exact query order so a later StateTree plan can turn the one
+    // physical stream into aliased per-sequence logical attention streams.
+    if (tree_ragged_capable && n_stream == 1 && ubatch.n_tokens > 1 &&
+            ubatch.n_tokens == ubatch.n_seqs_unq) {
+        std::set<llama_seq_id> unique;
+        bool valid = true;
+        res.attn_seqs.reserve(ubatch.n_tokens);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1 || !unique.insert(ubatch.seq_id[i][0]).second) {
+                valid = false;
+                break;
+            }
+            res.attn_seqs.push_back(ubatch.seq_id[i][0]);
+        }
+        if (!valid) {
+            res.attn_seqs.clear();
+        }
+    }
+
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+void llama_kv_cache::apply_ubatch(slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1261,6 +1358,36 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    build_tree_ragged_plan(sinfo, ubatch);
+}
+
+void llama_kv_cache::build_tree_ragged_plan(slot_info & sinfo, const llama_ubatch & ubatch) const {
+    GGML_UNUSED(ubatch);
+
+    sinfo.tree_ragged_attn = false;
+    sinfo.attn_idxs.clear();
+    sinfo.attn_n_kv = 0;
+    sinfo.attn_union_rows = 0;
+
+    if (!tree_ragged_capable || n_stream != 1 || sinfo.attn_seqs.size() < 2) {
+        return;
+    }
+
+    const auto plan = llama_kv_build_ragged_plan(v_cells[0], sinfo.attn_seqs, n_pad);
+
+    // This path is Treebeard-specific: ordinary unrelated unified-KV traffic
+    // keeps the established dense/batched graph. A shared cell proves that the
+    // active sequences are a copy-on-write fork family. Switch graph shape
+    // only when it also removes physical attention columns.
+    if (!plan.reduces_columns) {
+        return;
+    }
+
+    sinfo.attn_idxs = plan.rows;
+    sinfo.attn_n_kv = plan.n_kv;
+    sinfo.attn_union_rows = plan.union_rows;
+    sinfo.tree_ragged_attn = true;
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -1307,6 +1434,10 @@ bool llama_kv_cache::get_force_indexed_fattn() const {
 }
 
 bool llama_kv_cache::get_attn_is_dense(const slot_info & sinfo) const {
+    if (sinfo.tree_ragged_attn) {
+        return false;
+    }
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
@@ -1318,6 +1449,10 @@ bool llama_kv_cache::get_attn_is_dense(const slot_info & sinfo) const {
     return true;
 }
 
+uint32_t llama_kv_cache::get_n_attn_stream(const slot_info & sinfo) const {
+    return sinfo.tree_ragged_attn ? sinfo.attn_seqs.size() : sinfo.s1 - sinfo.s0 + 1;
+}
+
 ggml_type llama_kv_cache::type_k() const {
     return layers[0].k->type;
 }
@@ -1327,6 +1462,14 @@ ggml_type llama_kv_cache::type_v() const {
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    if (sinfo.tree_ragged_attn) {
+        GGML_ASSERT(sinfo.attn_n_kv > 0);
+        if (page_probe > 0) {
+            page_probe_log("get_n_kv_tree_ragged", &sinfo, sinfo.attn_n_kv);
+        }
+        return sinfo.attn_n_kv;
+    }
+
     if (compact_attn > 0) {
         const uint32_t result = get_n_kv_compact(sinfo);
 
@@ -1357,6 +1500,11 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 uint32_t llama_kv_cache::get_n_kv_compact(const slot_info & sinfo) const {
+    if (sinfo.tree_ragged_attn) {
+        GGML_ASSERT(sinfo.attn_n_kv > 0);
+        return sinfo.attn_n_kv;
+    }
+
     uint32_t result = 0;
 
     const uint32_t n_pad_cur = std::max(n_pad, LLAMA_KV_PAGE_PROBE_SIZE);
@@ -1372,6 +1520,17 @@ uint32_t llama_kv_cache::get_n_kv_compact(const slot_info & sinfo) const {
 
 std::vector<uint32_t> llama_kv_cache::compact_attn_idxs(const slot_info & sinfo, uint32_t n_kv, bool invalid_pad) const {
     const uint32_t invalid = std::numeric_limits<uint32_t>::max();
+
+    if (sinfo.tree_ragged_attn) {
+        GGML_ASSERT(n_kv == sinfo.attn_n_kv);
+        GGML_ASSERT(sinfo.attn_idxs.size() == sinfo.attn_seqs.size()*n_kv);
+
+        auto res = sinfo.attn_idxs;
+        if (!invalid_pad) {
+            std::replace(res.begin(), res.end(), invalid, 0u);
+        }
+        return res;
+    }
 
     std::vector<uint32_t> res(sinfo.n_stream()*n_kv, invalid_pad ? invalid : 0);
 
@@ -1440,6 +1599,10 @@ void llama_kv_cache::page_probe_log(const char * tag, const slot_info * sinfo, i
 
         const auto & cells = v_cells[stream];
         const auto stats = llama_kv_page_probe_collect(cells);
+        const uint32_t dense_n_pad = std::max(n_pad, 256u);
+        const uint32_t dense_n_kv = std::min(
+                stats.size,
+                std::max(dense_n_pad, GGML_PAD(stats.used_max_p1, dense_n_pad)));
 
         uint32_t slot_rows = 0;
         std::set<uint32_t> slot_pages;
@@ -1458,10 +1621,14 @@ void llama_kv_cache::page_probe_log(const char * tag, const slot_info * sinfo, i
         }
 
         LLAMA_LOG_WARN(
-                "%s: kv-page-probe[%s]: stream=%u n_kv=%d size=%u used=%u used_min=%u used_max_p1=%u holes=%u live_pages=%u dense_pages=%u largest_free_run=%u head=%u slot_rows=%u slot_pages=%zu page_size=%u\n",
+                "%s: kv-page-probe[%s]: stream=%u n_kv=%d size=%u used=%u used_min=%u used_max_p1=%u holes=%u live_pages=%u dense_pages=%u largest_free_run=%u head=%u slot_rows=%u slot_pages=%zu page_size=%u tree_ragged=%d attn_streams=%u attn_union_rows=%u dense_n_kv=%u\n",
                 __func__, tag, stream, n_kv, stats.size, stats.used, stats.used_min, stats.used_max_p1,
                 stats.holes_below_used_max, stats.live_pages, stats.dense_pages, stats.largest_free_run,
-                stream < v_heads.size() ? v_heads[stream] : 0, slot_rows, slot_pages.size(), LLAMA_KV_PAGE_PROBE_SIZE);
+                stream < v_heads.size() ? v_heads[stream] : 0, slot_rows, slot_pages.size(), LLAMA_KV_PAGE_PROBE_SIZE,
+                sinfo && sinfo->tree_ragged_attn ? 1 : 0,
+                sinfo ? get_n_attn_stream(*sinfo) : n_stream,
+                sinfo ? sinfo->attn_union_rows : 0,
+                dense_n_kv);
     }
 }
 
@@ -1475,14 +1642,20 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = get_n_attn_stream(sinfo);
+    const size_t stream_stride = ggml_row_size(k->type, n_embd_k_gqa*kv_size);
 
-    return ggml_view_4d(ctx, k,
-            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+    auto * result = ggml_view_4d(ctx, k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, sinfo.tree_ragged_attn ? 1 : ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+            stream_stride,
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+    if (sinfo.tree_ragged_attn) {
+        result->ne[3] = ns;
+        result->nb[3] = 0;
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1496,16 +1669,22 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = get_n_attn_stream(sinfo);
+    const size_t stream_stride = ggml_row_size(v->type, n_embd_v_gqa*kv_size);
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
-        return ggml_view_4d(ctx, v,
-                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
+        auto * result = ggml_view_4d(ctx, v,
+                hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, sinfo.tree_ragged_attn ? 1 : ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
+                stream_stride,                                          // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+        if (sinfo.tree_ragged_attn) {
+            result->ne[3] = ns;
+            result->nb[3] = 0;
+        }
+        return result;
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1518,7 +1697,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::get_k_compact(ggml_context * ctx, int32_t il, ggml_tensor * attn_idxs, const slot_info & sinfo) const {
-    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(compact_attn > 0 || sinfo.tree_ragged_attn);
     GGML_ASSERT(attn_idxs);
     GGML_ASSERT(attn_idxs->type == GGML_TYPE_I32);
 
@@ -1531,7 +1710,7 @@ ggml_tensor * llama_kv_cache::get_k_compact(ggml_context * ctx, int32_t il, ggml
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = get_n_attn_stream(sinfo);
     GGML_ASSERT(attn_idxs->ne[1] == ns);
 
     if (compact_attn > 1) {
@@ -1543,10 +1722,14 @@ ggml_tensor * llama_kv_cache::get_k_compact(ggml_context * ctx, int32_t il, ggml
     }
 
     ggml_tensor * k_view = ggml_view_3d(ctx, k,
-            n_embd_k_gqa, kv_size, ns,
+            n_embd_k_gqa, kv_size, sinfo.tree_ragged_attn ? 1 : ns,
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+    if (sinfo.tree_ragged_attn) {
+        k_view->ne[2] = ns;
+        k_view->nb[2] = 0;
+    }
 
     ggml_tensor * k_rows = ggml_get_rows(ctx, k_view, attn_idxs);
 
@@ -1555,7 +1738,7 @@ ggml_tensor * llama_kv_cache::get_k_compact(ggml_context * ctx, int32_t il, ggml
 }
 
 ggml_tensor * llama_kv_cache::get_v_compact(ggml_context * ctx, int32_t il, ggml_tensor * attn_idxs, const slot_info & sinfo) const {
-    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(compact_attn > 0 || sinfo.tree_ragged_attn);
     GGML_ASSERT(!v_trans);
     GGML_ASSERT(attn_idxs);
     GGML_ASSERT(attn_idxs->type == GGML_TYPE_I32);
@@ -1569,7 +1752,7 @@ ggml_tensor * llama_kv_cache::get_v_compact(ggml_context * ctx, int32_t il, ggml
 
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = get_n_attn_stream(sinfo);
     GGML_ASSERT(attn_idxs->ne[1] == ns);
 
     if (compact_attn > 1) {
@@ -1581,10 +1764,14 @@ ggml_tensor * llama_kv_cache::get_v_compact(ggml_context * ctx, int32_t il, ggml
     }
 
     ggml_tensor * v_view = ggml_view_3d(ctx, v,
-            n_embd_v_gqa, kv_size, ns,
+            n_embd_v_gqa, kv_size, sinfo.tree_ragged_attn ? 1 : ns,
             ggml_row_size(v->type, n_embd_v_gqa),
             ggml_row_size(v->type, n_embd_v_gqa*kv_size),
             ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+    if (sinfo.tree_ragged_attn) {
+        v_view->ne[2] = ns;
+        v_view->nb[2] = 0;
+    }
 
     ggml_tensor * v_rows = ggml_get_rows(ctx, v_view, attn_idxs);
 
@@ -1710,9 +1897,9 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
 }
 
 ggml_tensor * llama_kv_cache::build_input_attn_idxs(ggml_context * ctx, uint32_t n_kv, const slot_info & sinfo) const {
-    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(compact_attn > 0 || sinfo.tree_ragged_attn);
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = get_n_attn_stream(sinfo);
 
     ggml_tensor * attn_idxs = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
     ggml_set_input(attn_idxs);
@@ -1812,13 +1999,13 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_attn_idxs(ggml_tensor * dst, const slot_info & sinfo) const {
-    GGML_ASSERT(compact_attn > 0);
+    GGML_ASSERT(compact_attn > 0 || sinfo.tree_ragged_attn);
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const uint32_t n_kv = dst->ne[0];
     const uint32_t ns   = dst->ne[1];
 
-    GGML_ASSERT(ns == sinfo.s1 - sinfo.s0 + 1);
+    GGML_ASSERT(ns == get_n_attn_stream(sinfo));
 
     const auto idxs = compact_attn_idxs(sinfo, n_kv, false);
 
@@ -2081,7 +2268,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     std::vector<uint32_t> attn_idxs;
     const std::vector<uint32_t> * attn_idxs_ptr = nullptr;
 
-    if (compact_attn > 0) {
+    if (compact_attn > 0 || sinfo.tree_ragged_attn) {
         attn_idxs = compact_attn_idxs(sinfo, n_kv, true);
         attn_idxs_ptr = &attn_idxs;
     }
@@ -2929,11 +3116,11 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
 }
 
 bool llama_kv_cache_context::get_use_compact_attn() const {
-    return kv->get_use_compact_attn();
+    return sinfos[i_cur].tree_ragged_attn || kv->get_use_compact_attn();
 }
 
 bool llama_kv_cache_context::get_use_indexed_fattn() const {
-    return kv->get_use_indexed_fattn();
+    return sinfos[i_cur].tree_ragged_attn || kv->get_use_indexed_fattn();
 }
 
 bool llama_kv_cache_context::get_force_indexed_fattn() const {
@@ -2942,6 +3129,10 @@ bool llama_kv_cache_context::get_force_indexed_fattn() const {
 
 bool llama_kv_cache_context::get_attn_is_dense() const {
     return kv->get_attn_is_dense(sinfos[i_cur]);
+}
+
+uint32_t llama_kv_cache_context::get_n_attn_stream() const {
+    return kv->get_n_attn_stream(sinfos[i_cur]);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

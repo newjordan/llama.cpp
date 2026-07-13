@@ -13,6 +13,22 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+// Host-side plan consumed by Treebeard's sequence-ragged indexed attention.
+// Rows are laid out [sequence][n_kv] and padded with UINT32_MAX.
+struct llama_kv_ragged_plan {
+    std::vector<uint32_t> rows;
+    uint32_t n_kv = 0;
+    uint32_t union_rows = 0;
+    uint32_t dense_n_kv = 0;
+    bool has_shared_prefix = false;
+    bool reduces_columns = false;
+};
+
+llama_kv_ragged_plan llama_kv_build_ragged_plan(
+        const llama_kv_cells & cells,
+        const std::vector<llama_seq_id> & seqs,
+        uint32_t n_pad);
+
 //
 // llama_kv_cache
 //
@@ -41,6 +57,17 @@ public:
 
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
+
+        // Treebeard unified-KV decode can expose one logical attention stream
+        // per sequence while all streams still alias the same physical KV
+        // allocation. The row map is sequence-ragged: shared prefix cells are
+        // present in every applicable stream, while private branch tails are
+        // present only in their owner stream. UINT32_MAX marks padded rows.
+        std::vector<llama_seq_id> attn_seqs;
+        std::vector<uint32_t>     attn_idxs;
+        uint32_t                  attn_n_kv = 0;
+        uint32_t                  attn_union_rows = 0;
+        bool                      tree_ragged_attn = false;
 
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
@@ -161,6 +188,7 @@ public:
     bool get_use_indexed_fattn() const;
     bool get_force_indexed_fattn() const;
     bool get_attn_is_dense(const slot_info & sinfo) const;
+    uint32_t get_n_attn_stream(const slot_info & sinfo) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -197,7 +225,7 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    void apply_ubatch(slot_info & sinfo, const llama_ubatch & ubatch);
 
     //
     // input API
@@ -273,6 +301,11 @@ private:
     // env: LLAMA_KV_INDEXED_FATTN
     int indexed_fattn = 0;
 
+    // True only when the unified f16 KV allocation lives on the SYCL device
+    // that implements indexed flash-attention. This is a capability gate, not
+    // a runtime tuning knob.
+    bool tree_ragged_capable = false;
+
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
@@ -335,6 +368,7 @@ private:
 
     uint32_t get_n_kv_compact(const slot_info & sinfo) const;
     std::vector<uint32_t> compact_attn_idxs(const slot_info & sinfo, uint32_t n_kv, bool invalid_pad) const;
+    void build_tree_ragged_plan(slot_info & sinfo, const llama_ubatch & ubatch) const;
 
     void page_probe_log(const char * tag, const slot_info * sinfo, int32_t n_kv) const;
 };
@@ -386,6 +420,7 @@ public:
     bool get_use_indexed_fattn() const;
     bool get_force_indexed_fattn() const;
     bool get_attn_is_dense() const;
+    uint32_t get_n_attn_stream() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
