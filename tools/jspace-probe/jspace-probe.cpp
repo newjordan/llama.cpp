@@ -1,5 +1,7 @@
 #include "arg.h"
 #include "common.h"
+#include "ggml-backend.h"
+#include "ggml.h"
 #include "llama.h"
 
 #include <nlohmann/json.hpp>
@@ -34,6 +36,74 @@ struct probe_args {
     std::vector<char *>       common_argv;
     bool                      self_test = false;
 };
+
+struct residual_norm_capture {
+    std::string        tensor_name;
+    std::vector<float> values;
+    std::string        error;
+    double             l2        = 0.0;
+    double             rms       = 0.0;
+    int64_t            dimension = 0;
+    bool               captured  = false;
+
+    void reset() {
+        error.clear();
+        l2 = 0.0;
+        rms = 0.0;
+        dimension = 0;
+        captured = false;
+    }
+};
+
+static bool capture_residual_norm(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * capture = static_cast<residual_norm_capture *>(user_data);
+    const bool matches = !capture->tensor_name.empty() &&
+            std::strcmp(tensor->name, capture->tensor_name.c_str()) == 0;
+
+    if (ask) {
+        return matches;
+    }
+    if (!matches) {
+        return true;
+    }
+
+    if (tensor->type != GGML_TYPE_F32) {
+        capture->error = "residual tensor " + capture->tensor_name +
+                " has unsupported type " + ggml_type_name(tensor->type) + " (expected f32)";
+        return true;
+    }
+    if (tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+            tensor->nb[0] != sizeof(float)) {
+        capture->error = "residual tensor " + capture->tensor_name + " has an unsupported layout";
+        return true;
+    }
+
+    const size_t width = static_cast<size_t>(tensor->ne[0]);
+    const size_t offset = static_cast<size_t>(tensor->ne[1] - 1) * tensor->nb[1];
+    const size_t nbytes = width * sizeof(float);
+    if (offset + nbytes > ggml_nbytes(tensor)) {
+        capture->error = "last column of residual tensor " + capture->tensor_name + " is out of bounds";
+        return true;
+    }
+
+    capture->values.resize(width);
+    ggml_backend_tensor_get(tensor, capture->values.data(), offset, nbytes);
+
+    double sum_squares = 0.0;
+    for (float value : capture->values) {
+        if (!std::isfinite(value)) {
+            capture->error = "residual tensor " + capture->tensor_name + " contains a non-finite value";
+            return true;
+        }
+        sum_squares += static_cast<double>(value) * value;
+    }
+
+    capture->dimension = tensor->ne[0];
+    capture->l2 = std::sqrt(sum_squares);
+    capture->rms = std::sqrt(sum_squares / static_cast<double>(capture->dimension));
+    capture->captured = true;
+    return true;
+}
 
 static std::string trim(const std::string & value) {
     const size_t first = value.find_first_not_of(" \t\r\n");
@@ -324,7 +394,8 @@ static json evaluate_prompt(
         llama_context *                    ctx,
         const llama_vocab *                vocab,
         const std::vector<llama_token> &   prompt_tokens,
-        const std::vector<llama_token> &   requested_ids) {
+        const std::vector<llama_token> &   requested_ids,
+        residual_norm_capture &            residual_capture) {
     // Qwen3.6 is hybrid recurrent/attention. Clearing data, not only metadata,
     // resets both its KV cache and recurrent/GDN state between paired doses.
     llama_synchronize(ctx);
@@ -334,6 +405,7 @@ static json evaluate_prompt(
     }
     llama_memory_clear(memory, true);
     llama_perf_context_reset(ctx);
+    residual_capture.reset();
 
     const size_t n_batch = llama_n_batch(ctx);
     for (size_t offset = 0; offset < prompt_tokens.size(); offset += n_batch) {
@@ -354,9 +426,22 @@ static json evaluate_prompt(
     }
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     const double log_z = logits_logsumexp(logits, static_cast<size_t>(n_vocab));
+    if (!residual_capture.error.empty()) {
+        throw std::runtime_error(residual_capture.error);
+    }
+    if (!residual_capture.captured) {
+        throw std::runtime_error("evaluation did not expose residual tensor " + residual_capture.tensor_name);
+    }
 
     json result;
     result["logsumexp"] = log_z;
+    result["residual"] = {
+        { "tensor", residual_capture.tensor_name },
+        { "position", prompt_tokens.size() - 1 },
+        { "dimension", residual_capture.dimension },
+        { "l2", residual_capture.l2 },
+        { "rms", residual_capture.rms },
+    };
     result["tokens"] = json::array();
     for (llama_token id : requested_ids) {
         const double logit = logits[id];
@@ -379,6 +464,10 @@ static json evaluate_prompt(
 static int run_probe(common_params & params, const probe_args & probe) {
     const auto & requested_ids = probe.token_ids;
 
+    residual_norm_capture residual_capture;
+    params.cb_eval = capture_residual_norm;
+    params.cb_eval_user_data = &residual_capture;
+
     // Apply control vectors ourselves after common initialization. This follows the
     // common loader path but lets the probe fail closed if loading or application fails.
     const auto control_vectors = params.control_vectors;
@@ -391,6 +480,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
     if (model == nullptr || ctx == nullptr) {
         throw std::runtime_error("failed to initialize model and context");
     }
+    residual_capture.tensor_name = "l_out-" + std::to_string(llama_model_n_layer(model) - 1);
 
     if (llama_model_has_encoder(model)) {
         throw std::runtime_error("J-Space causal probing currently requires a decoder-only model");
@@ -475,7 +565,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
         }
     }
     apply_control_vector(ctx, base_cvec_ptr, layer_start, layer_end, cvec_full_size);
-    const json baseline = evaluate_prompt(ctx, vocab, prompt_tokens, requested_ids);
+    const json baseline = evaluate_prompt(ctx, vocab, prompt_tokens, requested_ids, residual_capture);
 
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
@@ -500,6 +590,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
         { "last_prompt_token_piece", common_token_to_piece(vocab, prompt_tokens.back(), true) },
         { "distribution", "raw_full_vocabulary_softmax" },
         { "temperature", 1.0 },
+        { "residual_tensor", residual_capture.tensor_name },
         { "state_reset", "llama_memory_clear(data=true) before every evaluation" },
     };
 
@@ -534,13 +625,14 @@ static int run_probe(common_params & params, const probe_args & probe) {
                 const auto composed = compose_control_vectors(
                         base_cvec_ptr, loaded.data, strength, cvec_full_size);
                 apply_control_vector(ctx, &composed, layer_start, layer_end, cvec_full_size);
-                result = evaluate_prompt(ctx, vocab, prompt_tokens, requested_ids);
+                result = evaluate_prompt(ctx, vocab, prompt_tokens, requested_ids, residual_capture);
             }
 
             json run = {
                 { "strength", strength },
                 { "reused_baseline", reused_baseline },
                 { "logsumexp", result.at("logsumexp") },
+                { "residual", result.at("residual") },
                 { "tokens", result.at("tokens") },
             };
             sweep["runs"].push_back(std::move(run));

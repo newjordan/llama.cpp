@@ -2,8 +2,10 @@
 
 `llama-jspace-probe` evaluates a prompt and writes a single JSON document to
 stdout. For each requested vocabulary token it reports the raw logit and the
-full-vocabulary log-probability at the last prompt position. llama.cpp logs stay
-on stderr, so stdout can be redirected directly to a JSON file.
+full-vocabulary log-probability at the last prompt position. It also reports the
+L2 norm and RMS of the final prompt column from the last post-block residual
+(`l_out-39` for the 40-layer Qwen3.6 model). llama.cpp logs stay on stderr, so
+stdout can be redirected directly to a JSON file.
 
 The probe uses the common llama.cpp model/context arguments. It also uses the
 normal control-vector loader, including scaled vectors and layer ranges:
@@ -32,6 +34,11 @@ result. Before every real evaluation the probe clears both memory metadata and
 data, resetting Qwen3.6 KV and recurrent/GDN state. Standard
 `--control-vector-scaled FILE:SCALE,...` vectors remain supported and form the
 base intervention for the baseline and every sweep run.
+
+Residual collection uses a selective evaluation callback: it transfers only
+the final column of the last `l_out` tensor, rather than retaining complete
+layer activations. Baseline and every nonzero dose include `residual.l2`,
+`residual.rms`, `residual.dimension`, and the exact tensor name in JSON.
 
 A failed or incompatible control vector makes the command fail instead of
 returning an unsteered result.
