@@ -4326,6 +4326,279 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+// Routed MoE down projection followed by routing-weight application and expert
+// reduction.  SYCL recognizes this whole graph and replaces the broadcast MUL
+// plus expert-view ADD chain with one weighted-sum epilogue kernel.
+struct test_moe_down_reduce : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool views_first;
+    const bool force_weights_overlap;
+
+    ggml_tensor * overlap_storage = nullptr;
+    ggml_tensor * overlap_weights = nullptr;
+    ggml_tensor * overlap_dst     = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, n_mats, n_used, m, n, k, views_first, force_weights_overlap);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_DOWN_REDUCE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    test_moe_down_reduce(ggml_type type_a, int n_mats, int n_used,
+                         int64_t m, int64_t n, int64_t k, bool views_first = false,
+                         bool force_weights_overlap = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k), views_first(views_first),
+          force_weights_overlap(force_weights_overlap) {
+        GGML_ASSERT(n_used >= 2 && n_used <= n_mats);
+        GGML_ASSERT(!force_weights_overlap || n > 1);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "down_experts");
+
+        ggml_tensor * ids_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids_storage, "ids_storage");
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_storage, n_used, n, ids_storage->nb[1], 0);
+        ggml_set_name(ids, "selected_experts");
+
+        ggml_tensor * activations = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(activations, "expert_activations");
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, as, activations, ids);
+        ggml_set_name(experts, "expert_down");
+
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        overlap_weights = force_weights_overlap ? weights : nullptr;
+        if (force_weights_overlap) {
+            overlap_storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m * n);
+            ggml_set_name(overlap_storage, "routing_weights_overlap_storage");
+        } else {
+            overlap_storage = nullptr;
+        }
+        ggml_set_name(weights, "routing_weights");
+        experts = ggml_mul(ctx, experts, weights);
+        ggml_set_name(experts, "weighted_expert_down");
+
+        ggml_tensor * out;
+        if (n == 1) {
+            out = ggml_cont(ctx, ggml_permute(ctx, experts, 1, 0, 2, 3));
+            out = ggml_sum_rows(ctx, out);
+            out = ggml_reshape_2d(ctx, out, m, n);
+        } else {
+            std::vector<ggml_tensor *> views((size_t) n_used);
+            for (int expert = 0; expert < n_used; ++expert) {
+                views[(size_t) expert] = ggml_view_2d(
+                    ctx, experts, m, n, experts->nb[2], expert * experts->nb[1]);
+                if (views_first) {
+                    ggml_build_forward_expand(gf, views[(size_t) expert]);
+                }
+            }
+            out = views[0];
+            for (int expert = 1; expert < n_used; ++expert) {
+                out = ggml_add(ctx, out, views[(size_t) expert]);
+            }
+        }
+        ggml_set_name(out, "moe_down_reduced");
+        overlap_dst = force_weights_overlap ? out : nullptr;
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        if (force_weights_overlap) {
+            GGML_ASSERT(overlap_storage != nullptr && overlap_weights != nullptr && overlap_dst != nullptr);
+            overlap_weights->data = overlap_storage->data;
+            overlap_dst->data     = overlap_storage->data;
+        }
+    }
+};
+
+// Separate routed gate and up projections followed by SwiGLU. SYCL recognizes
+// the complete three-node graph and computes paired rows directly into the
+// activated output; CPU execution remains the unfused reference.
+struct test_moe_dual_swiglu : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const bool broadcast_b;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    test_moe_dual_swiglu(ggml_type type_a, int n_mats, int n_used,
+                         bool broadcast_b, int64_t m, int64_t n, int64_t k)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used),
+          broadcast_b(broadcast_b), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, broadcast_b, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_DUAL_SWIGLU";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 4 * m * k * n * n_used;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_weights =
+            ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gate_weights, "gate_expert_weights");
+        ggml_tensor * up_weights =
+            ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(up_weights, "up_expert_weights");
+
+        ggml_tensor * ids_storage =
+            ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids_storage, "ids_storage");
+        ggml_tensor * ids = ggml_view_2d(
+            ctx, ids_storage, n_used, n, ids_storage->nb[1], 0);
+        ggml_set_name(ids, "selected_experts");
+
+        ggml_tensor * input = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, k, broadcast_b ? 1 : n_used, n);
+        ggml_set_name(input, "expert_input");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, ids);
+        ggml_set_name(gate, "expert_gate");
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, ids);
+        ggml_set_name(up, "expert_up");
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "activated_experts");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
+// Complete batched expert pipeline: separate gate/up MMIDs, SwiGLU, routed
+// down MMID, routing-weight multiply, and ordered top-k reduction.  The SYCL
+// path may replace this entire graph with the composite Q8 activation/down
+// pipeline while CPU execution remains the ordinary graph reference.
+struct test_moe_pipeline : public test_case {
+    const ggml_type gate_type;
+    const ggml_type down_type;
+    const int n_mats;
+    const int n_used;
+    const int64_t input_dim;
+    const int64_t expert_dim;
+    const int64_t output_dim;
+    const int64_t n_tokens;
+
+    test_moe_pipeline(ggml_type gate_type, ggml_type down_type,
+                      int n_mats, int n_used, int64_t input_dim,
+                      int64_t expert_dim, int64_t output_dim,
+                      int64_t n_tokens)
+        : gate_type(gate_type), down_type(down_type), n_mats(n_mats),
+          n_used(n_used), input_dim(input_dim), expert_dim(expert_dim),
+          output_dim(output_dim), n_tokens(n_tokens) {
+        GGML_ASSERT(n_used >= 2 && n_used <= n_mats);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(gate_type, down_type, n_mats, n_used,
+                            input_dim, expert_dim, output_dim, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_PIPELINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * n_tokens * n_used *
+            (2 * input_dim * expert_dim + expert_dim * output_dim);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_weights = ggml_new_tensor_3d(
+            ctx, gate_type, input_dim, expert_dim, n_mats);
+        ggml_set_name(gate_weights, "pipeline_gate_weights");
+        ggml_tensor * up_weights = ggml_new_tensor_3d(
+            ctx, gate_type, input_dim, expert_dim, n_mats);
+        ggml_set_name(up_weights, "pipeline_up_weights");
+        ggml_tensor * down_weights = ggml_new_tensor_3d(
+            ctx, down_type, expert_dim, output_dim, n_mats);
+        ggml_set_name(down_weights, "pipeline_down_weights");
+
+        ggml_tensor * ids_storage = ggml_new_tensor_2d(
+            ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        ggml_set_name(ids_storage, "pipeline_ids_storage");
+        ggml_tensor * ids = ggml_view_2d(
+            ctx, ids_storage, n_used, n_tokens, ids_storage->nb[1], 0);
+        ggml_set_name(ids, "pipeline_selected_experts");
+
+        ggml_tensor * input = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, input_dim, 1, n_tokens);
+        ggml_set_name(input, "pipeline_input");
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_weights, input, ids);
+        ggml_set_name(gate, "pipeline_gate");
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_weights, input, ids);
+        ggml_set_name(up, "pipeline_up");
+        ggml_tensor * glu = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(glu, "pipeline_swiglu");
+        ggml_tensor * experts = ggml_mul_mat_id(ctx, down_weights, glu, ids);
+        ggml_set_name(experts, "pipeline_down");
+
+        ggml_tensor * weights = ggml_new_tensor_3d(
+            ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "pipeline_routing_weights");
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        ggml_set_name(weighted, "pipeline_weighted_down");
+
+        std::vector<ggml_tensor *> views((size_t) n_used);
+        for (int expert = 0; expert < n_used; ++expert) {
+            views[(size_t) expert] = ggml_view_2d(
+                ctx, weighted, output_dim, n_tokens, weighted->nb[2],
+                expert * weighted->nb[1]);
+            ggml_build_forward_expand(gf, views[(size_t) expert]);
+        }
+        ggml_tensor * out = views[0];
+        for (int expert = 1; expert < n_used; ++expert) {
+            out = ggml_add(ctx, out, views[(size_t) expert]);
+        }
+        ggml_set_name(out, "pipeline_output");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -8411,6 +8684,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 8, true,  512,  12, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 8, false, 2048, 12, 512));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, 12, 512));
+    // Whole routed-down graph: MMID -> routing weights -> expert reduction.
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q6_K, 16, 8, 65, 12, 256));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q8_0, 16, 8, 65, 12, 256));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q5_K, 16, 8, 65, 12, 256, true));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q6_K, 16, 8, 65, 12, 256, true));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q8_0, 16, 8, 65, 12, 256, true));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q6_K, 16, 8, 65, 12, 256, true, true));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q6_K, 16, 8, 65, 1, 256));
+    // Separate gate/up MMIDs fused with SwiGLU: direct single-token coverage,
+    // batched grouped coverage, and both production K-quant types.
+    test_cases.emplace_back(new test_moe_dual_swiglu(
+        GGML_TYPE_Q5_K, 16, 8, true, 64, 1, 256));
+    test_cases.emplace_back(new test_moe_dual_swiglu(
+        GGML_TYPE_Q5_K, 16, 8, true, 65, 12, 256));
+    test_cases.emplace_back(new test_moe_dual_swiglu(
+        GGML_TYPE_Q6_K, 16, 8, true, 65, 12, 256));
+    test_cases.emplace_back(new test_moe_pipeline(
+        GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, 16, 8, 256, 256, 65, 12));
 
 #if 0
     {
@@ -9238,6 +9529,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 8, true,  512,  12, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 8, false, 2048, 12, 512));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, false, 2048, 12, 512));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q6_K, 256, 8, 2048, 12, 512, true));
+    test_cases.emplace_back(new test_moe_down_reduce(GGML_TYPE_Q8_0, 256, 8, 2048, 12, 512, true));
+    test_cases.emplace_back(new test_moe_dual_swiglu(
+        GGML_TYPE_Q5_K, 256, 8, true, 512, 12, 2048));
+    test_cases.emplace_back(new test_moe_dual_swiglu(
+        GGML_TYPE_Q6_K, 256, 8, true, 512, 12, 2048));
+    test_cases.emplace_back(new test_moe_pipeline(
+        GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, 256, 8, 2048, 512, 2048, 12));
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;

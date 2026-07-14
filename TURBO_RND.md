@@ -22,6 +22,9 @@ and risky kernel/runtime ideas that should not be mixed into review branches.
 
 Active experiment:
 
+- `docs/treebeard-throughput-rnd.md`: canonical measured task ledger for the
+  B70/Qwen MoE throughput campaign, starting with fusion-aware pre-allocation
+  liveness and then moving to material intermediate elimination.
 - `docs/turbo-unified-kv-paged-attn.md`: unified-KV paged attention for
   `-kvu`, targeting the 12-slot 262144-token serving shape.
 - `docs/turbo-speculative-breakout.md`: single-answer branch, verify, and

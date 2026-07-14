@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 
 #include "dpct/helper.hpp"
 #include "ggml.h"
@@ -325,6 +326,15 @@ void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 
 namespace sycl_ex = sycl::ext::oneapi::experimental;
+
+#ifdef GGML_SYCL_GRAPH
+struct ggml_sycl_graph {
+    size_t uid = 0;
+    int64_t last_used_time = 0;
+    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> executable;
+};
+#endif
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
@@ -450,7 +460,35 @@ struct ggml_backend_sycl_context {
     }
 
 #ifdef GGML_SYCL_GRAPH
-    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // One backend context can see several scheduler splits over its lifetime. Keep their
+    // executable graphs separate, but evict stale entries so changing batch shapes cannot
+    // grow the cache without bound.
+    std::unordered_map<const void *, std::unique_ptr<ggml_sycl_graph>> sycl_graphs;
+    int64_t last_graph_eviction_sweep = 0;
+
+    ggml_sycl_graph * sycl_graph(const void * first_node_ptr) {
+        const int64_t time_now = ggml_time_us();
+
+        // Match the CUDA graph cache lifetime: sweep every 5 seconds and evict entries
+        // unused for at least 10 seconds.
+        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+            last_graph_eviction_sweep = time_now;
+            for (auto it = sycl_graphs.begin(); it != sycl_graphs.end();) {
+                if (time_now - it->second->last_used_time >= 10'000'000) {
+                    it = sycl_graphs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        auto it = sycl_graphs.find(first_node_ptr);
+        if (it == sycl_graphs.end()) {
+            it = sycl_graphs.emplace(first_node_ptr, std::make_unique<ggml_sycl_graph>()).first;
+        }
+        it->second->last_used_time = time_now;
+        return it->second.get();
+    }
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
