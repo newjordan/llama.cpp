@@ -48,6 +48,11 @@ The script uses multi-slot serving throughput to work on one user task:
     for unresolved validator failures.
 13. With objective fast path, `--no-score-final`, and an exact-output validator,
     return a terminal-valid baseline without launching branches.
+14. With `--adaptive-fanout`, launch cumulative branch widths such as 1, 2, 4,
+    and 8, validate after each wave, and stop at the first passing branch.
+15. With the fork backend and `--preserve-prefix-root`, keep one untouched
+    StateTree root, collapse failed waves back to it, refork the next wave with
+    a generation fence, and commit a passing branch atomically.
 
 The result JSON records branch outputs, verifier reports, parsed scores,
 `prefix_ok` decisions, selected branch metadata, timings, the final answer,
@@ -198,6 +203,30 @@ available to explicit `id_slot` requests. Context shift and cache-reuse shifts
 are disabled while state is shared. Inherited checkpoints are discarded;
 checkpoints created after divergence remain sequence-local so hybrid/recurrent
 models can retain their own branch prefix without mutating siblings.
+
+Run validator-first escalation while preserving a transactional prefix root:
+
+```bash
+python3 scripts/turbo-speculative-breakout.py \
+  --attach \
+  --port 8093 \
+  --prefix-clone-backend fork \
+  --preserve-prefix-root \
+  --adaptive-fanout \
+  --fanout-stages 1,2,4,8 \
+  --benchmark-suite objective-core \
+  --branch-slots 1-8 \
+  --prefix-slot 0 \
+  --final-slot 9 \
+  --no-score-final \
+  --objective-fast-path
+```
+
+In this mode the prefix slot is excluded from `--branch-slots`. Each stage
+forks only its new branch slots. A failed stage commits the untouched root and
+uses its returned `fork_id` to fence the next refork. A passing stage commits
+the first validator-passing branch. Final cleanup still erases the committed
+singleton so a benchmark task cannot leak a reservation into the next task.
 
 For controlled A/B resets, verify every requested slot reports
 `is_processing=false`, `is_reserved=false`, `fork_source_id=-1`,

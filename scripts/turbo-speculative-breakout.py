@@ -410,6 +410,23 @@ def parse_slot_list(value: str) -> list[int]:
     return slots
 
 
+def parse_fanout_stages(value: str, n_slots: int) -> list[int]:
+    stages: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        width = int(part)
+        if width <= 0:
+            raise argparse.ArgumentTypeError("fanout stages must be positive")
+        width = min(width, n_slots)
+        if not stages or width > stages[-1]:
+            stages.append(width)
+    if not stages:
+        raise argparse.ArgumentTypeError("expected at least one fanout stage")
+    return stages
+
+
 def http_json(method: str, url: str, payload: dict[str, Any] | None = None, timeout: float = 60.0) -> Any:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -573,17 +590,38 @@ def slot_action(port: int, slot_id: int, action: str, filename: str | None = Non
     return result if isinstance(result, dict) else {}
 
 
-def slot_fork(port: int, source_id: int, destinations: list[int], timeout: float = 300.0) -> dict[str, Any]:
+def slot_fork(
+    port: int,
+    source_id: int,
+    destinations: list[int],
+    timeout: float = 300.0,
+    fork_id: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"destinations": destinations}
+    if fork_id is not None:
+        payload["fork_id"] = fork_id
     result = http_json(
         "POST",
         f"http://127.0.0.1:{port}/slots/{source_id}?action=fork",
-        {"destinations": destinations},
+        payload,
         timeout=timeout,
     )
     if not isinstance(result, dict):
         raise RuntimeError("slot fork returned a non-object response")
     if result.get("id_slot") != source_id or result.get("destinations") != destinations:
         raise RuntimeError("slot fork response does not match the requested source and destinations")
+    return result
+
+
+def slot_commit(port: int, slot_id: int, fork_id: int, timeout: float = 300.0) -> dict[str, Any]:
+    result = http_json(
+        "POST",
+        f"http://127.0.0.1:{port}/slots/{slot_id}?action=commit",
+        {"fork_id": fork_id},
+        timeout=timeout,
+    )
+    if not isinstance(result, dict) or result.get("id_slot") != slot_id:
+        raise RuntimeError("slot commit response does not match the requested winner")
     return result
 
 
@@ -1581,6 +1619,9 @@ def breakout_run_config(
         "objective_fast_fallback_recombine": args.objective_fast_fallback_recombine,
         "objective_fast_fallback_model_verifier": args.objective_fast_fallback_model_verifier,
         "objective_fast_fallback_repair_rounds": args.objective_fast_fallback_repair_rounds,
+        "adaptive_fanout": getattr(args, "adaptive_fanout", False),
+        "fanout_stages": getattr(args, "fanout_stages", "1,2,4,8"),
+        "preserve_prefix_root": getattr(args, "preserve_prefix_root", False),
         "accept_score": args.accept_score,
         "verify_prefix_chars": args.verify_prefix_chars,
     }
@@ -1637,6 +1678,7 @@ def baseline_terminal_result(
             "terminal_validation_surface": "cleaned_content",
             "branches_launched": 0,
             "fanout_waves": 0,
+            "fanout_stages": [],
         },
         "prefix": {
             "backend": None,
@@ -1735,7 +1777,15 @@ def run_breakout(
     suite_index: int = 0,
 ) -> dict[str, Any]:
     slots = parse_slot_list(args.branch_slots)
-    if args.prefix_slot not in slots:
+    preserve_prefix_root = getattr(args, "preserve_prefix_root", False)
+    if preserve_prefix_root:
+        if not getattr(args, "adaptive_fanout", False) or objective_case is None:
+            raise SystemExit("--preserve-prefix-root requires adaptive objective fanout")
+        if not args.prefix_clone or args.prefix_clone_backend != "fork":
+            raise SystemExit("--preserve-prefix-root requires --prefix-clone and --prefix-clone-backend fork")
+        if args.prefix_slot in slots:
+            raise SystemExit("--prefix-slot must be excluded from --branch-slots with --preserve-prefix-root")
+    elif args.prefix_slot not in slots:
         raise SystemExit("--prefix-slot must be one of --branch-slots")
 
     props = {}
@@ -1797,6 +1847,7 @@ def run_breakout(
     save_result: dict[str, Any] | None = None
     restore_results: list[dict[str, Any]] = []
     fork_result: dict[str, Any] | None = None
+    fork_waves: list[dict[str, Any]] = []
     clone_wall_s: float | None = None
     clone_filename = f"breakout-prefix-{utc_stamp()}-{os.getpid()}.bin"
 
@@ -1821,7 +1872,7 @@ def run_breakout(
         destinations = [slot_id for slot_id in slots if slot_id != args.prefix_slot]
         clone_start = time.perf_counter()
         if args.prefix_clone_backend == "fork":
-            if destinations:
+            if destinations and not preserve_prefix_root:
                 try:
                     fork_result = slot_fork(
                         args.port,
@@ -1863,9 +1914,70 @@ def run_breakout(
             )
         )
 
+    adaptive_fanout = getattr(args, "adaptive_fanout", False)
+    if adaptive_fanout and objective_case is None:
+        raise SystemExit("--adaptive-fanout requires --benchmark-suite or --benchmark-suite-file")
+
+    stage_ends = (
+        parse_fanout_stages(getattr(args, "fanout_stages", "1,2,4,8"), len(branch_prompts))
+        if adaptive_fanout
+        else [len(branch_prompts)]
+    )
     fanout_waves = 0
-    branch_results = fanout(args, branch_prompts)
-    fanout_waves += 1
+    fanout_stage_results: list[dict[str, Any]] = []
+    branch_results: list[RequestResult] = []
+    current_root_fork_id: int | None = None
+    for stage_end in stage_ends:
+        stage_start = len(branch_results)
+        stage_fork: dict[str, Any] | None = None
+        stage_commit: dict[str, Any] | None = None
+        if preserve_prefix_root:
+            stage_slots = [item[2] for item in branch_prompts[stage_start:stage_end]]
+            stage_fork = slot_fork(
+                args.port,
+                args.prefix_slot,
+                stage_slots,
+                timeout=args.request_timeout,
+                fork_id=current_root_fork_id,
+            )
+            fork_waves.append(stage_fork)
+
+        stage_results = fanout(args, branch_prompts[stage_start:stage_end])
+        branch_results.extend(stage_results)
+        fanout_waves += 1
+
+        passing_indices: list[int] = []
+        if objective_case is not None:
+            for index, branch in enumerate(branch_results):
+                if branch.ok and validate_objective(objective_case, branch.content).get("passed"):
+                    passing_indices.append(index)
+
+        if preserve_prefix_root:
+            winner_slot = (
+                branch_results[passing_indices[0]].id_slot
+                if passing_indices
+                else args.prefix_slot
+            )
+            stage_commit = slot_commit(
+                args.port,
+                int(winner_slot),
+                int(stage_fork["fork_id"]),
+                timeout=args.request_timeout,
+            )
+            current_root_fork_id = int(stage_commit["fork_id"])
+
+        fanout_stage_results.append({
+            "target_width": stage_end,
+            "launched": len(stage_results),
+            "cumulative_launched": len(branch_results),
+            "passing_indices": passing_indices,
+            "stopped": bool(adaptive_fanout and passing_indices),
+            "fork": stage_fork,
+            "commit": stage_commit,
+        })
+        if adaptive_fanout and passing_indices:
+            break
+
     if not any(r.ok for r in branch_results):
         raise RuntimeError(f"all branch requests failed: {summarize_requests(branch_results)['errors']}")
 
@@ -2501,12 +2613,14 @@ def run_breakout(
             "terminal_validation_surface": "cleaned_content",
             "branches_launched": len(branch_results),
             "fanout_waves": fanout_waves,
+            "fanout_stages": fanout_stage_results,
         },
         "prefix": {
             "backend": args.prefix_clone_backend if args.prefix_clone else None,
             "result": asdict(prefix_result) if prefix_result else None,
             "clone_wall_s": clone_wall_s,
             "fork": fork_result,
+            "fork_waves": fork_waves,
             "save": save_result,
             "restore": restore_results,
             "clone_filename": clone_filename if args.prefix_clone and args.prefix_clone_backend == "file" else None,
@@ -2608,6 +2722,9 @@ def main() -> int:
     parser.add_argument("--objective-fast-fallback-recombine", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path, run recombine only if direct branch/repair still fails validation")
     parser.add_argument("--objective-fast-fallback-model-verifier", action=argparse.BooleanOptionalAction, default=True, help="In objective fast path, run model verifier fanout only before fallback recombine")
     parser.add_argument("--objective-fast-fallback-repair-rounds", type=int, default=1, help="Verifier-informed objective repair rounds after fallback recombine fails")
+    parser.add_argument("--adaptive-fanout", action=argparse.BooleanOptionalAction, default=False, help="Escalate objective branch width in stages and stop after a validator pass")
+    parser.add_argument("--fanout-stages", default="1,2,4,8", help="Cumulative adaptive fanout widths, capped by available branch slots")
+    parser.add_argument("--preserve-prefix-root", action=argparse.BooleanOptionalAction, default=False, help="Keep an untouched StateTree root, collapse failed waves, and commit a passing branch")
     parser.add_argument("--baseline-tokens", type=int, default=512)
     parser.add_argument("--branch-tokens", type=int, default=384)
     parser.add_argument("--verify-tokens", type=int, default=192)
@@ -2667,6 +2784,8 @@ def main() -> int:
 
         use_fork_backend = args.prefix_clone and args.prefix_clone_backend == "fork"
         cleanup_slots = parse_slot_list(args.branch_slots)
+        if args.preserve_prefix_root and args.prefix_slot not in cleanup_slots:
+            cleanup_slots.append(args.prefix_slot)
         if use_fork_backend:
             cleanup_errors = cleanup_fork_reservations(
                 args.port,

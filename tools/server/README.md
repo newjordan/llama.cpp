@@ -460,6 +460,8 @@ By default, this value is set to `0`, meaning no tokens are kept. Use `-1` to re
 
 `n_cache_reuse`: Min chunk size to attempt reusing from the cache via KV shifting. For more info, see `--cache-reuse` arg. Default: `0`, which is disabled.
 
+`speculative.n_max`: Per-request cap on speculative proposal tokens. Set `0` to disable speculation for one request or `-1` to use the server-configured maximum. Default: `-1`.
+
 `stream`: Allows receiving each predicted token in real-time instead of waiting for the completion to finish (uses a different response format). To enable this, set to `true`.
 
 `stop`: Specify a JSON array of stopping strings.
@@ -596,7 +598,7 @@ An explicit empty array disables any reverse prompts configured on the server co
   - `limit`: Stopped because `n_predict` tokens were generated before stop words or EOS was encountered
   - `word`: Stopped due to encountering a stopping word from `stop` JSON array provided
 - `stopping_word`: The stopping word encountered which stopped the generation (or "" if not stopped due to a stopping word)
-- `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`
+- `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`. Speculative responses also include total drafted and accepted tokens plus per-round draft and accepted widths.
 - `tokens_cached`: Number of tokens from the prompt which could be re-used from previous completion
 - `tokens_evaluated`: Number of tokens evaluated in total from the prompt
 - `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)

@@ -77,6 +77,7 @@ json task_params::to_json(bool only_metrics) const {
             {"generation_prompt",         chat_parser_params.generation_prompt},
             {"samplers",                  samplers},
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
+            {"speculative.n_max",         speculative_n_max},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -134,6 +135,7 @@ json task_params::to_json(bool only_metrics) const {
         {"generation_prompt",         chat_parser_params.generation_prompt},
         {"samplers",                  samplers},
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
+        {"speculative.n_max",         speculative_n_max},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -275,6 +277,10 @@ task_params server_task::params_from_json_cmpl(
     //params.t_max_prompt_ms  = json_value(data,       "t_max_prompt_ms",    defaults.t_max_prompt_ms); // TODO: implement
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
+    params.speculative_n_max = json_value(data,      "speculative.n_max",  defaults.speculative_n_max);
+    if (params.speculative_n_max < -1) {
+        throw std::runtime_error("speculative.n_max must be -1 or non-negative");
+    }
 
     params.sampling.top_k              = json_value(data, "top_k",               defaults.sampling.top_k);
     params.sampling.top_p              = json_value(data, "top_p",               defaults.sampling.top_p);
@@ -644,6 +650,8 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["draft_n_per_round"] = draft_n_per_round;
+        base["draft_n_accepted_per_round"] = draft_n_accepted_per_round;
     }
 
     return base;

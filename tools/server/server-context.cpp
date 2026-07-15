@@ -421,6 +421,8 @@ struct server_slot {
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    std::vector<int32_t> n_draft_per_round;
+    std::vector<int32_t> n_draft_accepted_per_round;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -447,6 +449,8 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+        n_draft_per_round.clear();
+        n_draft_accepted_per_round.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -575,6 +579,10 @@ struct server_slot {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
         }
 
+        if (task->params.speculative_n_max >= 0) {
+            n_draft_max = std::min(n_draft_max, task->params.speculative_n_max);
+        }
+
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
@@ -652,6 +660,8 @@ struct server_slot {
         if (n_draft_total > 0) {
             timings.draft_n          = n_draft_total;
             timings.draft_n_accepted = n_draft_accepted;
+            timings.draft_n_per_round = n_draft_per_round;
+            timings.draft_n_accepted_per_round = n_draft_accepted_per_round;
         }
 
         return timings;
@@ -6149,6 +6159,9 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.n_draft_total += draft.size();
+            if (!draft.empty()) {
+                slot.n_draft_per_round.push_back(static_cast<int32_t>(draft.size()));
+            }
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -7094,6 +7107,7 @@ private:
 
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += ids.size() - 1;
+                slot.n_draft_accepted_per_round.push_back(static_cast<int32_t>(ids.size()) - 1);
 
                 // add accepted tokens to the prompt
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);

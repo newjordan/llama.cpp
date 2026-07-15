@@ -275,6 +275,9 @@ class BaselineShortCircuitTests(unittest.TestCase):
             objective_fast_fallback_recombine=True,
             objective_fast_fallback_model_verifier=True,
             objective_fast_fallback_repair_rounds=1,
+            adaptive_fanout=False,
+            fanout_stages="1,2,4,8",
+            preserve_prefix_root=False,
             accept_score=70,
             verify_prefix_chars=1600,
             run_baseline=True,
@@ -519,6 +522,33 @@ class ReportingSemanticsTests(unittest.TestCase):
         self.assertEqual(accuracy["escalated_tasks"], 1)
         self.assertEqual(combined["mean_escalated_task_wall_s"], 5.0)
         self.assertEqual(combined["mean_all_tasks_wall_s"], 3.0)
+
+
+class AdaptiveFanoutTests(unittest.TestCase):
+    def test_fanout_stages_are_cumulative_and_capped(self) -> None:
+        self.assertEqual(breakout.parse_fanout_stages("1,2,4,8", 4), [1, 2, 4])
+        self.assertEqual(breakout.parse_fanout_stages("2,2,12", 8), [2, 8])
+
+    def test_invalid_fanout_stage_is_rejected(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            breakout.parse_fanout_stages("0,2", 8)
+
+    def test_refork_and_commit_are_generation_fenced(self) -> None:
+        with mock.patch.object(
+            breakout,
+            "http_json",
+            side_effect=[
+                {"id_slot": 0, "destinations": [2, 3], "fork_id": 8},
+                {"id_slot": 2, "fork_id": 8},
+            ],
+        ) as http_json:
+            fork = breakout.slot_fork(8093, 0, [2, 3], timeout=10.0, fork_id=7)
+            commit = breakout.slot_commit(8093, 2, int(fork["fork_id"]), timeout=10.0)
+
+        self.assertEqual(fork["fork_id"], 8)
+        self.assertEqual(commit["id_slot"], 2)
+        self.assertEqual(http_json.call_args_list[0].args[2], {"destinations": [2, 3], "fork_id": 7})
+        self.assertEqual(http_json.call_args_list[1].args[2], {"fork_id": 8})
 
 
 if __name__ == "__main__":
