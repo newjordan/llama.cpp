@@ -55,6 +55,12 @@ def sigmoid(values):
     return 1.0 / (1.0 + np.exp(-np.clip(values, -40.0, 40.0)))
 
 
+def logistic_objective(design, theta, labels, penalty):
+    logits = design @ theta
+    return float(np.logaddexp(0.0, logits).sum() - labels @ logits +
+                 0.5 * theta @ penalty @ theta)
+
+
 def binary_auroc(labels, scores):
     labels = np.asarray(labels, dtype=bool)
     scores = np.asarray(scores, dtype=np.float64)
@@ -94,7 +100,7 @@ def equal_mass_ece(labels, probabilities, bins=10):
 def fit_platt(scores, labels):
     design = np.column_stack((scores, np.ones(len(scores))))
     positive = int(labels.sum())
-    theta = np.array([1.0, math.log((positive + 0.5) /
+    theta = np.array([0.0, math.log((positive + 0.5) /
                                    (len(labels) - positive + 0.5))])
     penalty = np.diag((1e-3, 1e-3))
     for _ in range(100):
@@ -103,8 +109,20 @@ def fit_platt(scores, labels):
         gradient = design.T @ (probabilities - labels) + penalty @ theta
         hessian = design.T @ (design * variance[:, None]) + penalty
         step = np.linalg.solve(hessian, gradient)
-        theta -= step
-        if np.max(np.abs(step)) < 1e-10:
+        objective = logistic_objective(design, theta, labels, penalty)
+        expected_decrease = float(gradient @ step)
+        scale = 1.0
+        while scale >= 2.0 ** -30:
+            candidate = theta - scale * step
+            if logistic_objective(design, candidate, labels, penalty) <= \
+                    objective - 1e-4 * scale * expected_decrease:
+                break
+            scale *= 0.5
+        if scale < 2.0 ** -30:
+            raise RuntimeError("Platt optimizer line search failed")
+        applied_step = scale * step
+        theta -= applied_step
+        if np.max(np.abs(applied_step)) < 1e-10:
             break
     return theta
 
@@ -332,11 +350,13 @@ def test_command(args):
 
 def self_test():
     labels = np.repeat(np.arange(7), 12)
-    scores = np.full((len(labels), 7), -1.0)
-    scores[np.arange(len(labels)), labels] = 2.0
+    scores = np.full((len(labels), 7), 15.0)
+    scores[np.arange(len(labels)), labels] = 18.0
     platt = np.array([fit_platt(scores[:, axis], labels == axis) for axis in range(7)])
     probabilities = sigmoid(scores * platt[:, 0] + platt[:, 1])
     assert np.all(platt[:, 0] > 0)
+    assert np.all(probabilities < 1.0)
+    assert np.all(probabilities.argmax(axis=1) == labels)
     assert np.allclose(axis_aurocs(labels, scores, range(7)), 1.0)
     abstention = choose_abstention(labels, probabilities, 0.75)
     assert abstention["coverage"] == 1.0 and abstention["precision"] == 1.0

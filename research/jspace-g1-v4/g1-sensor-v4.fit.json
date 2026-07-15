@@ -1,0 +1,113 @@
+{
+  "schema": "treebeard.jspace.g1.fit.v4",
+  "status": "pass",
+  "inputs": {
+    "manifest_sha256": "0a2fccf25f6e1c43d59ba839a123b4a89253e30d98358426083289f07f0412ae",
+    "metadata_sha256": "ee2d69e763d8f62f9c2c9865d271398e149a48f6a83cbbe91c78fe46865b32f3",
+    "raw_sha256": "3acb615451b00019ee03710255c450485b6106169fd843e960d534472e66865a"
+  },
+  "representation": "fixed instruction-probed ordered label-token logits",
+  "gates": {
+    "macro_auroc_min": 0.8,
+    "each_source_macro_auroc_min": 0.75,
+    "macro_ece_max": 0.08,
+    "top1_accuracy_min": 0.55,
+    "neutral_fpr_max": 0.1,
+    "abstention_coverage_min": 0.2,
+    "abstention_precision_min": 0.75
+  },
+  "overall": {
+    "rows": 832,
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "disgust",
+      "fear",
+      "anger",
+      "neutral"
+    ],
+    "macro_auroc": 0.8787947485457251,
+    "axis_auroc": {
+      "sadness": 0.878173828125,
+      "surprise": 0.8354270241477273,
+      "joy": 0.8952858664772727,
+      "disgust": 0.8949862393465909,
+      "fear": 0.8982599431818182,
+      "anger": 0.868896484375,
+      "neutral": 0.8805338541666666
+    },
+    "macro_ece": 0.023566787091828217,
+    "top1_accuracy": 0.6334134615384616,
+    "neutral_fpr": 0.09375,
+    "abstention_coverage": 0.6177884615384616,
+    "abstention_precision": 0.7509727626459144
+  },
+  "sources": {
+    "empatheticdialogues": {
+      "rows": 384,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.9120442708333334,
+      "axis_auroc": {
+        "sadness": 0.933837890625,
+        "surprise": 0.817529296875,
+        "joy": 0.933447265625,
+        "disgust": 0.96953125,
+        "fear": 0.931396484375,
+        "anger": 0.8865234375
+      },
+      "macro_ece": 0.03967347337905235,
+      "top1_accuracy": 0.7005208333333334,
+      "neutral_fpr": null,
+      "abstention_coverage": 0.7317708333333334,
+      "abstention_precision": 0.7900355871886121
+    },
+    "dailydialog": {
+      "rows": 448,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger",
+        "neutral"
+      ],
+      "macro_auroc": 0.8474411737351192,
+      "axis_auroc": {
+        "sadness": 0.8285725911458334,
+        "surprise": 0.855712890625,
+        "joy": 0.8578287760416666,
+        "disgust": 0.8151041666666666,
+        "fear": 0.8665364583333334,
+        "anger": 0.8627115885416666,
+        "neutral": 0.8456217447916666
+      },
+      "macro_ece": 0.03408550141388909,
+      "top1_accuracy": 0.5758928571428571,
+      "neutral_fpr": 0.09375,
+      "abstention_coverage": 0.5200892857142857,
+      "abstention_precision": 0.703862660944206
+    }
+  },
+  "deadband": {
+    "threshold": 0.5912893620988102,
+    "realized_neutral_fpr": 0.09375
+  },
+  "abstention": {
+    "threshold": 0.49531951983937744,
+    "coverage": 0.6177884615384616,
+    "precision": 0.7509727626459144
+  },
+  "platt_positive_slopes": true,
+  "artifact": "research/jspace-g1-v4/g1-sensor-v4.npz",
+  "artifact_sha256": "e1c4e9ab6050c35bbf254395044b5cd796685c68ac15fbdd9f8fd17d1662c23d",
+  "calibration_gate_pass": true
+}
