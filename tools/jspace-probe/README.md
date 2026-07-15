@@ -18,6 +18,7 @@ normal control-vector loader, including scaled vectors and layer ranges:
   --token-ids 15420,6051,22292,17434 \
   --probe-vector joy=/path/to/joy.gguf \
   --probe-vector sadness=/path/to/sadness.gguf \
+  --verified-model-sha256 25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506 \
   --probe-strengths=-2,-1,0,1,2 \
   --fibonacci-pool-max 144 \
   --include-residual-vector \
@@ -36,6 +37,16 @@ result. Before every real evaluation the probe clears both memory metadata and
 data, resetting Qwen3.6 KV and recurrent/GDN state. Standard
 `--control-vector-scaled FILE:SCALE,...` vectors remain supported and form the
 base intervention for the baseline and every sweep run.
+
+Every `--probe-vector` also requires `--verified-model-sha256`. The runner must
+compute the full model-file SHA-256 before invoking the probe; the option is an
+attestation, not a fast in-tool hash. Before model allocation or vector-tensor
+loading, the probe reads only GGUF metadata and requires the Phase-0 schema, an
+exact base-model digest match, an exact `NAME`/axis match, and one of the three
+defined direction normalizations (`unit_l2_regularized_dual`,
+`raw_regularized_dual`, or `direct_pre_rms_contrast`). Missing, malformed, or
+unknown identity metadata fails closed. The attested digest and accepted
+artifact identity are copied into the output JSON.
 
 Residual collection uses a selective evaluation callback. By default it
 transfers only the final column of the last `l_out` tensor. Fibonacci pooling

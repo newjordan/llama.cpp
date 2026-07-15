@@ -3,11 +3,13 @@
 #include "fibonacci-pool.h"
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "llama.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <clocale>
 #include <cmath>
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -35,6 +38,7 @@ struct probe_args {
     std::vector<named_vector> probe_vectors;
     std::vector<float>        probe_strengths;
     std::vector<char *>       common_argv;
+    std::string               verified_model_sha256;
     bool                      include_residual_vector = false;
     size_t                    fibonacci_pool_max_tokens = 0;
     bool                      self_test = false;
@@ -310,6 +314,21 @@ static probe_args::named_vector parse_named_vector(const std::string & value) {
     return result;
 }
 
+static std::string parse_sha256(const std::string & value, const char * option) {
+    const std::string item = trim(value);
+    if (item.size() != 64 || !std::all_of(item.begin(), item.end(), [](unsigned char ch) {
+            return std::isxdigit(ch) != 0;
+        })) {
+        throw std::invalid_argument(std::string(option) + " requires exactly 64 hexadecimal characters");
+    }
+
+    std::string result = item;
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return result;
+}
+
 static probe_args preprocess_args(int argc, char ** argv) {
     probe_args result;
     result.common_argv.reserve(argc);
@@ -319,6 +338,7 @@ static probe_args preprocess_args(int argc, char ** argv) {
     constexpr const char * vector_prefix = "--probe-vector=";
     constexpr const char * strength_prefix = "--probe-strengths=";
     constexpr const char * fibonacci_prefix = "--fibonacci-pool-max=";
+    constexpr const char * model_sha_prefix = "--verified-model-sha256=";
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
@@ -329,6 +349,24 @@ static probe_args preprocess_args(int argc, char ** argv) {
         }
         if (arg == "--include-residual-vector") {
             result.include_residual_vector = true;
+            continue;
+        }
+        if (arg == "--verified-model-sha256") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--verified-model-sha256 requires a SHA-256 value");
+            }
+            if (!result.verified_model_sha256.empty()) {
+                throw std::invalid_argument("--verified-model-sha256 may be specified only once");
+            }
+            result.verified_model_sha256 = parse_sha256(argv[i], "--verified-model-sha256");
+            continue;
+        }
+        if (arg.compare(0, std::strlen(model_sha_prefix), model_sha_prefix) == 0) {
+            if (!result.verified_model_sha256.empty()) {
+                throw std::invalid_argument("--verified-model-sha256 may be specified only once");
+            }
+            result.verified_model_sha256 = parse_sha256(
+                    arg.substr(std::strlen(model_sha_prefix)), "--verified-model-sha256");
             continue;
         }
         if (arg == "--fibonacci-pool-max") {
@@ -500,6 +538,8 @@ static void print_usage(int, char ** argv) {
     std::printf("  --token-ids ID,ID,...  vocabulary IDs to report; may be repeated\n");
     std::printf("  --probe-vector NAME=PATH\n");
     std::printf("                           named control vector to sweep; may be repeated\n");
+    std::printf("  --verified-model-sha256 HEX\n");
+    std::printf("                           runner-verified model digest; required for vectors\n");
     std::printf("  --probe-strengths S,S,...\n");
     std::printf("                           shared finite strengths for every probe vector\n");
     std::printf("  --include-residual-vector\n");
@@ -508,6 +548,8 @@ static void print_usage(int, char ** argv) {
     std::printf("                           pool residual columns over 1,2,3,5,... token horizons\n");
     std::printf("  --self-test            run the model-independent deterministic smoke test\n\n");
 }
+
+static void run_identity_self_test();
 
 static int run_self_test() {
     const auto ids = parse_token_id_list("1, 2,248319");
@@ -542,6 +584,10 @@ static int run_self_test() {
     if (vector.name != "joy" || vector.path != "/tmp/joy.gguf") {
         throw std::runtime_error("named vector parser self-test failed");
     }
+    if (parse_sha256(std::string(64, 'A'), "self-test") != std::string(64, 'a')) {
+        throw std::runtime_error("SHA-256 parser normalization self-test failed");
+    }
+    run_identity_self_test();
 
     residual_norm_capture residual;
     residual.tensor_name = "l_out-39";
@@ -681,9 +727,107 @@ static std::string model_meta(const llama_model * model, const char * key) {
     return std::string(value.data(), static_cast<size_t>(needed));
 }
 
+struct probe_vector_identity {
+    std::string schema;
+    std::string axis;
+    std::string base_model_sha256;
+    std::string direction_normalization;
+};
+
+static std::string require_gguf_string(
+        const struct gguf_context * ctx,
+        const std::string &         path,
+        const char *                key) {
+    const int64_t key_id = gguf_find_key(ctx, key);
+    if (key_id < 0 || gguf_get_kv_type(ctx, key_id) != GGUF_TYPE_STRING) {
+        throw std::runtime_error("probe vector '" + path + "' is missing string metadata '" + key + "'");
+    }
+    return gguf_get_val_str(ctx, key_id);
+}
+
+static probe_vector_identity load_probe_vector_identity(const std::string & path) {
+    const struct gguf_init_params params {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    std::unique_ptr<struct gguf_context, decltype(&gguf_free)> ctx(
+            gguf_init_from_file(path.c_str(), params), &gguf_free);
+    if (!ctx) {
+        throw std::runtime_error("failed to read probe-vector metadata from " + path);
+    }
+
+    return {
+        require_gguf_string(ctx.get(), path, "jspace.schema"),
+        require_gguf_string(ctx.get(), path, "jspace.axis"),
+        require_gguf_string(ctx.get(), path, "jspace.base_model_sha256"),
+        require_gguf_string(ctx.get(), path, "jspace.direction_normalization"),
+    };
+}
+
+static void validate_probe_vector_identity(
+        const probe_vector_identity & identity,
+        const std::string &           requested_axis,
+        const std::string &           verified_model_sha256) {
+    if (identity.schema != "treebeard.jspace.phase0-cvec.v0") {
+        throw std::runtime_error("unsupported J-Space probe-vector schema '" + identity.schema + "'");
+    }
+    if (parse_sha256(identity.base_model_sha256, "jspace.base_model_sha256") != verified_model_sha256) {
+        throw std::runtime_error("probe-vector base-model SHA-256 does not match the runner-verified model");
+    }
+    if (identity.axis != requested_axis) {
+        throw std::runtime_error("probe-vector axis metadata '" + identity.axis +
+                "' does not match requested name '" + requested_axis + "'");
+    }
+    static const std::vector<std::string> supported_normalizations {
+        "unit_l2_regularized_dual",
+        "raw_regularized_dual",
+        "direct_pre_rms_contrast",
+    };
+    if (std::find(supported_normalizations.begin(), supported_normalizations.end(),
+                  identity.direction_normalization) == supported_normalizations.end()) {
+        throw std::runtime_error("unsupported probe-vector direction normalization '" +
+                identity.direction_normalization + "'");
+    }
+}
+
+static void run_identity_self_test() {
+    const std::string model_sha256(64, 'a');
+    const probe_vector_identity valid {
+        "treebeard.jspace.phase0-cvec.v0",
+        "joy",
+        model_sha256,
+        "raw_regularized_dual",
+    };
+    validate_probe_vector_identity(valid, "joy", model_sha256);
+
+    auto must_reject = [&](probe_vector_identity identity, const std::string & axis,
+                           const std::string & digest) {
+        try {
+            validate_probe_vector_identity(identity, axis, digest);
+        } catch (const std::exception &) {
+            return;
+        }
+        throw std::runtime_error("probe-vector identity self-test accepted an invalid artifact");
+    };
+
+    auto invalid = valid;
+    invalid.schema = "treebeard.jspace.unknown";
+    must_reject(invalid, "joy", model_sha256);
+    invalid = valid;
+    invalid.base_model_sha256 = std::string(64, 'b');
+    must_reject(invalid, "joy", model_sha256);
+    invalid = valid;
+    invalid.axis = "sadness";
+    must_reject(invalid, "joy", model_sha256);
+    invalid = valid;
+    invalid.direction_normalization.clear();
+    must_reject(invalid, "joy", model_sha256);
+}
+
 struct loaded_probe_vector {
     probe_args::named_vector      spec;
     common_control_vector_data    data;
+    probe_vector_identity         identity;
 };
 
 static void apply_control_vector(
@@ -841,6 +985,16 @@ static evaluation_result evaluate_prompt(
 static int run_probe(common_params & params, const probe_args & probe) {
     const auto & requested_ids = probe.token_ids;
 
+    // Identity is cheap to validate and must fail before allocating the model or
+    // loading any vector tensor data.
+    std::vector<probe_vector_identity> vector_identities;
+    vector_identities.reserve(probe.probe_vectors.size());
+    for (const auto & spec : probe.probe_vectors) {
+        auto identity = load_probe_vector_identity(spec.path);
+        validate_probe_vector_identity(identity, spec.name, probe.verified_model_sha256);
+        vector_identities.push_back(std::move(identity));
+    }
+
     residual_norm_capture residual_capture;
     params.cb_eval = capture_residual_norm;
     params.cb_eval_user_data = &residual_capture;
@@ -922,7 +1076,8 @@ static int run_probe(common_params & params, const probe_args & probe) {
 
     std::vector<loaded_probe_vector> loaded_vectors;
     loaded_vectors.reserve(probe.probe_vectors.size());
-    for (const auto & spec : probe.probe_vectors) {
+    for (size_t i = 0; i < probe.probe_vectors.size(); ++i) {
+        const auto & spec = probe.probe_vectors[i];
         auto data = common_control_vector_load({ { 1.0f, spec.path } });
         if (data.n_embd < 0) {
             throw std::runtime_error("failed to load probe vector '" + spec.name + "' from " + spec.path);
@@ -933,7 +1088,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
         if (base_cvec_ptr != nullptr && data.n_embd != base_cvec_ptr->n_embd) {
             throw std::runtime_error("probe vector '" + spec.name + "' embedding size does not match base vector");
         }
-        loaded_vectors.push_back({ spec, std::move(data) });
+        loaded_vectors.push_back({ spec, std::move(data), std::move(vector_identities[i]) });
     }
 
     const size_t cvec_full_size = static_cast<size_t>(llama_model_n_embd(model)) *
@@ -964,6 +1119,8 @@ static int run_probe(common_params & params, const probe_args & probe) {
     output["schema"] = "treebeard.jspace.logit_probe.v1";
     output["model"] = {
         { "path", params.model.path },
+        { "runner_verified_sha256", probe.verified_model_sha256.empty()
+                ? json(nullptr) : json(probe.verified_model_sha256) },
         { "architecture", model_meta(model, "general.architecture") },
         { "name", model_meta(model, "general.name") },
         { "description", description },
@@ -1013,6 +1170,12 @@ static int run_probe(common_params & params, const probe_args & probe) {
         json sweep = {
             { "name", loaded.spec.name },
             { "path", loaded.spec.path },
+            { "artifact_identity", {
+                { "schema", loaded.identity.schema },
+                { "axis", loaded.identity.axis },
+                { "base_model_sha256", loaded.identity.base_model_sha256 },
+                { "direction_normalization", loaded.identity.direction_normalization },
+            } },
             { "runs", json::array() },
         };
 
@@ -1089,6 +1252,10 @@ int main(int argc, char ** argv) {
         }
         if (probe.probe_vectors.empty() != probe.probe_strengths.empty()) {
             throw std::invalid_argument("--probe-vector and --probe-strengths must be used together");
+        }
+        if (!probe.probe_vectors.empty() && probe.verified_model_sha256.empty()) {
+            throw std::invalid_argument(
+                    "--verified-model-sha256 is required whenever --probe-vector is used");
         }
         for (size_t i = 0; i < probe.probe_vectors.size(); ++i) {
             for (size_t j = i + 1; j < probe.probe_vectors.size(); ++j) {
