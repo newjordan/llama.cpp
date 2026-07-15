@@ -153,3 +153,42 @@ Run the model-independent deterministic smoke test with:
 ```console
 ./build/bin/llama-jspace-probe --self-test
 ```
+
+## G1 semantic-sensor extraction
+
+`llama-jspace-sensor-extract` captures exact-runtime, last-token post-block
+residuals from a frozen `treebeard.jspace.g1.dataset.v1` manifest. It is a
+separate path from the anchor-logit probe: control vectors, embedding mode,
+chat templates, and special-token parsing are forbidden. Every sample starts
+after `llama_memory_clear(data=true)` and must fit in one microbatch, so a layer
+callback cannot silently select the final column of an intermediate split.
+
+The extractor writes an atomic metadata/raw pair. The JSON records model and
+manifest attestations, layer order, sample identities, token counts, and the
+raw shape. The F32 file is C-order `[sample, layer, embedding]`; its rows follow
+the frozen manifest exactly. Hash both inputs before invocation and both outputs
+after completion.
+
+```console
+./build/bin/llama-jspace-sensor-extract \
+  -m /path/to/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf \
+  -c 256 -b 256 -ub 256 -ngl 99 \
+  --manifest /path/to/g1-goemotions-manifest.json \
+  --verified-model-sha256 25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506 \
+  --verified-manifest-sha256 eee5eac3e2b0d9cd440a890af5504c5403ac52570c2db63e3bc19912c7e2e718 \
+  --layers 2,3,10,11,18,19,26,27,34,35,38,39 \
+  --out-prefix /path/to/qwen36-g1-12layer
+```
+
+The ordered layer set pairs six DeltaNet layers with six immediately following
+full-attention layers across depth. It is declared before fitting; G1 model
+selection must use only training and calibration rows. The test rows remain
+untouched until feature normalization, regularization, calibration, deadband,
+and abstention choices are frozen.
+
+Freeze the balanced anchor-free manifest from the official agreement-filtered
+GoEmotions splits with `scripts/treebeard-jspace-g1-manifest.py`. The freezer
+accepts only single-label rows for the eight declared axes, removes every
+case-folded anchor and simple morphological echo, rejects normalized duplicate
+text across all splits, and chooses rows by a fixed SHA-256 rank rather than
+PRNG state.
