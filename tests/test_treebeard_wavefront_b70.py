@@ -39,6 +39,33 @@ class TelemetryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             bench.validate_rounds(4, [4], [])
 
+    def test_serial_anchor_telemetry_is_self_consistent(self) -> None:
+        telemetry = bench.validate_anchor_telemetry(
+            4,
+            True,
+            {
+                "draft_anchor_n": 2,
+                "draft_anchor_match_n": 1,
+                "draft_anchor_fallback_n": 1,
+                "draft_anchor_serial_tokens": [11, 12],
+                "draft_anchor_batched_tokens": [11, 13],
+            },
+        )
+        self.assertEqual(telemetry["draft_anchor_fallback_n"], 1)
+
+        with self.assertRaises(RuntimeError):
+            bench.validate_anchor_telemetry(
+                4,
+                True,
+                {
+                    "draft_anchor_n": 1,
+                    "draft_anchor_match_n": 1,
+                    "draft_anchor_fallback_n": 0,
+                    "draft_anchor_serial_tokens": [11],
+                    "draft_anchor_batched_tokens": [12],
+                },
+            )
+
     def test_matched_midpoint_summary(self) -> None:
         samples = [
             {
@@ -59,6 +86,9 @@ class TelemetryTests(unittest.TestCase):
                 "wall_tps": 11.0,
                 "draft_n": 8,
                 "draft_n_accepted": 6,
+                "draft_anchor_n": 2,
+                "draft_anchor_match_n": 1,
+                "draft_anchor_fallback_n": 1,
                 "greedy_parity": True,
             },
             {
@@ -76,6 +106,7 @@ class TelemetryTests(unittest.TestCase):
         self.assertAlmostEqual(row["paired_server_gain_pct"]["mean"], 20.0)
         self.assertEqual(row["acceptance"], 0.75)
         self.assertEqual(row["proposal_coverage"], 1.0)
+        self.assertEqual(row["draft_anchor_match_rate"], 0.5)
 
 
 if __name__ == "__main__":

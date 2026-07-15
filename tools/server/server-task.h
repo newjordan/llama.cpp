@@ -100,6 +100,7 @@ struct task_params {
 
     // Per-request cap for speculative proposals. -1 uses the server default.
     int32_t speculative_n_max = -1;
+    bool speculative_serial_anchor = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -323,6 +324,11 @@ struct result_timings {
     int32_t draft_n_accepted = 0;
     std::vector<int32_t> draft_n_per_round;
     std::vector<int32_t> draft_n_accepted_per_round;
+    int32_t draft_anchor_n = 0;
+    int32_t draft_anchor_match_n = 0;
+    int32_t draft_anchor_fallback_n = 0;
+    std::vector<llama_token> draft_anchor_serial_tokens;
+    std::vector<llama_token> draft_anchor_batched_tokens;
 
     json to_json() const;
 };

@@ -274,6 +274,7 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+    llama_token spec_anchor = LLAMA_TOKEN_NULL;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -423,6 +424,11 @@ struct server_slot {
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     std::vector<int32_t> n_draft_per_round;
     std::vector<int32_t> n_draft_accepted_per_round;
+    int32_t n_draft_anchor = 0;
+    int32_t n_draft_anchor_match = 0;
+    int32_t n_draft_anchor_fallback = 0;
+    std::vector<llama_token> draft_anchor_serial_tokens;
+    std::vector<llama_token> draft_anchor_batched_tokens;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -441,6 +447,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_anchor = LLAMA_TOKEN_NULL;
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -451,6 +458,11 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_per_round.clear();
         n_draft_accepted_per_round.clear();
+        n_draft_anchor = 0;
+        n_draft_anchor_match = 0;
+        n_draft_anchor_fallback = 0;
+        draft_anchor_serial_tokens.clear();
+        draft_anchor_batched_tokens.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -662,6 +674,13 @@ struct server_slot {
             timings.draft_n_accepted = n_draft_accepted;
             timings.draft_n_per_round = n_draft_per_round;
             timings.draft_n_accepted_per_round = n_draft_accepted_per_round;
+        }
+        if (n_draft_anchor > 0) {
+            timings.draft_anchor_n = n_draft_anchor;
+            timings.draft_anchor_match_n = n_draft_anchor_match;
+            timings.draft_anchor_fallback_n = n_draft_anchor_fallback;
+            timings.draft_anchor_serial_tokens = draft_anchor_serial_tokens;
+            timings.draft_anchor_batched_tokens = draft_anchor_batched_tokens;
         }
 
         return timings;
@@ -5982,6 +6001,63 @@ private:
         }
     }
 
+    bool uses_spec_checkpoint(
+            common_context_seq_rm_type rm_type,
+            llama_context * ctx,
+            int32_t n_rollback) const {
+        return rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+             static_cast<uint32_t>(n_rollback) > llama_n_rs_seq(ctx));
+    }
+
+    void restore_spec_context(
+            server_slot & slot,
+            llama_context * ctx,
+            common_context_seq_rm_type rm_type,
+            int32_t n_rollback,
+            bool target) {
+        const auto & ckpt = slot.spec_ckpt;
+        if (uses_spec_checkpoint(rm_type, ctx, n_rollback)) {
+            if (target) {
+                ckpt.load_tgt(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            } else {
+                ckpt.load_dft(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+        common_context_seq_rm(ctx, slot.id, ckpt.pos_max + 1, -1);
+    }
+
+    int decode_serial_anchor(server_slot & slot, llama_token & sampled, bool process_spec) {
+        llama_token token = slot.sampled;
+        llama_pos pos = slot.spec_ckpt.pos_max + 1;
+        int32_t n_seq_id = 1;
+        llama_seq_id seq_id = slot.id;
+        llama_seq_id * seq_ids[] = { &seq_id };
+        int8_t logits = 1;
+        llama_batch serial_batch = {
+            1,
+            &token,
+            nullptr,
+            &pos,
+            &n_seq_id,
+            seq_ids,
+            &logits,
+        };
+
+        const int ret = llama_decode(slot.ctx_tgt, serial_batch);
+        metrics.on_decoded(slots);
+        if (ret != 0) {
+            return ret;
+        }
+        if (process_spec && !common_speculative_process(spec.get(), serial_batch)) {
+            return -2;
+        }
+
+        common_sampler_ptr smpl(common_sampler_clone(slot.smpl.get()));
+        sampled = common_sampler_sample(smpl.get(), slot.ctx_tgt, 0);
+        return 0;
+    }
+
     void update_slots() {
         maintain_retention();
 
@@ -6175,12 +6251,16 @@ private:
             }
 
             if (!draft.empty()) {
+                const int32_t n_anchor_rollback = draft.size() +
+                    (slot.task->params.speculative_serial_anchor ? 1 : 0);
                 const bool use_ckpt_tgt =
                     ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    static_cast<uint32_t>(n_anchor_rollback) > llama_n_rs_seq(ctx_tgt));
 
                 const bool use_ckpt_dft =
-                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
+                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                    static_cast<uint32_t>(n_anchor_rollback) > llama_n_rs_seq(ctx_dft.get()));
 
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
@@ -6776,6 +6856,33 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        bool serial_anchor_failed = false;
+        for (auto * slot_ptr : generating) {
+            auto & slot = *slot_ptr;
+            if (!slot.task->params.speculative_serial_anchor || slot.spec_draft.empty()) {
+                continue;
+            }
+
+            const int ret = decode_serial_anchor(slot, slot.spec_anchor, false);
+            if (ret != 0) {
+                SLT_ERR(slot, "serial speculative anchor failed, ret=%d\n", ret);
+                serial_anchor_failed = true;
+                break;
+            }
+            restore_spec_context(slot, slot.ctx_tgt, ctx_tgt_seq_rm_type, 1, true);
+        }
+
+        if (serial_anchor_failed) {
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    send_error(slot, "serial speculative anchor failed");
+                    slot.release();
+                    slot.prompt_clear(false);
+                }
+            }
+            return;
+        }
+
         if (batch.n_tokens == 0) {
             SRV_WRN("%s", "no tokens to decode\n");
 
@@ -7040,6 +7147,8 @@ private:
 
                 GGML_ASSERT(n_draft > 0);
 
+                bool serial_fallback = false;
+
                 // verify and try to accept the draft
                 {
                     // save the sampler sampler state in case we need to restore it
@@ -7051,50 +7160,102 @@ private:
 
                     GGML_ASSERT(accepted.size() >= 1);
 
-                    const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+                    if (slot.task->params.speculative_serial_anchor) {
+                        GGML_ASSERT(slot.spec_anchor != LLAMA_TOKEN_NULL);
 
-                    const bool use_ckpt_tgt =
-                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                       (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                        const llama_token serial_token = slot.spec_anchor;
+                        const llama_token batched_token = accepted.front();
+                        const bool anchor_match = serial_token == batched_token;
 
-                    // check for partial draft acceptance
-                    if (n_rollback > 0) {
-                        if (use_ckpt_tgt) {
-                            if (trace > 0) {
-                                SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
-                            }
+                        slot.n_draft_anchor++;
+                        slot.draft_anchor_serial_tokens.push_back(serial_token);
+                        slot.draft_anchor_batched_tokens.push_back(batched_token);
+                        slot.spec_anchor = LLAMA_TOKEN_NULL;
 
-                            // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                            slot.spec_draft = std::move(accepted);
+                        if (anchor_match) {
+                            slot.n_draft_anchor_match++;
+                        } else {
+                            slot.n_draft_anchor_fallback++;
+                            serial_fallback = true;
 
-                            const auto & ckpt = slot.spec_ckpt;
+                            SLT_WRN(slot,
+                                    "serial anchor mismatch: serial=%d batched=%d draft=%zu; falling back\n",
+                                    serial_token, batched_token, n_draft);
 
-                            SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
-
-                            {
-                                ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                                common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
-                            }
-
+                            const int32_t n_rollback = static_cast<int32_t>(n_draft + 1);
+                            restore_spec_context(slot, slot.ctx_tgt, ctx_tgt_seq_rm_type, n_rollback, true);
                             if (slot.ctx_dft) {
-                                ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                                common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                                restore_spec_context(slot, slot.ctx_dft, ctx_dft_seq_rm_type, n_rollback, false);
                             }
 
-                            slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                            slot.prompt.tokens.keep_first(slot.spec_ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
 
-                            continue;
+                            llama_token replayed = LLAMA_TOKEN_NULL;
+                            const int ret = decode_serial_anchor(slot, replayed, true);
+                            if (ret != 0 || replayed != serial_token) {
+                                SLT_ERR(slot,
+                                        "serial anchor replay failed, ret=%d expected=%d replayed=%d\n",
+                                        ret, serial_token, replayed);
+                                send_error(slot, "serial speculative anchor replay failed");
+                                slot.release();
+                                slot.prompt_clear(false);
+                                continue;
+                            }
+
+                            common_sampler_accept(slot.smpl.get(), serial_token, true);
+                            common_speculative_accept(spec.get(), slot.id, 0);
+
+                            accepted.assign(1, serial_token);
+                            slot.prompt.tokens.push_back(slot.sampled);
                         }
                     }
 
-                    if (trace > 0) {
-                        SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
-                    }
+                    if (!serial_fallback) {
+                        const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
-                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                        const bool use_ckpt_tgt = uses_spec_checkpoint(
+                            ctx_tgt_seq_rm_type, ctx_tgt, n_rollback);
+
+                        // check for partial draft acceptance
+                        if (n_rollback > 0) {
+                            if (use_ckpt_tgt) {
+                                if (trace > 0) {
+                                    SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                                }
+
+                                // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                                slot.spec_draft = std::move(accepted);
+
+                                const auto & ckpt = slot.spec_ckpt;
+
+                                SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                                {
+                                    ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                                    common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
+                                }
+
+                                if (slot.ctx_dft) {
+                                    ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+                                    common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                                }
+
+                                slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                                slot.smpl = std::move(smpl_save);
+
+                                continue;
+                            }
+                        }
+
+                        if (trace > 0) {
+                            SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                        }
+
+                        common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                    }
 
                     slot.spec_draft = std::move(accepted);
                 }
@@ -7109,16 +7270,20 @@ private:
                 slot.n_draft_accepted += ids.size() - 1;
                 slot.n_draft_accepted_per_round.push_back(static_cast<int32_t>(ids.size()) - 1);
 
-                // add accepted tokens to the prompt
-                slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
-                slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+                if (!serial_fallback) {
+                    // add accepted tokens to the prompt
+                    slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                    slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+                }
 
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
-                if (slot.ctx_dft) {
-                    common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (!serial_fallback) {
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    if (slot.ctx_dft) {
+                        common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    }
                 }
 
                 for (size_t i = 0; i < ids.size(); ++i) {

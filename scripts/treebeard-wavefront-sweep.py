@@ -91,6 +91,7 @@ def run_request(
     n_predict: int,
     seed: int,
     timeout: float,
+    serial_anchor: bool,
 ) -> dict[str, Any]:
     payload = {
         "prompt": case["prompt"],
@@ -103,6 +104,7 @@ def run_request(
         "ignore_eos": True,
         "stop": [],
         "speculative.n_max": width,
+        "speculative.serial_anchor": serial_anchor,
     }
     started = time.perf_counter()
     response = http_json("POST", f"http://127.0.0.1:{port}/completion", payload, timeout)
@@ -111,6 +113,22 @@ def run_request(
     tokens = response.get("tokens")
     if not isinstance(tokens, list) or not all(isinstance(token, int) and not isinstance(token, bool) for token in tokens):
         raise RuntimeError("server response did not contain an integer token list")
+    anchor_n = int(timings.get("draft_anchor_n") or 0)
+    anchor_match_n = int(timings.get("draft_anchor_match_n") or 0)
+    anchor_fallback_n = int(timings.get("draft_anchor_fallback_n") or 0)
+    anchor_serial = list(timings.get("draft_anchor_serial_tokens") or [])
+    anchor_batched = list(timings.get("draft_anchor_batched_tokens") or [])
+    draft_n = int(timings.get("draft_n") or 0)
+    if anchor_n != len(anchor_serial) or anchor_n != len(anchor_batched):
+        raise RuntimeError("serial anchor token arrays are not aligned")
+    if anchor_match_n + anchor_fallback_n != anchor_n:
+        raise RuntimeError("serial anchor outcomes do not match the anchor total")
+    if sum(a == b for a, b in zip(anchor_serial, anchor_batched)) != anchor_match_n:
+        raise RuntimeError("serial anchor token comparisons do not match the reported outcomes")
+    if (width == 0 or not serial_anchor) and anchor_n:
+        raise RuntimeError("serial anchor telemetry was emitted for an unanchored request")
+    if serial_anchor and draft_n > 0 and anchor_n == 0:
+        raise RuntimeError("drafted request did not execute a serial anchor")
     return {
         "case_id": case["id"],
         "width": width,
@@ -118,10 +136,15 @@ def run_request(
         "tokens": tokens,
         "predicted_n": int(timings.get("predicted_n") or len(tokens)),
         "predicted_tps": timings.get("predicted_per_second"),
-        "draft_n": int(timings.get("draft_n") or 0),
+        "draft_n": draft_n,
         "draft_n_accepted": int(timings.get("draft_n_accepted") or 0),
         "draft_n_per_round": list(timings.get("draft_n_per_round") or []),
         "draft_n_accepted_per_round": list(timings.get("draft_n_accepted_per_round") or []),
+        "draft_anchor_n": anchor_n,
+        "draft_anchor_match_n": anchor_match_n,
+        "draft_anchor_fallback_n": anchor_fallback_n,
+        "draft_anchor_serial_tokens": anchor_serial,
+        "draft_anchor_batched_tokens": anchor_batched,
     }
 
 
@@ -137,6 +160,9 @@ def summarize(samples: list[dict[str, Any]], widths: list[int]) -> list[dict[str
         walls = [float(sample["wall_s"]) for sample in selected]
         drafted = sum(int(sample["draft_n"]) for sample in selected)
         accepted = sum(int(sample["draft_n_accepted"]) for sample in selected)
+        anchor_n = sum(int(sample.get("draft_anchor_n") or 0) for sample in selected)
+        anchor_match_n = sum(int(sample.get("draft_anchor_match_n") or 0) for sample in selected)
+        anchor_fallback_n = sum(int(sample.get("draft_anchor_fallback_n") or 0) for sample in selected)
         predicted = sum(int(sample["predicted_n"]) for sample in selected)
         parity = [sample["tokens"] == control_by_case.get(sample["case_id"]) for sample in selected]
         rows.append(
@@ -150,6 +176,10 @@ def summarize(samples: list[dict[str, Any]], widths: list[int]) -> list[dict[str
                 "draft_n_accepted": accepted,
                 "acceptance": accepted / drafted if drafted else None,
                 "draft_rounds": sum(len(sample["draft_n_per_round"]) for sample in selected),
+                "draft_anchor_n": anchor_n,
+                "draft_anchor_match_n": anchor_match_n,
+                "draft_anchor_fallback_n": anchor_fallback_n,
+                "draft_anchor_match_rate": anchor_match_n / anchor_n if anchor_n else None,
                 "greedy_parity": all(parity),
             }
         )
@@ -173,6 +203,7 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--strict-parity", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--aba", action=argparse.BooleanOptionalAction, default=True, help="Bracket each rotated width sweep with width-0 controls")
+    parser.add_argument("--serial-anchor", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     widths = parse_widths(args.widths)
@@ -196,6 +227,7 @@ def main() -> int:
                     args.n_predict,
                     args.seed + repeat * 1000 + case_index,
                     args.timeout,
+                    args.serial_anchor,
                 )
                 sample["repeat"] = repeat
                 sample["order"] = request_index
@@ -224,6 +256,7 @@ def main() -> int:
             "n_predict": args.n_predict,
             "seed": args.seed,
             "aba": args.aba,
+            "serial_anchor": args.serial_anchor,
             "cases": [case["id"] for case in cases],
         },
         "summary": summary,

@@ -167,6 +167,33 @@ def validate_rounds(width: int, proposed: list[Any], accepted: list[Any]) -> Non
             raise RuntimeError(f"draft round width {draft_n} exceeded request cap {width}")
 
 
+def validate_anchor_telemetry(width: int, enabled: bool, timings: dict[str, Any]) -> dict[str, Any]:
+    anchor_n = int(timings.get("draft_anchor_n") or 0)
+    match_n = int(timings.get("draft_anchor_match_n") or 0)
+    fallback_n = int(timings.get("draft_anchor_fallback_n") or 0)
+    serial_tokens = list(timings.get("draft_anchor_serial_tokens") or [])
+    batched_tokens = list(timings.get("draft_anchor_batched_tokens") or [])
+    values = [anchor_n, match_n, fallback_n, *serial_tokens, *batched_tokens]
+    if not all(type(value) is int for value in values):
+        raise RuntimeError("serial anchor telemetry contains a non-integer")
+    if anchor_n != len(serial_tokens) or anchor_n != len(batched_tokens):
+        raise RuntimeError("serial anchor token arrays are not aligned")
+    if match_n + fallback_n != anchor_n:
+        raise RuntimeError("serial anchor outcomes do not match the anchor total")
+    observed_matches = sum(serial == batched for serial, batched in zip(serial_tokens, batched_tokens))
+    if observed_matches != match_n:
+        raise RuntimeError("serial anchor token comparisons do not match the reported outcomes")
+    if (width == 0 or not enabled) and anchor_n:
+        raise RuntimeError("serial anchor telemetry was emitted for an unanchored request")
+    return {
+        "draft_anchor_n": anchor_n,
+        "draft_anchor_match_n": match_n,
+        "draft_anchor_fallback_n": fallback_n,
+        "draft_anchor_serial_tokens": serial_tokens,
+        "draft_anchor_batched_tokens": batched_tokens,
+    }
+
+
 def completion(
     base_url: str,
     prompt: list[int],
@@ -175,6 +202,7 @@ def completion(
     n_predict: int,
     seed: int,
     timeout: float,
+    serial_anchor: bool,
 ) -> dict[str, Any]:
     payload = {
         "prompt": prompt,
@@ -189,6 +217,7 @@ def completion(
         "stop": [],
         "stream": False,
         "speculative.n_max": width,
+        "speculative.serial_anchor": serial_anchor,
     }
     started = time.perf_counter()
     response = http_json("POST", f"{base_url}/completion", payload, timeout)
@@ -220,6 +249,9 @@ def completion(
     draft_n_accepted = int(timings.get("draft_n_accepted") or 0)
     if sum(proposed) != draft_n or sum(accepted) != draft_n_accepted:
         raise RuntimeError("per-round draft telemetry does not match totals")
+    anchor = validate_anchor_telemetry(width, serial_anchor, timings)
+    if serial_anchor and draft_n > 0 and anchor["draft_anchor_n"] == 0:
+        raise RuntimeError("drafted request did not execute a serial anchor")
     if response.get("truncated") is True:
         raise RuntimeError("completion unexpectedly truncated its prompt")
     wall_s = ended - started
@@ -244,6 +276,7 @@ def completion(
         "draft_n_accepted": draft_n_accepted,
         "draft_n_per_round": proposed,
         "draft_n_accepted_per_round": accepted,
+        **anchor,
     }
 
 
@@ -276,6 +309,9 @@ def summarize_matched(samples: list[dict[str, Any]], widths: list[int]) -> list[
                 gains_wall.append(midpoint_gain(sample["wall_tps"], before["wall_tps"], after["wall_tps"]))
         drafted = sum(int(sample["draft_n"]) for sample in selected)
         accepted = sum(int(sample["draft_n_accepted"]) for sample in selected)
+        anchor_n = sum(int(sample.get("draft_anchor_n") or 0) for sample in selected)
+        anchor_match_n = sum(int(sample.get("draft_anchor_match_n") or 0) for sample in selected)
+        anchor_fallback_n = sum(int(sample.get("draft_anchor_fallback_n") or 0) for sample in selected)
         rows.append({
             "width": width,
             "samples": len(selected),
@@ -286,6 +322,10 @@ def summarize_matched(samples: list[dict[str, Any]], widths: list[int]) -> list[
             "draft_n": drafted,
             "draft_n_accepted": accepted,
             "acceptance": accepted / drafted if drafted else None,
+            "draft_anchor_n": anchor_n,
+            "draft_anchor_match_n": anchor_match_n,
+            "draft_anchor_fallback_n": anchor_fallback_n,
+            "draft_anchor_match_rate": anchor_match_n / anchor_n if anchor_n else None,
             "proposal_coverage": (
                 sum(int(sample["draft_n"] > 0) for sample in selected) / len(selected)
                 if selected else None
@@ -311,6 +351,7 @@ def run_single_suite(
     timeout: float,
     sample_file: Any,
     reuse_case_prefix: bool,
+    serial_anchor: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     all_samples: list[dict[str, Any]] = []
     summaries: dict[str, list[dict[str, Any]]] = {}
@@ -322,7 +363,7 @@ def run_single_suite(
             prompt = build_prompt(filler, suffix, depth)
             if not reuse_case_prefix:
                 erase_slot(base_url, 0, timeout)
-            warmup = completion(base_url, prompt, 0, 0, min(16, n_predict), seed, timeout)
+            warmup = completion(base_url, prompt, 0, 0, min(16, n_predict), seed, timeout, serial_anchor)
             if warmup["draft_n"] != 0:
                 raise RuntimeError("single-suite warmup unexpectedly drafted tokens")
             case_samples: list[dict[str, Any]] = []
@@ -345,6 +386,7 @@ def run_single_suite(
                         n_predict,
                         seed + case_index,
                         timeout,
+                        serial_anchor,
                     )
                     phase = (
                         "before" if order_index == 0
@@ -383,12 +425,13 @@ def run_wave(
     n_predict: int,
     seed: int,
     timeout: float,
+    serial_anchor: bool,
 ) -> dict[str, Any]:
     barrier = threading.Barrier(active_agents)
 
     def one(slot: int) -> dict[str, Any]:
         barrier.wait()
-        return completion(base_url, prompt, slot, width, n_predict, seed + slot, timeout)
+        return completion(base_url, prompt, slot, width, n_predict, seed + slot, timeout, serial_anchor)
 
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=active_agents) as executor:
@@ -403,6 +446,9 @@ def run_wave(
         "predicted_n": active_agents * n_predict,
         "draft_n": sum(int(request["draft_n"]) for request in requests),
         "draft_n_accepted": sum(int(request["draft_n_accepted"]) for request in requests),
+        "draft_anchor_n": sum(int(request["draft_anchor_n"]) for request in requests),
+        "draft_anchor_match_n": sum(int(request["draft_anchor_match_n"]) for request in requests),
+        "draft_anchor_fallback_n": sum(int(request["draft_anchor_fallback_n"]) for request in requests),
         "requests": requests,
     }
 
@@ -420,6 +466,7 @@ def run_concurrency_suite(
     timeout: float,
     sample_file: Any,
     reuse_case_prefix: bool,
+    serial_anchor: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     all_samples: list[dict[str, Any]] = []
     summaries: dict[str, list[dict[str, Any]]] = {}
@@ -432,7 +479,7 @@ def run_concurrency_suite(
         if not reuse_case_prefix:
             for slot in range(active_agents):
                 erase_slot(base_url, slot, timeout)
-        run_wave(base_url, prompt, active_agents, 0, min(16, n_predict), seed, timeout)
+        run_wave(base_url, prompt, active_agents, 0, min(16, n_predict), seed, timeout, serial_anchor)
         case_samples: list[dict[str, Any]] = []
         for repeat in range(repeats):
             offset = repeat % max(1, len(nonzero))
@@ -453,6 +500,7 @@ def run_concurrency_suite(
                     n_predict,
                     seed + case_index * 1000,
                     timeout,
+                    serial_anchor,
                 )
                 phase = (
                     "before" if order_index == 0
@@ -503,6 +551,7 @@ def main() -> int:
     parser.add_argument("--strict-parity", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--run-concurrency", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reuse-case-prefix", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--serial-anchor", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     depths = parse_int_list(args.depths)
@@ -539,6 +588,7 @@ def main() -> int:
             "strict_parity": args.strict_parity,
             "run_concurrency": args.run_concurrency,
             "reuse_case_prefix": args.reuse_case_prefix,
+            "serial_anchor": args.serial_anchor,
         },
         "passed": False,
         "failures": [],
@@ -575,6 +625,7 @@ def main() -> int:
                 args.timeout,
                 sample_file,
                 args.reuse_case_prefix,
+                args.serial_anchor,
             )
             if args.run_concurrency:
                 concurrency_samples, concurrency_summary = run_concurrency_suite(
@@ -590,6 +641,7 @@ def main() -> int:
                     args.timeout,
                     sample_file,
                     args.reuse_case_prefix,
+                    args.serial_anchor,
                 )
             else:
                 concurrency_samples, concurrency_summary = [], {}

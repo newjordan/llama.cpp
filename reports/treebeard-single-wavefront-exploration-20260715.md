@@ -112,6 +112,31 @@ draft_n_accepted_per_round
 The per-round arrays expose the actual verifier shape and committed work rather
 than only a final acceptance ratio.
 
+### Serial top-1 commit anchor
+
+Greedy speculative requests can now opt into:
+
+```json
+{"speculative.serial_anchor": true}
+```
+
+Before the target evaluates the wide verification batch, the server decodes
+the block's first input token alone from the speculative checkpoint and samples
+its top-1 with a cloned sampler. The target context is then restored and the
+wide batch is evaluated. The block can use the normal commit path only when its
+first batched top-1 matches the serial anchor.
+
+On a mismatch, the server restores the target context, draft context, prompt,
+and sampler to the pre-block checkpoint. It then replays only the serial
+transition, commits zero draft tokens from the mismatched block, and resumes
+generation from that serial result. The feature is rejected for nonzero
+temperature and backend sampling because the contract is specifically serial
+greedy top-1 parity.
+
+The response timing object records the number of anchor checks, matches, and
+fallbacks plus the serial and batched token IDs. Both wavefront harnesses
+validate that these arrays and counts agree before accepting an artifact.
+
 ### Width sweep harness
 
 `scripts/treebeard-wavefront-sweep.py`:
@@ -159,6 +184,21 @@ The code-edit and free-prose cases generated no proposals. Their width results
 stayed within roughly -1.80% to +0.47% of their controls. This is the most
 important policy observation: width selection matters only after a proposal
 exists. The first controller decision is coverage, not width.
+
+### Serial-anchor CPU smoke
+
+Artifact:
+
+```text
+/home/frosty40/turbo/treebeard-work/results/treebeard-single-wavefront/serial-anchor-cpu-proposal-smoke-20260714.json
+```
+
+The isolated Qwen3.5 0.8B CPU smoke compared widths 0, 4, and 8 for 64 greedy
+tokens. Width 4 executed 8 anchor checks and width 8 executed 6. All 14 anchors
+matched, both speculative outputs exactly matched width 0, and the candidates
+accepted 32/32 and 36/37 proposed tokens respectively. This validates the
+match path and telemetry on a proposal-bearing workload; the B70 shallow gate
+is still required to exercise the known divergent backend and its fallback.
 
 ## Implemented quality surface
 
@@ -279,18 +319,22 @@ proposal, but proposal coverage and acceptance did not guarantee agreement
 with serial greedy decode. Coverage is necessary for speed; exact transition
 parity is necessary for correctness.
 
-### The next B70 question is narrow
+### The remaining B70 question is narrow
 
-The width curve is now measured. The remaining question is:
+The width curve is measured and the serial block-head anchor is implemented.
+The remaining question is:
 
 ```text
-How can B70 retain efficient multi-column target evaluation while anchoring
-every committed transition to the serial width-zero top-1 decision?
+Does the serial block-head anchor catch B70's observed batched divergence early
+enough to preserve exact shallow width-zero output while retaining useful wide
+verification?
 ```
 
-The current verifier cannot answer that safely. The next implementation must
-detect batched-versus-serial disagreement before commit, then prove shallow
-exact parity before another long-context maintenance run.
+The implementation detects a first-transition disagreement before commit and
+falls back to the serial transition. A matching block-head anchor does not by
+itself prove that every later accepted column equals an independently serial
+decode, so exact shallow parity remains the release gate before another
+long-context maintenance run.
 
 ## Parked paths
 
@@ -308,6 +352,10 @@ exact parity before another long-context maintenance run.
 - Candidate `llama-server` release build completed with Intel oneAPI/SYCL.
 - Python benchmark/controller tests: 27 passed.
 - `git diff --check`: passed.
+- Serial-anchor focused Python tests: 9 passed.
+- Serial-anchor CPU proposal smoke: exact width-0 parity at widths 4 and 8,
+  14/14 matching anchor checks, and 68/69 accepted proposals.
+- Serial-anchor non-greedy request rejection: HTTP 400 with the expected error.
 - CPU width gate: 54/54 exact greedy parity.
 - Per-round cap and telemetry alignment: passed for all 54 samples.
 - Invalid negative request cap: HTTP 400 with the expected error.
@@ -323,15 +371,15 @@ exact parity before another long-context maintenance run.
 
 ## Next controlled gate
 
-The planned B70 width sweep is complete and rejects the current candidate. The
-next gate should happen at shallow context before another production
+The serial anchor is implemented and its isolated CPU gate passes. The next
+gate should happen at shallow B70 context before another long-context
 maintenance run:
 
-1. Compare batched-verifier and serial width-zero top-1 decisions before every
-   speculative commit.
-2. Localize the first logit divergence by operator and batch width, beginning
-   with the accepted MoE fusions while retaining a generic-backend control.
-3. Fall back to the serial transition whenever the anchor disagrees.
-4. Require exact parity at shallow context before repeating any 32K or 256K
+1. Confirm that the known divergent widths produce anchor fallbacks and exact
+   width-zero token parity.
+2. Localize any mismatch that survives a matching block-head anchor by operator
+   and batch column, beginning with the accepted MoE fusions while retaining a
+   generic-backend control.
+3. Require exact parity at shallow context before repeating any 32K or 256K
    measurement.
-5. Only then remeasure throughput and the twelve-agent regression guard.
+4. Only then remeasure throughput and the twelve-agent regression guard.

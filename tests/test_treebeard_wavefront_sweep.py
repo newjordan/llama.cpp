@@ -44,12 +44,16 @@ class SummaryTests(unittest.TestCase):
                 "draft_n": 4,
                 "draft_n_accepted": 2,
                 "draft_n_per_round": [4],
+                "draft_anchor_n": 2,
+                "draft_anchor_match_n": 1,
+                "draft_anchor_fallback_n": 1,
             },
         ]
 
         rows = sweep.summarize(samples, [0, 4])
 
         self.assertEqual(rows[1]["acceptance"], 0.5)
+        self.assertEqual(rows[1]["draft_anchor_match_rate"], 0.5)
         self.assertEqual(rows[1]["wall_p50_speedup"], 2.0)
         self.assertTrue(rows[1]["greedy_parity"])
 

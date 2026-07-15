@@ -78,6 +78,7 @@ json task_params::to_json(bool only_metrics) const {
             {"samplers",                  samplers},
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"speculative.n_max",         speculative_n_max},
+            {"speculative.serial_anchor", speculative_serial_anchor},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -136,6 +137,7 @@ json task_params::to_json(bool only_metrics) const {
         {"samplers",                  samplers},
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"speculative.n_max",         speculative_n_max},
+        {"speculative.serial_anchor", speculative_serial_anchor},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -278,6 +280,7 @@ task_params server_task::params_from_json_cmpl(
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
     params.speculative_n_max = json_value(data,      "speculative.n_max",  defaults.speculative_n_max);
+    params.speculative_serial_anchor = json_value(data, "speculative.serial_anchor", false);
     if (params.speculative_n_max < -1) {
         throw std::runtime_error("speculative.n_max must be -1 or non-negative");
     }
@@ -625,6 +628,14 @@ task_params server_task::params_from_json_cmpl(
         throw std::runtime_error("n_cmpl cannot be greater than the number of slots, please increase -np");
     }
 
+    if (params.speculative_serial_anchor && params.sampling.temp != 0.0f) {
+        throw std::runtime_error("speculative.serial_anchor requires temperature 0");
+    }
+
+    if (params.speculative_serial_anchor && params.sampling.backend_sampling) {
+        throw std::runtime_error("speculative.serial_anchor does not support backend sampling");
+    }
+
     return params;
 }
 
@@ -652,6 +663,14 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
         base["draft_n_per_round"] = draft_n_per_round;
         base["draft_n_accepted_per_round"] = draft_n_accepted_per_round;
+    }
+
+    if (draft_anchor_n > 0) {
+        base["draft_anchor_n"] = draft_anchor_n;
+        base["draft_anchor_match_n"] = draft_anchor_match_n;
+        base["draft_anchor_fallback_n"] = draft_anchor_fallback_n;
+        base["draft_anchor_serial_tokens"] = draft_anchor_serial_tokens;
+        base["draft_anchor_batched_tokens"] = draft_anchor_batched_tokens;
     }
 
     return base;

@@ -21,6 +21,8 @@ WIDTHS=${TREEBEARD_WAVEFRONT_WIDTHS:-0,1,2,4,8,12,24,48}
 CASES=${TREEBEARD_WAVEFRONT_CASES:-structured-copy,code-edit,free-prose}
 RUN_CONCURRENCY=${TREEBEARD_WAVEFRONT_RUN_CONCURRENCY:-1}
 DISABLE_MOE_FUSIONS=${TREEBEARD_WAVEFRONT_DISABLE_MOE_FUSIONS:-0}
+SERIAL_ANCHOR=${TREEBEARD_WAVEFRONT_SERIAL_ANCHOR:-1}
+STRICT_PARITY=${TREEBEARD_WAVEFRONT_STRICT_PARITY:-1}
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-single-wavefront-b70/$RUN_ID"
 CANDIDATE_PID=
@@ -189,12 +191,22 @@ if [[ "$RUN_CONCURRENCY" != 1 ]]; then
     concurrency_arg=--no-run-concurrency
 fi
 
+anchor_arg=--serial-anchor
+if [[ "$SERIAL_ANCHOR" != 1 ]]; then
+    anchor_arg=--no-serial-anchor
+fi
+
+parity_arg=--strict-parity
+if [[ "$STRICT_PARITY" != 1 ]]; then
+    parity_arg=--no-strict-parity
+fi
+
 python3 "$HARNESS" \
     --port "$PORT" --ctx 262144 --parallel 12 \
     --depths "$DEPTHS" --widths "$WIDTHS" --concurrency-widths "$WIDTHS" \
     --cases "$CASES" --repeats "$REPEATS" --concurrency-repeats "$CONCURRENCY_REPEATS" \
     --n-predict "$N_PREDICT" --timeout 1800 \
-    "$concurrency_arg" --reuse-case-prefix \
+    "$concurrency_arg" "$anchor_arg" "$parity_arg" --reuse-case-prefix \
     --out "$OUT/wavefront-b70.json" \
     2>&1 | tee "$OUT/wavefront-b70-console.log"
 

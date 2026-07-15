@@ -110,6 +110,37 @@ def test_with_ctx_shift():
     assert res.body["truncated"] == True
 
 
+def test_serial_anchor_reports_greedy_checks():
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 32,
+        "speculative.serial_anchor": True,
+    })
+    assert res.status_code == 200
+    timings = res.body["timings"]
+    assert timings["draft_anchor_n"] > 0
+    assert timings["draft_anchor_match_n"] + timings["draft_anchor_fallback_n"] == timings["draft_anchor_n"]
+    assert len(timings["draft_anchor_serial_tokens"]) == timings["draft_anchor_n"]
+    assert len(timings["draft_anchor_batched_tokens"]) == timings["draft_anchor_n"]
+
+
+def test_serial_anchor_rejects_sampling():
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.8,
+        "n_predict": 8,
+        "speculative.serial_anchor": True,
+    })
+    assert res.status_code == 400
+    assert "requires temperature 0" in res.body["error"]["message"]
+
+
 @pytest.mark.parametrize("n_slots,n_requests", [
     (1, 2),
     (2, 2),
