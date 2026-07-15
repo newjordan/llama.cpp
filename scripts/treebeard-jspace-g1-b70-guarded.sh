@@ -9,6 +9,9 @@ MODEL_SHA=25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506
 MANIFEST=${TREEBEARD_JSPACE_G1_MANIFEST:-$ROOT/research/jspace-g1-20260715/g1-goemotions-manifest.json}
 MANIFEST_SHA=${TREEBEARD_JSPACE_G1_MANIFEST_SHA:-eee5eac3e2b0d9cd440a890af5504c5403ac52570c2db63e3bc19912c7e2e718}
 LAYERS=${TREEBEARD_JSPACE_G1_LAYERS:-2,3,10,11,18,19,26,27,34,35,38,39}
+EXPECTED_ROWS=${TREEBEARD_JSPACE_G1_EXPECTED_ROWS:-2304}
+EXPECTED_SCHEMA=${TREEBEARD_JSPACE_G1_EXPECTED_SCHEMA:-treebeard.jspace.g1.dataset.v1}
+PREFIX_NAME=${TREEBEARD_JSPACE_G1_PREFIX_NAME:-qwen36-g1-12layer}
 SERVICE=turbo-statetree-rc4.service
 LIVE_PORT=8093
 EXPECTED_BUILD=b9627-3fcf1c626
@@ -16,7 +19,7 @@ EXPECTED_ALIAS=turbo-statetree-0.1.0-rc.4-Qwen3.6-35B-A3B-Q5-c262144-np12-moe-t2
 EXPECTED_SERVER_SHA=211d4115d455ed506c3e23c9cc45312ca2062cf8ea426b11b3273735d0775bff
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-jspace-g1-b70/$RUN_ID"
-PREFIX="$OUT/qwen36-g1-12layer"
+PREFIX="$OUT/$PREFIX_NAME"
 
 mkdir -p "$OUT/maintenance" "$OUT/candidate"
 printf '%s\n' "$OUT" > "$ROOT/results/treebeard-jspace-g1-b70/latest-run.txt"
@@ -104,7 +107,8 @@ sha256sum "$BUILD/bin/llama-jspace-sensor-extract" "$BUILD/bin/libggml-sycl.so" 
     > "$OUT/candidate/runtime.sha256"
 git -C "$WORKTREE" rev-parse HEAD > "$OUT/candidate/source-head.txt"
 git -C "$WORKTREE" diff -- \
-    scripts/treebeard-jspace-g1-manifest.py scripts/treebeard-jspace-g1-b70-guarded.sh \
+    scripts/treebeard-jspace-g1-manifest.py scripts/treebeard-jspace-g1-controls.py \
+    scripts/treebeard-jspace-g1-b70-guarded.sh \
     tools/jspace-probe/CMakeLists.txt tools/jspace-probe/README.md \
     tools/jspace-probe/jspace-sensor-extract.cpp \
     > "$OUT/candidate/source.patch"
@@ -142,13 +146,15 @@ env \
     2> "$OUT/candidate/extractor.log"
 
 jq -e --arg manifest_sha "$MANIFEST_SHA" --arg model_sha "$MODEL_SHA" \
+    --arg dataset_schema "$EXPECTED_SCHEMA" --argjson rows "$EXPECTED_ROWS" \
     '.schema == "treebeard.jspace.g1.activations.v1" and
      .status == "exact_runtime_last_token_residuals" and
      .dataset.runner_verified_sha256 == $manifest_sha and
+     .dataset.schema == $dataset_schema and
      .model.runner_verified_sha256 == $model_sha and
      .raw.dtype == "little_endian_float32" and
-     .raw.shape == [2304,12,2048] and
-     (.rows | length) == 2304 and
+     .raw.shape == [$rows,12,2048] and
+     (.rows | length) == $rows and
      .capture.layers == [2,3,10,11,18,19,26,27,34,35,38,39] and
      .capture.chat_template == false and
      .capture.parse_special == false and

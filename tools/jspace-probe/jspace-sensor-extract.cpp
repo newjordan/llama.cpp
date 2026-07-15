@@ -214,7 +214,9 @@ static json read_manifest(const std::string & path) {
         throw std::runtime_error("failed to open manifest: " + path);
     }
     json document = json::parse(input);
-    if (document.value("schema", "") != "treebeard.jspace.g1.dataset.v1" ||
+    const std::string schema = document.value("schema", "");
+    if ((schema != "treebeard.jspace.g1.dataset.v1" &&
+            schema != "treebeard.jspace.g1.controls.v1") ||
             !document.contains("rows") || !document["rows"].is_array() || document["rows"].empty()) {
         throw std::runtime_error("unsupported or empty J-Space G1 manifest");
     }
@@ -225,7 +227,7 @@ static json read_manifest(const std::string & path) {
                 throw std::runtime_error(std::string("manifest row has invalid field: ") + field);
             }
         }
-        if (row.value("anchor_echo", true)) {
+        if (schema == "treebeard.jspace.g1.dataset.v1" && row.value("anchor_echo", true)) {
             throw std::runtime_error("manifest row is not certified anchor-free");
         }
         if (!sample_ids.insert(row["sample_id"].get<std::string>()).second) {
