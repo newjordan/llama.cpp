@@ -6718,7 +6718,24 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // Optional per-op-type profiler (SIQ_PROF=1): serializes each op with a queue wait and accumulates
     // host-observed GPU time per op type. Serialization inflates absolutes (removes overlap) but the
     // RELATIVE breakdown + serialized-total-vs-wall ratio reveal where decode time goes. Diagnostic only.
+    // When SIQ_PROF_TRIGGER_FILE names a file, leave execution unmodified until that file exists. This
+    // permits a late profile window after expensive prompt/state setup without restarting the process.
     static const bool prof = getenv("SIQ_PROF") != nullptr;
+    static const std::string prof_trigger_file = []() {
+        const char * path = getenv("SIQ_PROF_TRIGGER_FILE");
+        return path != nullptr ? std::string(path) : std::string();
+    }();
+    static std::atomic<bool> prof_active { prof_trigger_file.empty() };
+    if (prof && !prof_active.load(std::memory_order_relaxed)) {
+        FILE * trigger = fopen(prof_trigger_file.c_str(), "rb");
+        if (trigger != nullptr) {
+            fclose(trigger);
+            if (!prof_active.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr, "[siq-prof] trigger active file=%s\n", prof_trigger_file.c_str());
+            }
+        }
+    }
+    const bool prof_now = prof && prof_active.load(std::memory_order_relaxed);
     static double op_us[GGML_OP_COUNT] = { 0 };
     static long   op_n [GGML_OP_COUNT] = { 0 };
     static double unary_us = 0;
@@ -6926,7 +6943,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         ggml_tensor * node = cgraph->nodes[i];
         const auto gather_plan = state_io_plan_for_gather(node);
         if (gather_plan != state_io_plan.end()) {
-            const double tf0 = prof ? now_us() : 0.0;
+            const double tf0 = prof_now ? now_us() : 0.0;
             ggml_tensor * marker = gather_plan->marker;
             if (marker->op == GGML_OP_SSM_CONV) {
                 ggml_sycl_state_io_gather_conflicts(
@@ -6938,7 +6955,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     *sycl_ctx, marker->src[6], marker->src[7], marker->src[9],
                     marker->src[8], gather_plan->n_rs);
             }
-            if (prof) {
+            if (prof_now) {
                 sycl_ctx->stream()->wait();
                 fusion_us[GGML_SYCL_FUSION_PROFILE_STATE_IO] += now_us() - tf0;
                 fusion_n[GGML_SYCL_FUSION_PROFILE_STATE_IO]++;
@@ -6956,7 +6973,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         if (state_io_contains(state_io_direct, node)) {
-            const double tf0 = prof ? now_us() : 0.0;
+            const double tf0 = prof_now ? now_us() : 0.0;
             const auto direct_plan = state_io_plan_for_marker(node);
             GGML_ASSERT(direct_plan != state_io_plan.end());
             if (node->op == GGML_OP_SSM_CONV) {
@@ -6969,7 +6986,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     *sycl_ctx, node, node->src[6], node->src[7], node->src[9],
                     node->src[8], direct_plan->n_rs);
             }
-            if (prof) {
+            if (prof_now) {
                 sycl_ctx->stream()->wait();
                 fusion_us[GGML_SYCL_FUSION_PROFILE_STATE_IO] += now_us() - tf0;
                 fusion_n[GGML_SYCL_FUSION_PROFILE_STATE_IO]++;
@@ -6978,14 +6995,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 
         {
-            const double tf0 = prof ? now_us() : 0.0;
+            const double tf0 = prof_now ? now_us() : 0.0;
             ggml_sycl_fusion_profile_kind fusion_kind = GGML_SYCL_FUSION_PROFILE_NONE;
             const int nodes_to_skip = ggml_sycl_try_fuse(
                 *sycl_ctx, cgraph, i, &fusion_kind);
             if (nodes_to_skip != 0) {
                 GGML_ASSERT(fusion_kind > GGML_SYCL_FUSION_PROFILE_NONE &&
                             fusion_kind < GGML_SYCL_FUSION_PROFILE_COUNT);
-                if (prof) {
+                if (prof_now) {
                     sycl_ctx->stream()->wait();
                     fusion_us[fusion_kind] += now_us() - tf0;
                     fusion_n[fusion_kind]++;
@@ -7002,9 +7019,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
-        const double t0 = prof ? now_us() : 0.0;
+        const double t0 = prof_now ? now_us() : 0.0;
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-        if (prof) {
+        if (prof_now) {
             sycl_ctx->stream()->wait();
             const double dt = now_us() - t0;
             if (node->op == GGML_OP_UNARY) { unary_us += dt; unary_n++; }
@@ -7023,7 +7040,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         GGML_ASSERT(ok);
     }
 
-    if (prof && (++geval % 50 == 0)) {
+    if (prof_now && (++geval % 50 == 0)) {
         struct row { const char * name; double us; long n; };
         std::vector<row> rows;
         for (int op = 0; op < GGML_OP_COUNT; ++op) {
