@@ -1,0 +1,78 @@
+{
+  "schema": "treebeard.jspace.g1.test.v2",
+  "status": "fail",
+  "inputs": {
+    "manifest_sha256": "8bd19e9de6f814be34b9b91c238d8a7c286d7c299d7af65ba6a88336567c87f3",
+    "metadata_sha256": "de3f0d623e3fceea3a4714700cc4910ae9fdb02b0e91d2c35b7d0bc2ec460d62",
+    "raw_sha256": "3194a370a613c82b4530e723a5182c7c841be82184b83a2fe02a5229530e7e8e",
+    "artifact_sha256": "ba3230c6f7046330ecf7a17fc1187062f5e5518ebadacf7037fec18068798768",
+    "rows": 160,
+    "source_split_counts": {
+      "calibration": 10,
+      "test": 11,
+      "train": 139
+    }
+  },
+  "gates": {
+    "macro_auroc_min": 0.8,
+    "macro_ece_max": 0.05,
+    "neutral_fpr_max": 0.1,
+    "abstention_coverage_min": 0.15,
+    "abstention_precision_min": 0.7
+  },
+  "macro_auroc": 0.8416964285714286,
+  "axis_auroc": {
+    "sadness": 0.8375,
+    "surprise": 0.9010714285714285,
+    "joy": 0.8582142857142857,
+    "disgust": 0.6728571428571428,
+    "fear": 0.8803571428571428,
+    "anger": 0.8203571428571429,
+    "curiosity": 0.9664285714285714,
+    "neutral": 0.7967857142857143
+  },
+  "macro_ece": 0.059329735490920125,
+  "axis_ece": {
+    "sadness": 0.060993716862706354,
+    "surprise": 0.04905674864972813,
+    "joy": 0.05473277622721445,
+    "disgust": 0.07426582296895018,
+    "fear": 0.07681279157611802,
+    "anger": 0.04499580392558944,
+    "curiosity": 0.03519894471864242,
+    "neutral": 0.07858127899841201
+  },
+  "macro_auroc_bootstrap": {
+    "replicates": 1000,
+    "p025": 0.8062321428571427,
+    "median": 0.8416741071428572,
+    "p975": 0.8737075892857143
+  },
+  "deadband": {
+    "threshold": 0.8732825440071169,
+    "neutral_fpr": 0.0
+  },
+  "abstention": {
+    "threshold": 0.891241233863245,
+    "coverage": 0.1375,
+    "precision": 0.8636363636363636
+  },
+  "token_count_diagnostic": {
+    "axis_pearson": {
+      "sadness": 0.03548630831051863,
+      "surprise": -0.2579707666955838,
+      "joy": -0.1273524687732557,
+      "disgust": 0.2829534576071849,
+      "fear": -0.37658120242764104,
+      "anger": -0.14708591317622924,
+      "curiosity": 0.23013288830011241,
+      "neutral": 0.5542334839230072
+    },
+    "maximum_absolute": 0.5542334839230072,
+    "interpretation": "report-only; no post-test representation change is permitted"
+  },
+  "label_shuffle_control": {
+    "mean_macro_auroc": 0.5061090959821428
+  },
+  "test_gate_pass": false
+}

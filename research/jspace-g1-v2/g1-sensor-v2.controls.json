@@ -1,0 +1,86 @@
+{
+  "schema": "treebeard.jspace.g1.controls-eval.v2",
+  "status": "pass",
+  "inputs": {
+    "manifest_sha256": "0a5d0322b8d07f1e791090265a214a76413e402ebc5791917d3c8d028fdc07dc",
+    "metadata_sha256": "5013d289af39fd7b350a180037d885c31a0ae723b0071cd424689a6b60e40578",
+    "raw_sha256": "7edea9aec421b3a2867c39e945f319d5e0f6b41b378ebbba672b57fbb3e73abc",
+    "artifact_sha256": "ba3230c6f7046330ecf7a17fc1187062f5e5518ebadacf7037fec18068798768",
+    "rows": 128
+  },
+  "gates": {
+    "direct_macro_auroc_min": 0.8,
+    "quotation_macro_auroc_min": 0.7,
+    "third_person_macro_auroc_min": 0.75,
+    "negation_pair_suppression_min": 0.7,
+    "neutral_flat_fpr_max": 0.1
+  },
+  "gate_checks": {
+    "direct": true,
+    "quotation": true,
+    "third_person": true,
+    "negation": true,
+    "neutral_flat": true,
+    "label_shuffle": true
+  },
+  "balanced_semantic_retention": {
+    "direct": {
+      "rows": 28,
+      "macro_auroc": 0.8154761904761906,
+      "axis_auroc": {
+        "sadness": 0.7604166666666666,
+        "surprise": 0.8125,
+        "joy": 0.9270833333333334,
+        "disgust": 0.8020833333333334,
+        "fear": 0.71875,
+        "anger": 0.8333333333333334,
+        "curiosity": 0.8541666666666666
+      },
+      "top1_accuracy": 0.25
+    },
+    "quotation": {
+      "rows": 28,
+      "macro_auroc": 0.7857142857142857,
+      "axis_auroc": {
+        "sadness": 0.7291666666666666,
+        "surprise": 0.8541666666666666,
+        "joy": 0.75,
+        "disgust": 0.78125,
+        "fear": 0.8541666666666666,
+        "anger": 0.7083333333333334,
+        "curiosity": 0.8229166666666666
+      },
+      "top1_accuracy": 0.25
+    },
+    "third_person": {
+      "rows": 28,
+      "macro_auroc": 0.7663690476190477,
+      "axis_auroc": {
+        "sadness": 0.6875,
+        "surprise": 0.75,
+        "joy": 0.9479166666666666,
+        "disgust": 0.7395833333333334,
+        "fear": 0.7083333333333334,
+        "anger": 0.78125,
+        "curiosity": 0.75
+      },
+      "top1_accuracy": 0.25
+    }
+  },
+  "negation_scope": {
+    "rows": 28,
+    "paired_target_score_suppression_rate": 0.7142857142857143,
+    "paired_target_score_delta_median": 0.1874361830436527,
+    "neutral_top1_rate": 0.0
+  },
+  "neutral_flat": {
+    "rows": 16,
+    "deadband_false_positive_rate": 0.0,
+    "neutral_top1_rate": 0.3125
+  },
+  "label_shuffle_control": {
+    "replicates": 64,
+    "mean_macro_auroc": 0.5084635416666666
+  },
+  "control_gate_pass": true
+}
