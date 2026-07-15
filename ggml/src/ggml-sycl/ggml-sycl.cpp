@@ -2532,7 +2532,13 @@ inline void ggml_sycl_op_mul_mat_sycl(
 
         {
             const int64_t gemm_flops = (int64_t)row_diff * src1_ncols * ne10;
-            const bool use_mkl_direct = gemm_flops < 256 * 256 * 256;
+            // oneDNN's FP32 router GEMM is not bit-reproducible on Intel B70 across
+            // repeated graph executions. Tiny router drift can change the selected
+            // experts and amplify into large output differences. Keep this semantic
+            // projection device-resident, but use oneMKL's reproducible FP32 path.
+            const bool is_moe_router = src0->type == GGML_TYPE_F32 &&
+                    std::strstr(src0->name, ".ffn_gate_inp.weight") != nullptr;
+            const bool use_mkl_direct = is_moe_router || gemm_flops < 256 * 256 * 256;
 #if GGML_SYCL_DNNL
             if (!g_ggml_sycl_disable_dnn && !use_mkl_direct) {
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,

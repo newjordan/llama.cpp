@@ -48,6 +48,26 @@ defined direction normalizations (`unit_l2_regularized_dual`,
 unknown identity metadata fails closed. The attested digest and accepted
 artifact identity are copied into the output JSON.
 
+`--verify-disabled-invariance N` is the G0 disabled-path stop gate. It accepts
+one probe vector, no base control vectors, and 1 through 32 greedy tokens. The
+probe compares a baseline with three same-process controls: an untouched replay,
+a graph rebuild with no artifact installed, and an artifact enable followed by
+an explicit `llama_set_adapter_cvec(data=null)` disable. Every arm starts from a
+full metadata-and-data memory clear. The gate requires bit-identical full-vocab
+logits at every greedy step, the same top-1 token sequence, and byte-identical
+serialized logical sequence state. A mismatch terminates the run and reports
+the first affected step plus logit mismatch magnitude; only a complete pass is
+written as `disabled_invariance.status = "pass"`.
+
+The B70 acceptance harness is `scripts/treebeard-jspace-b70-guarded.sh`. It
+hashes the model and candidate runtime, tests five fixed prompt strata (including
+a prompt that crosses the configured batch boundary), checks the kernel journal,
+and restores and re-verifies the exact production service under an exit trap.
+Its `TREEBEARD_JSPACE_CASE`, `TREEBEARD_JSPACE_BATCH`,
+`TREEBEARD_JSPACE_UBATCH`, `TREEBEARD_JSPACE_NGL`, and backend A/B environment
+variables are diagnostic controls; the default is the fully offloaded exact
+invariance corpus.
+
 Residual collection uses a selective evaluation callback. By default it
 transfers only the final column of the last `l_out` tensor. Fibonacci pooling
 retains only its largest complete suffix, capped at 144 columns (1.125 MiB for
@@ -104,6 +124,8 @@ The exact-Qwen3.6 multi-batch pooling smoke is recorded in
 [`reports/treebeard-jspace-fibonacci-smoke-20260713.md`](../../reports/treebeard-jspace-fibonacci-smoke-20260713.md).
 The fail-closed artifact admission check is recorded in
 [`reports/treebeard-jspace-g0-identity-20260715.md`](../../reports/treebeard-jspace-g0-identity-20260715.md).
+The disabled-path fence and the B70 MoE-router determinism fix are recorded in
+[`reports/treebeard-jspace-g0-disabled-invariance-20260715.md`](../../reports/treebeard-jspace-g0-disabled-invariance-20260715.md).
 
 The baseline full-vocabulary logits stay in-process (about 1 MiB for Qwen3.6)
 and are not serialized. Each sweep run reports full-vocabulary

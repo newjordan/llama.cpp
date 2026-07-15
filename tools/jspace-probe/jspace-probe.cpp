@@ -39,6 +39,7 @@ struct probe_args {
     std::vector<float>        probe_strengths;
     std::vector<char *>       common_argv;
     std::string               verified_model_sha256;
+    size_t                    disabled_invariance_tokens = 0;
     bool                      include_residual_vector = false;
     size_t                    fibonacci_pool_max_tokens = 0;
     bool                      self_test = false;
@@ -298,6 +299,19 @@ static size_t parse_fibonacci_pool_max_tokens(const std::string & value) {
     return static_cast<size_t>(parsed);
 }
 
+static size_t parse_disabled_invariance_tokens(const std::string & value) {
+    const std::string item = trim(value);
+    errno = 0;
+    char * parse_end = nullptr;
+    const unsigned long long parsed = std::strtoull(item.c_str(), &parse_end, 10);
+    if (item.empty() || errno == ERANGE || parse_end == item.c_str() || *parse_end != '\0' ||
+            parsed == 0 || parsed > 32) {
+        throw std::invalid_argument(
+                "--verify-disabled-invariance must be an integer from 1 through 32");
+    }
+    return static_cast<size_t>(parsed);
+}
+
 static probe_args::named_vector parse_named_vector(const std::string & value) {
     const size_t separator = value.find('=');
     if (separator == std::string::npos) {
@@ -339,6 +353,7 @@ static probe_args preprocess_args(int argc, char ** argv) {
     constexpr const char * strength_prefix = "--probe-strengths=";
     constexpr const char * fibonacci_prefix = "--fibonacci-pool-max=";
     constexpr const char * model_sha_prefix = "--verified-model-sha256=";
+    constexpr const char * disabled_invariance_prefix = "--verify-disabled-invariance=";
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
@@ -349,6 +364,18 @@ static probe_args preprocess_args(int argc, char ** argv) {
         }
         if (arg == "--include-residual-vector") {
             result.include_residual_vector = true;
+            continue;
+        }
+        if (arg == "--verify-disabled-invariance") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--verify-disabled-invariance requires a token count");
+            }
+            result.disabled_invariance_tokens = parse_disabled_invariance_tokens(argv[i]);
+            continue;
+        }
+        if (arg.compare(0, std::strlen(disabled_invariance_prefix), disabled_invariance_prefix) == 0) {
+            result.disabled_invariance_tokens = parse_disabled_invariance_tokens(
+                    arg.substr(std::strlen(disabled_invariance_prefix)));
             continue;
         }
         if (arg == "--verified-model-sha256") {
@@ -546,6 +573,8 @@ static void print_usage(int, char ** argv) {
     std::printf("                           include the final post-block residual values in JSON\n");
     std::printf("  --fibonacci-pool-max N\n");
     std::printf("                           pool residual columns over 1,2,3,5,... token horizons\n");
+    std::printf("  --verify-disabled-invariance N\n");
+    std::printf("                           require exact disabled-path parity for N greedy tokens\n");
     std::printf("  --self-test            run the model-independent deterministic smoke test\n\n");
 }
 
@@ -570,6 +599,9 @@ static int run_self_test() {
     }
     if (parse_fibonacci_pool_max_tokens("144") != 144) {
         throw std::runtime_error("Fibonacci pool-max parser self-test failed");
+    }
+    if (parse_disabled_invariance_tokens("32") != 32) {
+        throw std::runtime_error("disabled-invariance token parser self-test failed");
     }
     bool rejected_bad_pool_max = false;
     try {
@@ -887,6 +919,126 @@ struct evaluation_result {
     double             log_z = 0.0;
 };
 
+static llama_token greedy_top_1(const std::vector<float> & logits) {
+    if (logits.empty()) {
+        throw std::runtime_error("cannot sample from empty logits");
+    }
+    return static_cast<llama_token>(
+            std::distance(logits.begin(), std::max_element(logits.begin(), logits.end())));
+}
+
+static std::vector<float> decode_one_token_logits(
+        llama_context *         ctx,
+        llama_token             token,
+        residual_norm_capture & residual_capture) {
+    residual_capture.reset();
+    llama_batch batch = llama_batch_get_one(&token, 1);
+    const int32_t rc = llama_decode(ctx, batch);
+    if (rc != 0) {
+        throw std::runtime_error("disabled-invariance decode failed with code " + std::to_string(rc));
+    }
+    llama_synchronize(ctx);
+
+    const float * logits = llama_get_logits_ith(ctx, -1);
+    if (logits == nullptr) {
+        throw std::runtime_error("disabled-invariance logits are unavailable");
+    }
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    return std::vector<float>(logits, logits + n_vocab);
+}
+
+static std::vector<uint8_t> capture_sequence_state(llama_context * ctx) {
+    llama_synchronize(ctx);
+    const size_t size = llama_state_seq_get_size(ctx, 0);
+    if (size == 0) {
+        throw std::runtime_error("disabled-invariance sequence state is empty");
+    }
+    std::vector<uint8_t> data(size);
+    const size_t written = llama_state_seq_get_data(ctx, data.data(), data.size(), 0);
+    if (written != data.size()) {
+        throw std::runtime_error("disabled-invariance sequence state serialization failed");
+    }
+    return data;
+}
+
+struct disabled_invariance_trace {
+    std::vector<std::vector<float>> logits;
+    std::vector<llama_token>        sampled_tokens;
+    std::vector<uint8_t>            sequence_state;
+};
+
+static disabled_invariance_trace finish_disabled_invariance_trace(
+        llama_context *            ctx,
+        std::vector<float>          initial_logits,
+        size_t                      token_count,
+        residual_norm_capture &    residual_capture) {
+    disabled_invariance_trace result;
+    result.logits.reserve(token_count);
+    result.sampled_tokens.reserve(token_count);
+
+    auto logits = std::move(initial_logits);
+    for (size_t i = 0; i < token_count; ++i) {
+        const llama_token token = greedy_top_1(logits);
+        result.logits.push_back(std::move(logits));
+        result.sampled_tokens.push_back(token);
+        if (i + 1 < token_count) {
+            logits = decode_one_token_logits(ctx, token, residual_capture);
+        }
+    }
+    result.sequence_state = capture_sequence_state(ctx);
+    return result;
+}
+
+static bool bit_identical(const std::vector<float> & lhs, const std::vector<float> & rhs) {
+    return lhs.size() == rhs.size() &&
+            (lhs.empty() || std::memcmp(lhs.data(), rhs.data(), lhs.size() * sizeof(float)) == 0);
+}
+
+static void require_trace_identity(
+        const disabled_invariance_trace & baseline,
+        const disabled_invariance_trace & candidate,
+        const char *                      label) {
+    if (baseline.sampled_tokens != candidate.sampled_tokens) {
+        throw std::runtime_error(std::string(label) + " changed the greedy token sequence");
+    }
+    if (baseline.logits.size() != candidate.logits.size()) {
+        throw std::runtime_error(std::string(label) + " changed the logit-step count");
+    }
+    for (size_t i = 0; i < baseline.logits.size(); ++i) {
+        if (!bit_identical(baseline.logits[i], candidate.logits[i])) {
+            size_t mismatch_count = 0;
+            size_t max_index = 0;
+            double max_abs = 0.0;
+            for (size_t j = 0; j < baseline.logits[i].size(); ++j) {
+                uint32_t baseline_bits = 0;
+                uint32_t candidate_bits = 0;
+                std::memcpy(&baseline_bits, &baseline.logits[i][j], sizeof(baseline_bits));
+                std::memcpy(&candidate_bits, &candidate.logits[i][j], sizeof(candidate_bits));
+                if (baseline_bits == candidate_bits) {
+                    continue;
+                }
+                ++mismatch_count;
+                const double abs_diff = std::abs(
+                        static_cast<double>(baseline.logits[i][j]) - candidate.logits[i][j]);
+                if (abs_diff > max_abs) {
+                    max_abs = abs_diff;
+                    max_index = j;
+                }
+            }
+            throw std::runtime_error(
+                    std::string(label) + " changed logits at greedy step " + std::to_string(i) +
+                    ": mismatches=" + std::to_string(mismatch_count) +
+                    " max_abs=" + std::to_string(max_abs) +
+                    " max_token=" + std::to_string(max_index) +
+                    " baseline=" + std::to_string(baseline.logits[i][max_index]) +
+                    " candidate=" + std::to_string(candidate.logits[i][max_index]));
+        }
+    }
+    if (baseline.sequence_state != candidate.sequence_state) {
+        throw std::runtime_error(std::string(label) + " changed serialized logical sequence state");
+    }
+}
+
 static evaluation_result evaluate_prompt(
         llama_context *                    ctx,
         const llama_vocab *                vocab,
@@ -1112,6 +1264,90 @@ static int run_probe(common_params & params, const probe_args & probe) {
             probe.include_residual_vector,
             probe.fibonacci_pool_max_tokens);
 
+    json disabled_invariance;
+    if (probe.disabled_invariance_tokens > 0) {
+        auto baseline_trace = finish_disabled_invariance_trace(
+                ctx, baseline.logits, probe.disabled_invariance_tokens, residual_capture);
+
+        auto replay_initial = evaluate_prompt(
+                ctx,
+                vocab,
+                prompt_tokens,
+                requested_ids,
+                residual_capture,
+                probe.include_residual_vector,
+                probe.fibonacci_pool_max_tokens);
+        auto replay_trace = finish_disabled_invariance_trace(
+                ctx,
+                std::move(replay_initial.logits),
+                probe.disabled_invariance_tokens,
+                residual_capture);
+        require_trace_identity(baseline_trace, replay_trace, "no-API replay control");
+
+        apply_control_vector(ctx, nullptr, layer_start, layer_end, cvec_full_size);
+        auto rebuild_initial = evaluate_prompt(
+                ctx,
+                vocab,
+                prompt_tokens,
+                requested_ids,
+                residual_capture,
+                probe.include_residual_vector,
+                probe.fibonacci_pool_max_tokens);
+        auto rebuild_trace = finish_disabled_invariance_trace(
+                ctx,
+                std::move(rebuild_initial.logits),
+                probe.disabled_invariance_tokens,
+                residual_capture);
+        require_trace_identity(baseline_trace, rebuild_trace, "no-artifact graph-rebuild control");
+
+        const auto enabled = compose_control_vectors(
+                nullptr, loaded_vectors.front().data, 1.0f, cvec_full_size);
+        apply_control_vector(ctx, &enabled, layer_start, layer_end, cvec_full_size);
+        apply_control_vector(ctx, nullptr, layer_start, layer_end, cvec_full_size);
+
+        auto disabled_initial = evaluate_prompt(
+                ctx,
+                vocab,
+                prompt_tokens,
+                requested_ids,
+                residual_capture,
+                probe.include_residual_vector,
+                probe.fibonacci_pool_max_tokens);
+        auto disabled_trace = finish_disabled_invariance_trace(
+                ctx,
+                std::move(disabled_initial.logits),
+                probe.disabled_invariance_tokens,
+                residual_capture);
+        require_trace_identity(baseline_trace, disabled_trace, "disabled controller");
+
+        json tokens = json::array();
+        for (llama_token token : baseline_trace.sampled_tokens) {
+            tokens.push_back({
+                { "id", token },
+                { "piece", common_token_to_piece(vocab, token, true) },
+            });
+        }
+        disabled_invariance = {
+            { "status", "pass" },
+            { "artifact", loaded_vectors.front().spec.path },
+            { "disable_api", "llama_set_adapter_cvec(data=null)" },
+            { "sampler", "greedy_top_1_lowest_token_id_tie_break" },
+            { "steps", probe.disabled_invariance_tokens },
+            { "sampled_tokens", std::move(tokens) },
+            { "controls", {
+                { "no_api_replay", "pass" },
+                { "no_artifact_graph_rebuild", "pass" },
+            } },
+            { "logit_values_per_step", n_vocab },
+            { "logit_bytes_compared", probe.disabled_invariance_tokens *
+                    static_cast<size_t>(n_vocab) * sizeof(float) },
+            { "sequence_state_bytes_compared", baseline_trace.sequence_state.size() },
+            { "logits_bit_identical", true },
+            { "sampled_tokens_identical", true },
+            { "sequence_state_bit_identical", true },
+        };
+    }
+
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
 
@@ -1139,6 +1375,8 @@ static int run_probe(common_params & params, const probe_args & probe) {
         { "temperature", 1.0 },
         { "residual_tensor", residual_capture.tensor_name },
         { "state_reset", "llama_memory_clear(data=true) before every evaluation" },
+        { "warmup", probe.disabled_invariance_tokens > 0 ?
+                "common empty run before invariant baseline" : "disabled" },
     };
     if (probe.fibonacci_pool_max_tokens > 0) {
         output["probe"]["fibonacci_pool"] = {
@@ -1164,6 +1402,9 @@ static int run_probe(common_params & params, const probe_args & probe) {
         { "layer_end", has_any_control ? json(layer_end) : json(nullptr) },
     };
     output["baseline"] = baseline.output;
+    if (!disabled_invariance.is_null()) {
+        output["disabled_invariance"] = std::move(disabled_invariance);
+    }
     output["sweeps"] = json::array();
 
     for (const auto & loaded : loaded_vectors) {
@@ -1257,6 +1498,16 @@ int main(int argc, char ** argv) {
             throw std::invalid_argument(
                     "--verified-model-sha256 is required whenever --probe-vector is used");
         }
+        if (probe.disabled_invariance_tokens > 0) {
+            if (probe.probe_vectors.size() != 1) {
+                throw std::invalid_argument(
+                        "--verify-disabled-invariance requires exactly one --probe-vector");
+            }
+            if (!params.control_vectors.empty()) {
+                throw std::invalid_argument(
+                        "--verify-disabled-invariance cannot be combined with base control vectors");
+            }
+        }
         for (size_t i = 0; i < probe.probe_vectors.size(); ++i) {
             for (size_t j = i + 1; j < probe.probe_vectors.size(); ++j) {
                 if (probe.probe_vectors[i].name == probe.probe_vectors[j].name) {
@@ -1269,9 +1520,8 @@ int main(int argc, char ** argv) {
             throw std::invalid_argument("embedding mode is incompatible with a causal logit probe");
         }
 
-        // This tool does no generation and should not spend a second evaluation on warmup.
         params.n_predict = 0;
-        params.warmup = false;
+        params.warmup = probe.disabled_invariance_tokens > 0;
 
         llama_backend_init();
         backend_initialized = true;
