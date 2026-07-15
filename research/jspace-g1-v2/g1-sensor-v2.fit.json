@@ -1,0 +1,92 @@
+{
+  "schema": "treebeard.jspace.g1.fit.v2",
+  "status": "pass",
+  "evidence_boundary": "fit indexes only v1 train/calibration; no v1 or v2 test activation is indexed",
+  "inputs": {
+    "metadata_sha256": "b51d524b7f35a997a039bff5ca0e5b2d8febd2b6e61b8972800886d604caa007",
+    "raw_sha256": "a2aaafc55e210a6530aa12427577c2a85d35060c34db8af420daf7e3ab2cd4de",
+    "train_rows": 1792,
+    "calibration_rows": 256,
+    "unindexed_v1_test_rows": 256
+  },
+  "method": {
+    "representation": "arithmetic mean across every literal prompt token",
+    "layer": 35,
+    "ridge": 1.0,
+    "family": "diagonal_regularized_one_vs_rest_mean_discriminant",
+    "calibration": "per-axis Platt scaling on v1 calibration"
+  },
+  "calibration": {
+    "macro_auroc": 0.8685302734375,
+    "axis_auroc": {
+      "sadness": 0.8756975446428571,
+      "surprise": 0.8592354910714286,
+      "joy": 0.9208984375,
+      "disgust": 0.8523995535714286,
+      "fear": 0.8822544642857143,
+      "anger": 0.8935546875,
+      "curiosity": 0.9582868303571429,
+      "neutral": 0.7059151785714286
+    },
+    "macro_ece": 0.03478067859077551,
+    "axis_ece": {
+      "sadness": 0.01905071358601134,
+      "surprise": 0.03610703540588158,
+      "joy": 0.029408706625044485,
+      "disgust": 0.023489048576728552,
+      "fear": 0.04221433364154284,
+      "anger": 0.029640434435316387,
+      "curiosity": 0.040226423077571224,
+      "neutral": 0.05810873337810766
+    },
+    "neutral_fpr": 0.03125
+  },
+  "bootstrap_stability": {
+    "replicates": 32,
+    "axis_median_cosine": {
+      "sadness": 0.9180784471451813,
+      "surprise": 0.9484014497567888,
+      "joy": 0.9354383986532706,
+      "disgust": 0.883768787184362,
+      "fear": 0.9257674720764231,
+      "anger": 0.9473406403258473,
+      "curiosity": 0.9563386235864073,
+      "neutral": 0.8773150265465411
+    },
+    "axis_p05_cosine": {
+      "sadness": 0.8986765869045134,
+      "surprise": 0.9318252266206943,
+      "joy": 0.919468295068042,
+      "disgust": 0.8643700304639844,
+      "fear": 0.9092381411955789,
+      "anger": 0.937183720542489,
+      "curiosity": 0.9477534363871941,
+      "neutral": 0.8489532063111435
+    },
+    "median_cosine": 0.9306958987700027,
+    "p05_cosine": 0.8675971122468644
+  },
+  "abstention": {
+    "threshold": 0.891241233863245,
+    "coverage": 0.1171875,
+    "precision": 0.8
+  },
+  "label_shuffle_control": {
+    "macro_auroc": [
+      0.5568150111607142,
+      0.5730154854910714,
+      0.46384974888392855,
+      0.5344935825892857,
+      0.46822684151785715,
+      0.4974539620535714,
+      0.5132010323660715,
+      0.4662388392857143
+    ],
+    "mean": 0.5091618129185268
+  },
+  "artifact": {
+    "path": "research/jspace-g1-v2/g1-sensor-v2.npz",
+    "sha256": "ba3230c6f7046330ecf7a17fc1187062f5e5518ebadacf7037fec18068798768"
+  },
+  "calibration_gate_pass": true
+}
