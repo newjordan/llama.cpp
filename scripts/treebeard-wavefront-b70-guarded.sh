@@ -33,10 +33,12 @@ REUSE_N_PREDICT=${TREEBEARD_WAVEFRONT_REUSE_N_PREDICT:-64}
 REUSE_SEQUENTIAL=${TREEBEARD_WAVEFRONT_REUSE_SEQUENTIAL:-0}
 MOE_REUSE_PROFILE=${TREEBEARD_WAVEFRONT_MOE_REUSE_PROFILE:-$REUSE_PROBE}
 NO_SPEC=${TREEBEARD_WAVEFRONT_NO_SPEC:-0}
-STATE_IO_FUSION=${TREEBEARD_WAVEFRONT_STATE_IO_FUSION:-0}
+STATE_IO_FUSION=${TREEBEARD_WAVEFRONT_STATE_IO_FUSION:-1}
 STATE_IO_DEBUG=${TREEBEARD_WAVEFRONT_STATE_IO_DEBUG:-0}
 STATE_IO_MODE=${TREEBEARD_WAVEFRONT_STATE_IO_MODE:-all}
 ADMISSION_HOLD_MS=${TREEBEARD_WAVEFRONT_ADMISSION_HOLD_MS:-0}
+CACHE_TYPE_K=${TREEBEARD_WAVEFRONT_CACHE_TYPE_K:-f16}
+CACHE_TYPE_V=${TREEBEARD_WAVEFRONT_CACHE_TYPE_V:-f16}
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-single-wavefront-b70/$RUN_ID"
 CANDIDATE_PID=
@@ -160,6 +162,7 @@ source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 
 mode_env=()
+mode_env+=(GGML_SYCL_ENABLE_STATE_IO_FUSION="$STATE_IO_FUSION")
 if [[ "$DISABLE_MOE_FUSIONS" == 1 ]]; then
     mode_env+=(GGML_SYCL_DISABLE_MOE_DOWN_REDUCE=1)
     mode_env+=(GGML_SYCL_DISABLE_MOE_DUAL_SWIGLU=1)
@@ -177,7 +180,7 @@ if [[ "$MOE_REUSE_PROFILE" == 1 ]]; then
     mode_env+=(GGML_SYCL_MOE_REUSE_PROFILE=1)
 fi
 if [[ "$STATE_IO_FUSION" == 1 ]]; then
-    mode_env+=(GGML_SYCL_ENABLE_STATE_IO_FUSION=1 GGML_SYCL_STATE_IO_MODE="$STATE_IO_MODE")
+    mode_env+=(GGML_SYCL_STATE_IO_MODE="$STATE_IO_MODE")
 fi
 if [[ "$STATE_IO_DEBUG" == 1 ]]; then
     mode_env+=(GGML_SYCL_STATE_IO_DEBUG=1)
@@ -203,7 +206,7 @@ env \
     "${mode_env[@]}" \
     taskset -c 0-10,12-15 "$BUILD/bin/llama-server" \
     -m "$MODEL" -ngl 99 -ncmoe 0 --no-op-offload \
-    -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 \
+    -c 262144 -np 12 -kvu -fa on -ctk "$CACHE_TYPE_K" -ctv "$CACHE_TYPE_V" \
     -b 8192 -ub 1024 -t 15 \
     --host 127.0.0.1 --port "$PORT" --jinja --metrics \
     "${spec_args[@]}" \

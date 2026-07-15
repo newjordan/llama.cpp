@@ -5830,7 +5830,7 @@ static void ggml_sycl_trace_moe_dual_swiglu(
 static bool ggml_sycl_state_io_enabled() {
     static const bool enabled = []() {
         const char * env = getenv("GGML_SYCL_ENABLE_STATE_IO_FUSION");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     return enabled;
 }
