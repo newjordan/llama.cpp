@@ -69,3 +69,24 @@ The consumed calibration data may be used only for explicitly labeled
 diagnosis of a distinct future design. Any new G1 attempt needs a newly frozen
 representation and a new source-disjoint evaluation boundary; it cannot claim
 the untouched v3 test as an unbiased validation after calibration-led design.
+
+## Post-stop diagnostic
+
+After the stop was committed, a diagnostic-only sweep reused the consumed
+MELD-train capture. It refitted the same GoEmotions-only discriminant at each of
+the 12 captured layers for both last-token and mean-token residuals, then
+refitted the declared length calibrator on the already consumed rows. It did
+not read or capture MELD test data.
+
+The best of 24 representations was last-token layer 26:
+
+- macro AUROC: `0.743949`;
+- minimum per-axis AUROC: `0.662109` (fear);
+- short/medium/long macro AUROC: `0.743141`, `0.760114`, `0.730329`;
+- maximum coverage at at least 0.75 retained precision: `0.066964`.
+
+Last-token layer 27 followed at `0.738503`; the previously selected last-token
+layer 18 reached `0.731448`. No captured representation reached the `0.80`
+discrimination or `0.15` coverage floors. This bounds a layer/pooling-only v4:
+the next credible sensor must change the training-domain or feature geometry
+and must use a newly frozen external evaluation source.
