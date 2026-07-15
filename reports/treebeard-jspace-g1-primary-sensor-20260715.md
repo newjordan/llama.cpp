@@ -7,6 +7,10 @@ the predeclared lexical echo, negation, quotation, sarcasm, third-person,
 mixed-mood, neutral-flat, and narrated-tedium controls. No actuator or
 production steering claim follows from this result.
 
+Subsequent result: the lexical-echo control failed its frozen gate, so G1 is
+parked. See
+[`treebeard-jspace-g1-control-stop-20260715.md`](treebeard-jspace-g1-control-stop-20260715.md).
+
 ## Dataset and evidence boundary
 
 The source is the official agreement-filtered

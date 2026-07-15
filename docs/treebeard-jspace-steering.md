@@ -88,8 +88,10 @@ state-conditioned plant equation. A later frozen GoEmotions slice also found a
 held-out anchor-free semantic read signal at layer 18 (macro AUROC 0.8428, macro
 ECE 0.0445), recorded in
 [`reports/treebeard-jspace-g1-primary-sensor-20260715.md`](../reports/treebeard-jspace-g1-primary-sensor-20260715.md).
-That is a sensor result, not evidence of semantic steering; G1 remains open for
-the predeclared linguistic control matrix.
+That is a sensor result, not evidence of semantic steering. Its subsequent
+lexical-echo control scored 0.7558 against the frozen 0.80 floor, so G1 is
+parked as recorded in
+[`reports/treebeard-jspace-g1-control-stop-20260715.md`](../reports/treebeard-jspace-g1-control-stop-20260715.md).
 
 ## Recursive Fibonacci pooling candidate
 
@@ -159,9 +161,10 @@ finding is “multiscale pooling helps,” not “Fibonacci helps.”
 ## Advancement sequence
 
 1. G0 request-scoped actuator lifecycle isolation: complete.
-2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`: primary
-   train/calibration/test slice passed; linguistic controls remain open.
-3. Compare the Fibonacci bank to all matched pooling controls.
+2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`: primary slice
+   passed, lexical-echo control failed; G1 parked.
+3. Compare the Fibonacci bank to all matched pooling controls: not entered for
+   the parked v1 sensor.
 4. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.
 5. Add request-scoped low-rank feedback with deadband, confidence abstention,
    trust-region limits, and protected-task bypasses.
