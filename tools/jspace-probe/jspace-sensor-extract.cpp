@@ -294,6 +294,7 @@ static json read_manifest(const std::string & path) {
             schema != "treebeard.jspace.g1.dataset.v2" &&
             schema != "treebeard.jspace.g1.dataset.v3" &&
             schema != "treebeard.jspace.g1.dataset.v4" &&
+            schema != "treebeard.jspace.g1.dataset.v5" &&
             schema != "treebeard.jspace.g1.controls.v1" &&
             schema != "treebeard.jspace.g1.controls.v2") ||
             !document.contains("rows") || !document["rows"].is_array() || document["rows"].empty()) {
@@ -345,8 +346,10 @@ static int run_self_test() {
 static int run_extractor(common_params & params, const extractor_args & args) {
     json manifest = read_manifest(args.manifest_path);
     const bool routing = !args.routing_verbalizers.empty();
-    if (routing && manifest.value("schema", "") != "treebeard.jspace.g1.dataset.v4") {
-        throw std::invalid_argument("routing extraction requires a frozen v4 manifest");
+    const std::string manifest_schema = manifest.value("schema", "");
+    if (routing && manifest_schema != "treebeard.jspace.g1.dataset.v4" &&
+            manifest_schema != "treebeard.jspace.g1.dataset.v5") {
+        throw std::invalid_argument("routing extraction requires a frozen v4 or v5 manifest");
     }
     if (routing && args.routing_verbalizers.size() != 7) {
         throw std::invalid_argument("routing extraction requires exactly seven ordered verbalizers");
