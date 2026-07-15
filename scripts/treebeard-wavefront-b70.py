@@ -173,7 +173,25 @@ def validate_anchor_telemetry(width: int, enabled: bool, timings: dict[str, Any]
     fallback_n = int(timings.get("draft_anchor_fallback_n") or 0)
     serial_tokens = list(timings.get("draft_anchor_serial_tokens") or [])
     batched_tokens = list(timings.get("draft_anchor_batched_tokens") or [])
-    values = [anchor_n, match_n, fallback_n, *serial_tokens, *batched_tokens]
+    audit_tokens = int(timings.get("draft_audit_tokens") or 0)
+    audit_matched = int(timings.get("draft_audit_tokens_matched") or 0)
+    audit_fallback_n = int(timings.get("draft_audit_fallback_n") or 0)
+    audit_first_mismatch = list(timings.get("draft_audit_first_mismatch") or [])
+    audit_serial_tokens = list(timings.get("draft_audit_serial_tokens") or [])
+    audit_batched_tokens = list(timings.get("draft_audit_batched_tokens") or [])
+    values = [
+        anchor_n,
+        match_n,
+        fallback_n,
+        audit_tokens,
+        audit_matched,
+        audit_fallback_n,
+        *serial_tokens,
+        *batched_tokens,
+        *audit_first_mismatch,
+        *audit_serial_tokens,
+        *audit_batched_tokens,
+    ]
     if not all(type(value) is int for value in values):
         raise RuntimeError("serial anchor telemetry contains a non-integer")
     if anchor_n != len(serial_tokens) or anchor_n != len(batched_tokens):
@@ -183,7 +201,20 @@ def validate_anchor_telemetry(width: int, enabled: bool, timings: dict[str, Any]
     observed_matches = sum(serial == batched for serial, batched in zip(serial_tokens, batched_tokens))
     if observed_matches != match_n:
         raise RuntimeError("serial anchor token comparisons do not match the reported outcomes")
-    if (width == 0 or not enabled) and anchor_n:
+    if audit_matched + audit_fallback_n != audit_tokens:
+        raise RuntimeError("serial audit comparisons do not match the audited token total")
+    if len(audit_first_mismatch) != anchor_n:
+        raise RuntimeError("serial audit rounds do not match the anchor total")
+    observed_fallbacks = sum(index >= 0 for index in audit_first_mismatch)
+    if observed_fallbacks != audit_fallback_n:
+        raise RuntimeError("serial audit mismatch columns do not match the fallback total")
+    if any(index < -1 or index > width for index in audit_first_mismatch):
+        raise RuntimeError("serial audit contains an invalid mismatch column")
+    if len(audit_serial_tokens) != audit_fallback_n or len(audit_batched_tokens) != audit_fallback_n:
+        raise RuntimeError("serial audit mismatch token arrays are not aligned")
+    if any(serial == batched for serial, batched in zip(audit_serial_tokens, audit_batched_tokens)):
+        raise RuntimeError("serial audit mismatch token arrays contain a match")
+    if (width == 0 or not enabled) and (anchor_n or audit_tokens or audit_first_mismatch):
         raise RuntimeError("serial anchor telemetry was emitted for an unanchored request")
     return {
         "draft_anchor_n": anchor_n,
@@ -191,6 +222,12 @@ def validate_anchor_telemetry(width: int, enabled: bool, timings: dict[str, Any]
         "draft_anchor_fallback_n": fallback_n,
         "draft_anchor_serial_tokens": serial_tokens,
         "draft_anchor_batched_tokens": batched_tokens,
+        "draft_audit_tokens": audit_tokens,
+        "draft_audit_tokens_matched": audit_matched,
+        "draft_audit_fallback_n": audit_fallback_n,
+        "draft_audit_first_mismatch": audit_first_mismatch,
+        "draft_audit_serial_tokens": audit_serial_tokens,
+        "draft_audit_batched_tokens": audit_batched_tokens,
     }
 
 
@@ -312,6 +349,15 @@ def summarize_matched(samples: list[dict[str, Any]], widths: list[int]) -> list[
         anchor_n = sum(int(sample.get("draft_anchor_n") or 0) for sample in selected)
         anchor_match_n = sum(int(sample.get("draft_anchor_match_n") or 0) for sample in selected)
         anchor_fallback_n = sum(int(sample.get("draft_anchor_fallback_n") or 0) for sample in selected)
+        audit_tokens = sum(int(sample.get("draft_audit_tokens") or 0) for sample in selected)
+        audit_matched = sum(int(sample.get("draft_audit_tokens_matched") or 0) for sample in selected)
+        audit_fallback_n = sum(int(sample.get("draft_audit_fallback_n") or 0) for sample in selected)
+        mismatch_counts: dict[str, int] = {}
+        for sample in selected:
+            for column in sample.get("draft_audit_first_mismatch") or []:
+                if column >= 0:
+                    key = str(column)
+                    mismatch_counts[key] = mismatch_counts.get(key, 0) + 1
         rows.append({
             "width": width,
             "samples": len(selected),
@@ -326,6 +372,11 @@ def summarize_matched(samples: list[dict[str, Any]], widths: list[int]) -> list[
             "draft_anchor_match_n": anchor_match_n,
             "draft_anchor_fallback_n": anchor_fallback_n,
             "draft_anchor_match_rate": anchor_match_n / anchor_n if anchor_n else None,
+            "draft_audit_tokens": audit_tokens,
+            "draft_audit_tokens_matched": audit_matched,
+            "draft_audit_fallback_n": audit_fallback_n,
+            "draft_audit_match_rate": audit_matched / audit_tokens if audit_tokens else None,
+            "draft_audit_first_mismatch_counts": mismatch_counts,
             "proposal_coverage": (
                 sum(int(sample["draft_n"] > 0) for sample in selected) / len(selected)
                 if selected else None
@@ -449,6 +500,9 @@ def run_wave(
         "draft_anchor_n": sum(int(request["draft_anchor_n"]) for request in requests),
         "draft_anchor_match_n": sum(int(request["draft_anchor_match_n"]) for request in requests),
         "draft_anchor_fallback_n": sum(int(request["draft_anchor_fallback_n"]) for request in requests),
+        "draft_audit_tokens": sum(int(request["draft_audit_tokens"]) for request in requests),
+        "draft_audit_tokens_matched": sum(int(request["draft_audit_tokens_matched"]) for request in requests),
+        "draft_audit_fallback_n": sum(int(request["draft_audit_fallback_n"]) for request in requests),
         "requests": requests,
     }
 

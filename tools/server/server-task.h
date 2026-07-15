@@ -329,6 +329,12 @@ struct result_timings {
     int32_t draft_anchor_fallback_n = 0;
     std::vector<llama_token> draft_anchor_serial_tokens;
     std::vector<llama_token> draft_anchor_batched_tokens;
+    int32_t draft_audit_tokens = 0;
+    int32_t draft_audit_tokens_matched = 0;
+    int32_t draft_audit_fallback_n = 0;
+    std::vector<int32_t> draft_audit_first_mismatch;
+    std::vector<llama_token> draft_audit_serial_tokens;
+    std::vector<llama_token> draft_audit_batched_tokens;
 
     json to_json() const;
 };

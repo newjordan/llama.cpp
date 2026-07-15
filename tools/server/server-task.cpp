@@ -671,6 +671,12 @@ json result_timings::to_json() const {
         base["draft_anchor_fallback_n"] = draft_anchor_fallback_n;
         base["draft_anchor_serial_tokens"] = draft_anchor_serial_tokens;
         base["draft_anchor_batched_tokens"] = draft_anchor_batched_tokens;
+        base["draft_audit_tokens"] = draft_audit_tokens;
+        base["draft_audit_tokens_matched"] = draft_audit_tokens_matched;
+        base["draft_audit_fallback_n"] = draft_audit_fallback_n;
+        base["draft_audit_first_mismatch"] = draft_audit_first_mismatch;
+        base["draft_audit_serial_tokens"] = draft_audit_serial_tokens;
+        base["draft_audit_batched_tokens"] = draft_audit_batched_tokens;
     }
 
     return base;

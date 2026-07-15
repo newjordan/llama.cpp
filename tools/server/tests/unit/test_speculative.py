@@ -126,6 +126,11 @@ def test_serial_anchor_reports_greedy_checks():
     assert timings["draft_anchor_match_n"] + timings["draft_anchor_fallback_n"] == timings["draft_anchor_n"]
     assert len(timings["draft_anchor_serial_tokens"]) == timings["draft_anchor_n"]
     assert len(timings["draft_anchor_batched_tokens"]) == timings["draft_anchor_n"]
+    assert timings["draft_audit_tokens"] > 0
+    assert timings["draft_audit_tokens_matched"] + timings["draft_audit_fallback_n"] == timings["draft_audit_tokens"]
+    assert len(timings["draft_audit_first_mismatch"]) == timings["draft_anchor_n"]
+    assert len(timings["draft_audit_serial_tokens"]) == timings["draft_audit_fallback_n"]
+    assert len(timings["draft_audit_batched_tokens"]) == timings["draft_audit_fallback_n"]
 
 
 def test_serial_anchor_rejects_sampling():

@@ -274,7 +274,7 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
-    llama_token spec_anchor = LLAMA_TOKEN_NULL;
+    llama_tokens spec_serial;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -429,6 +429,12 @@ struct server_slot {
     int32_t n_draft_anchor_fallback = 0;
     std::vector<llama_token> draft_anchor_serial_tokens;
     std::vector<llama_token> draft_anchor_batched_tokens;
+    int32_t n_draft_audit_tokens = 0;
+    int32_t n_draft_audit_tokens_matched = 0;
+    int32_t n_draft_audit_fallback = 0;
+    std::vector<int32_t> draft_audit_first_mismatch;
+    std::vector<llama_token> draft_audit_serial_tokens;
+    std::vector<llama_token> draft_audit_batched_tokens;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -447,7 +453,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
-            spec_anchor = LLAMA_TOKEN_NULL;
+            spec_serial.clear();
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -463,6 +469,12 @@ struct server_slot {
         n_draft_anchor_fallback = 0;
         draft_anchor_serial_tokens.clear();
         draft_anchor_batched_tokens.clear();
+        n_draft_audit_tokens = 0;
+        n_draft_audit_tokens_matched = 0;
+        n_draft_audit_fallback = 0;
+        draft_audit_first_mismatch.clear();
+        draft_audit_serial_tokens.clear();
+        draft_audit_batched_tokens.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -681,6 +693,12 @@ struct server_slot {
             timings.draft_anchor_fallback_n = n_draft_anchor_fallback;
             timings.draft_anchor_serial_tokens = draft_anchor_serial_tokens;
             timings.draft_anchor_batched_tokens = draft_anchor_batched_tokens;
+            timings.draft_audit_tokens = n_draft_audit_tokens;
+            timings.draft_audit_tokens_matched = n_draft_audit_tokens_matched;
+            timings.draft_audit_fallback_n = n_draft_audit_fallback;
+            timings.draft_audit_first_mismatch = draft_audit_first_mismatch;
+            timings.draft_audit_serial_tokens = draft_audit_serial_tokens;
+            timings.draft_audit_batched_tokens = draft_audit_batched_tokens;
         }
 
         return timings;
@@ -6027,9 +6045,13 @@ private:
         common_context_seq_rm(ctx, slot.id, ckpt.pos_max + 1, -1);
     }
 
-    int decode_serial_anchor(server_slot & slot, llama_token & sampled, bool process_spec) {
-        llama_token token = slot.sampled;
-        llama_pos pos = slot.spec_ckpt.pos_max + 1;
+    int decode_serial_transition(
+            server_slot & slot,
+            llama_token token,
+            llama_pos pos,
+            common_sampler * smpl,
+            llama_token & sampled,
+            bool process_spec) {
         int32_t n_seq_id = 1;
         llama_seq_id seq_id = slot.id;
         llama_seq_id * seq_ids[] = { &seq_id };
@@ -6053,8 +6075,34 @@ private:
             return -2;
         }
 
+        sampled = common_sampler_sample(smpl, slot.ctx_tgt, 0);
+        return 0;
+    }
+
+    int build_serial_audit(server_slot & slot) {
+        slot.spec_serial.clear();
+
         common_sampler_ptr smpl(common_sampler_clone(slot.smpl.get()));
-        sampled = common_sampler_sample(smpl.get(), slot.ctx_tgt, 0);
+        llama_token token = slot.sampled;
+        llama_pos pos = slot.spec_ckpt.pos_max + 1;
+
+        for (size_t i = 0; i <= slot.spec_draft.size(); ++i) {
+            llama_token sampled = LLAMA_TOKEN_NULL;
+            const int ret = decode_serial_transition(slot, token, pos, smpl.get(), sampled, false);
+            if (ret != 0) {
+                return ret;
+            }
+
+            slot.spec_serial.push_back(sampled);
+            if (i == slot.spec_draft.size() || sampled != slot.spec_draft[i]) {
+                break;
+            }
+
+            common_sampler_accept(smpl.get(), sampled, true);
+            token = sampled;
+            pos++;
+        }
+
         return 0;
     }
 
@@ -6863,19 +6911,24 @@ private:
                 continue;
             }
 
-            const int ret = decode_serial_anchor(slot, slot.spec_anchor, false);
+            const int ret = build_serial_audit(slot);
             if (ret != 0) {
-                SLT_ERR(slot, "serial speculative anchor failed, ret=%d\n", ret);
+                SLT_ERR(slot, "serial speculative audit failed, ret=%d\n", ret);
                 serial_anchor_failed = true;
                 break;
             }
-            restore_spec_context(slot, slot.ctx_tgt, ctx_tgt_seq_rm_type, 1, true);
+            restore_spec_context(
+                slot,
+                slot.ctx_tgt,
+                ctx_tgt_seq_rm_type,
+                static_cast<int32_t>(slot.spec_serial.size()),
+                true);
         }
 
         if (serial_anchor_failed) {
             for (auto & slot : slots) {
                 if (slot.is_processing()) {
-                    send_error(slot, "serial speculative anchor failed");
+                    send_error(slot, "serial speculative audit failed");
                     slot.release();
                     slot.prompt_clear(false);
                 }
@@ -7147,7 +7200,7 @@ private:
 
                 GGML_ASSERT(n_draft > 0);
 
-                bool serial_fallback = false;
+                bool serial_commit = false;
 
                 // verify and try to accept the draft
                 {
@@ -7161,57 +7214,114 @@ private:
                     GGML_ASSERT(accepted.size() >= 1);
 
                     if (slot.task->params.speculative_serial_anchor) {
-                        GGML_ASSERT(slot.spec_anchor != LLAMA_TOKEN_NULL);
+                        GGML_ASSERT(!slot.spec_serial.empty());
 
-                        const llama_token serial_token = slot.spec_anchor;
+                        const llama_token serial_token = slot.spec_serial.front();
                         const llama_token batched_token = accepted.front();
                         const bool anchor_match = serial_token == batched_token;
 
                         slot.n_draft_anchor++;
                         slot.draft_anchor_serial_tokens.push_back(serial_token);
                         slot.draft_anchor_batched_tokens.push_back(batched_token);
-                        slot.spec_anchor = LLAMA_TOKEN_NULL;
 
                         if (anchor_match) {
                             slot.n_draft_anchor_match++;
                         } else {
                             slot.n_draft_anchor_fallback++;
-                            serial_fallback = true;
-
-                            SLT_WRN(slot,
-                                    "serial anchor mismatch: serial=%d batched=%d draft=%zu; falling back\n",
-                                    serial_token, batched_token, n_draft);
-
-                            const int32_t n_rollback = static_cast<int32_t>(n_draft + 1);
-                            restore_spec_context(slot, slot.ctx_tgt, ctx_tgt_seq_rm_type, n_rollback, true);
-                            if (slot.ctx_dft) {
-                                restore_spec_context(slot, slot.ctx_dft, ctx_dft_seq_rm_type, n_rollback, false);
-                            }
-
-                            slot.prompt.tokens.keep_first(slot.spec_ckpt.n_tokens);
-                            slot.smpl = std::move(smpl_save);
-
-                            llama_token replayed = LLAMA_TOKEN_NULL;
-                            const int ret = decode_serial_anchor(slot, replayed, true);
-                            if (ret != 0 || replayed != serial_token) {
-                                SLT_ERR(slot,
-                                        "serial anchor replay failed, ret=%d expected=%d replayed=%d\n",
-                                        ret, serial_token, replayed);
-                                send_error(slot, "serial speculative anchor replay failed");
-                                slot.release();
-                                slot.prompt_clear(false);
-                                continue;
-                            }
-
-                            common_sampler_accept(slot.smpl.get(), serial_token, true);
-                            common_speculative_accept(spec.get(), slot.id, 0);
-
-                            accepted.assign(1, serial_token);
-                            slot.prompt.tokens.push_back(slot.sampled);
                         }
+
+                        size_t first_mismatch = 0;
+                        const size_t n_compared = std::min(accepted.size(), slot.spec_serial.size());
+                        while (first_mismatch < n_compared &&
+                               accepted[first_mismatch] == slot.spec_serial[first_mismatch]) {
+                            first_mismatch++;
+                        }
+
+                        if (first_mismatch == n_compared && accepted.size() != slot.spec_serial.size()) {
+                            SLT_ERR(slot,
+                                    "serial audit length mismatch: serial=%zu batched=%zu draft=%zu\n",
+                                    slot.spec_serial.size(), accepted.size(), n_draft);
+                            send_error(slot, "serial speculative audit length mismatch");
+                            slot.release();
+                            slot.prompt_clear(false);
+                            continue;
+                        }
+
+                        slot.n_draft_audit_tokens_matched += static_cast<int32_t>(first_mismatch);
+
+                        if (first_mismatch == slot.spec_serial.size()) {
+                            slot.n_draft_audit_tokens += static_cast<int32_t>(first_mismatch);
+                            slot.draft_audit_first_mismatch.push_back(-1);
+                        } else {
+                            slot.n_draft_audit_tokens += static_cast<int32_t>(first_mismatch + 1);
+                            const llama_token serial_mismatch = slot.spec_serial[first_mismatch];
+                            const llama_token batched_mismatch = accepted[first_mismatch];
+
+                            slot.n_draft_audit_fallback++;
+                            slot.draft_audit_first_mismatch.push_back(static_cast<int32_t>(first_mismatch));
+                            slot.draft_audit_serial_tokens.push_back(serial_mismatch);
+                            slot.draft_audit_batched_tokens.push_back(batched_mismatch);
+                            SLT_WRN(slot,
+                                    "serial audit mismatch: column=%zu serial=%d batched=%d draft=%zu; falling back\n",
+                                    first_mismatch, serial_mismatch, batched_mismatch, n_draft);
+                        }
+
+                        // A matching top-1 vector does not prove that the wide decode produced
+                        // serial-equivalent KV state. Always rebuild the committed frontier
+                        // serially so the next round starts from a trusted state.
+                        serial_commit = true;
+                        const size_t n_serial_commit = first_mismatch < slot.spec_serial.size()
+                            ? first_mismatch + 1
+                            : slot.spec_serial.size();
+
+                        const int32_t n_rollback = static_cast<int32_t>(n_draft + 1);
+                        restore_spec_context(slot, slot.ctx_tgt, ctx_tgt_seq_rm_type, n_rollback, true);
+                        if (slot.ctx_dft) {
+                            restore_spec_context(slot, slot.ctx_dft, ctx_dft_seq_rm_type, n_rollback, false);
+                        }
+
+                        slot.prompt.tokens.keep_first(slot.spec_ckpt.n_tokens);
+                        slot.smpl = std::move(smpl_save);
+
+                        llama_token replay_token = slot.sampled;
+                        llama_pos replay_pos = slot.spec_ckpt.pos_max + 1;
+                        bool replay_failed = false;
+                        for (size_t j = 0; j < n_serial_commit; ++j) {
+                            llama_token replayed = LLAMA_TOKEN_NULL;
+                            const int ret = decode_serial_transition(
+                                slot, replay_token, replay_pos, slot.smpl.get(), replayed, true);
+                            if (ret != 0 || replayed != slot.spec_serial[j]) {
+                                SLT_ERR(slot,
+                                        "serial audit replay failed, column=%zu ret=%d expected=%d replayed=%d\n",
+                                        j, ret, slot.spec_serial[j], replayed);
+                                replay_failed = true;
+                                break;
+                            }
+
+                            slot.prompt.tokens.push_back(replay_token);
+                            common_sampler_accept(slot.smpl.get(), replayed, true);
+                            replay_token = replayed;
+                            replay_pos++;
+                        }
+
+                        if (replay_failed) {
+                            send_error(slot, "serial speculative audit replay failed");
+                            slot.release();
+                            slot.prompt_clear(false);
+                            continue;
+                        }
+
+                        common_speculative_accept(
+                            spec.get(), slot.id, static_cast<uint16_t>(n_serial_commit - 1));
+
+                        accepted.assign(
+                            slot.spec_serial.begin(),
+                            slot.spec_serial.begin() + n_serial_commit);
+
+                        slot.spec_serial.clear();
                     }
 
-                    if (!serial_fallback) {
+                    if (!serial_commit) {
                         const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                         const bool use_ckpt_tgt = uses_spec_checkpoint(
@@ -7270,7 +7380,7 @@ private:
                 slot.n_draft_accepted += ids.size() - 1;
                 slot.n_draft_accepted_per_round.push_back(static_cast<int32_t>(ids.size()) - 1);
 
-                if (!serial_fallback) {
+                if (!serial_commit) {
                     // add accepted tokens to the prompt
                     slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
                     slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
@@ -7279,7 +7389,7 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                if (!serial_fallback) {
+                if (!serial_commit) {
                     common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
                     if (slot.ctx_dft) {
                         common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);

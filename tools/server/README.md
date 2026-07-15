@@ -462,7 +462,7 @@ By default, this value is set to `0`, meaning no tokens are kept. Use `-1` to re
 
 `speculative.n_max`: Per-request cap on speculative proposal tokens. Set `0` to disable speculation for one request or `-1` to use the server-configured maximum. Default: `-1`.
 
-`speculative.serial_anchor`: Before accepting a speculative block, independently evaluate its first target transition with a serial greedy decode. If serial and batched top-1 disagree, discard the block and replay only the serial transition. Requires `temperature` 0 and does not support backend sampling. Default: `false`.
+`speculative.serial_anchor`: Before accepting a speculative block, independently evaluate its greedy target transitions serially through the first draft rejection. The server audits the batched result against that serial commit frontier, restores the checkpoint, and reconstructs the committed KV state serially even when the sampled tokens match; a matching token vector alone does not prove serial-equivalent state. Requires `temperature` 0 and does not support backend sampling. Default: `false`.
 
 `stream`: Allows receiving each predicted token in real-time instead of waiting for the completion to finish (uses a different response format). To enable this, set to `true`.
 

@@ -47,6 +47,10 @@ class SummaryTests(unittest.TestCase):
                 "draft_anchor_n": 2,
                 "draft_anchor_match_n": 1,
                 "draft_anchor_fallback_n": 1,
+                "draft_audit_tokens": 7,
+                "draft_audit_tokens_matched": 6,
+                "draft_audit_fallback_n": 1,
+                "draft_audit_first_mismatch": [-1, 2],
             },
         ]
 
@@ -54,6 +58,8 @@ class SummaryTests(unittest.TestCase):
 
         self.assertEqual(rows[1]["acceptance"], 0.5)
         self.assertEqual(rows[1]["draft_anchor_match_rate"], 0.5)
+        self.assertAlmostEqual(rows[1]["draft_audit_match_rate"], 6 / 7)
+        self.assertEqual(rows[1]["draft_audit_first_mismatch_counts"], {"2": 1})
         self.assertEqual(rows[1]["wall_p50_speedup"], 2.0)
         self.assertTrue(rows[1]["greedy_parity"])
 

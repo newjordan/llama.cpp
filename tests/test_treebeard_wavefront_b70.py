@@ -49,9 +49,16 @@ class TelemetryTests(unittest.TestCase):
                 "draft_anchor_fallback_n": 1,
                 "draft_anchor_serial_tokens": [11, 12],
                 "draft_anchor_batched_tokens": [11, 13],
+                "draft_audit_tokens": 7,
+                "draft_audit_tokens_matched": 6,
+                "draft_audit_fallback_n": 1,
+                "draft_audit_first_mismatch": [-1, 2],
+                "draft_audit_serial_tokens": [21],
+                "draft_audit_batched_tokens": [22],
             },
         )
         self.assertEqual(telemetry["draft_anchor_fallback_n"], 1)
+        self.assertEqual(telemetry["draft_audit_first_mismatch"], [-1, 2])
 
         with self.assertRaises(RuntimeError):
             bench.validate_anchor_telemetry(
@@ -63,6 +70,27 @@ class TelemetryTests(unittest.TestCase):
                     "draft_anchor_fallback_n": 0,
                     "draft_anchor_serial_tokens": [11],
                     "draft_anchor_batched_tokens": [12],
+                    "draft_audit_tokens": 1,
+                    "draft_audit_tokens_matched": 1,
+                    "draft_audit_fallback_n": 0,
+                    "draft_audit_first_mismatch": [-1],
+                },
+            )
+
+        with self.assertRaises(RuntimeError):
+            bench.validate_anchor_telemetry(
+                4,
+                True,
+                {
+                    "draft_anchor_n": 1,
+                    "draft_anchor_match_n": 1,
+                    "draft_anchor_fallback_n": 0,
+                    "draft_anchor_serial_tokens": [11],
+                    "draft_anchor_batched_tokens": [11],
+                    "draft_audit_tokens": 3,
+                    "draft_audit_tokens_matched": 3,
+                    "draft_audit_fallback_n": 0,
+                    "draft_audit_first_mismatch": [5],
                 },
             )
 
@@ -89,6 +117,10 @@ class TelemetryTests(unittest.TestCase):
                 "draft_anchor_n": 2,
                 "draft_anchor_match_n": 1,
                 "draft_anchor_fallback_n": 1,
+                "draft_audit_tokens": 7,
+                "draft_audit_tokens_matched": 6,
+                "draft_audit_fallback_n": 1,
+                "draft_audit_first_mismatch": [-1, 2],
                 "greedy_parity": True,
             },
             {
@@ -107,6 +139,8 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(row["acceptance"], 0.75)
         self.assertEqual(row["proposal_coverage"], 1.0)
         self.assertEqual(row["draft_anchor_match_rate"], 0.5)
+        self.assertAlmostEqual(row["draft_audit_match_rate"], 6 / 7)
+        self.assertEqual(row["draft_audit_first_mismatch_counts"], {"2": 1})
 
 
 if __name__ == "__main__":

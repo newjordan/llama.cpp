@@ -118,6 +118,12 @@ def run_request(
     anchor_fallback_n = int(timings.get("draft_anchor_fallback_n") or 0)
     anchor_serial = list(timings.get("draft_anchor_serial_tokens") or [])
     anchor_batched = list(timings.get("draft_anchor_batched_tokens") or [])
+    audit_tokens = int(timings.get("draft_audit_tokens") or 0)
+    audit_matched = int(timings.get("draft_audit_tokens_matched") or 0)
+    audit_fallback_n = int(timings.get("draft_audit_fallback_n") or 0)
+    audit_first_mismatch = list(timings.get("draft_audit_first_mismatch") or [])
+    audit_serial = list(timings.get("draft_audit_serial_tokens") or [])
+    audit_batched = list(timings.get("draft_audit_batched_tokens") or [])
     draft_n = int(timings.get("draft_n") or 0)
     if anchor_n != len(anchor_serial) or anchor_n != len(anchor_batched):
         raise RuntimeError("serial anchor token arrays are not aligned")
@@ -125,7 +131,29 @@ def run_request(
         raise RuntimeError("serial anchor outcomes do not match the anchor total")
     if sum(a == b for a, b in zip(anchor_serial, anchor_batched)) != anchor_match_n:
         raise RuntimeError("serial anchor token comparisons do not match the reported outcomes")
-    if (width == 0 or not serial_anchor) and anchor_n:
+    audit_values = [
+        audit_tokens,
+        audit_matched,
+        audit_fallback_n,
+        *audit_first_mismatch,
+        *audit_serial,
+        *audit_batched,
+    ]
+    if not all(type(value) is int for value in audit_values):
+        raise RuntimeError("serial audit telemetry contains a non-integer")
+    if audit_matched + audit_fallback_n != audit_tokens:
+        raise RuntimeError("serial audit comparisons do not match the audited token total")
+    if len(audit_first_mismatch) != anchor_n:
+        raise RuntimeError("serial audit rounds do not match the anchor total")
+    if sum(index >= 0 for index in audit_first_mismatch) != audit_fallback_n:
+        raise RuntimeError("serial audit mismatch columns do not match the fallback total")
+    if any(index < -1 or index > width for index in audit_first_mismatch):
+        raise RuntimeError("serial audit contains an invalid mismatch column")
+    if len(audit_serial) != audit_fallback_n or len(audit_batched) != audit_fallback_n:
+        raise RuntimeError("serial audit mismatch token arrays are not aligned")
+    if any(serial == batched for serial, batched in zip(audit_serial, audit_batched)):
+        raise RuntimeError("serial audit mismatch token arrays contain a match")
+    if (width == 0 or not serial_anchor) and (anchor_n or audit_tokens or audit_first_mismatch):
         raise RuntimeError("serial anchor telemetry was emitted for an unanchored request")
     if serial_anchor and draft_n > 0 and anchor_n == 0:
         raise RuntimeError("drafted request did not execute a serial anchor")
@@ -145,6 +173,12 @@ def run_request(
         "draft_anchor_fallback_n": anchor_fallback_n,
         "draft_anchor_serial_tokens": anchor_serial,
         "draft_anchor_batched_tokens": anchor_batched,
+        "draft_audit_tokens": audit_tokens,
+        "draft_audit_tokens_matched": audit_matched,
+        "draft_audit_fallback_n": audit_fallback_n,
+        "draft_audit_first_mismatch": audit_first_mismatch,
+        "draft_audit_serial_tokens": audit_serial,
+        "draft_audit_batched_tokens": audit_batched,
     }
 
 
@@ -163,6 +197,15 @@ def summarize(samples: list[dict[str, Any]], widths: list[int]) -> list[dict[str
         anchor_n = sum(int(sample.get("draft_anchor_n") or 0) for sample in selected)
         anchor_match_n = sum(int(sample.get("draft_anchor_match_n") or 0) for sample in selected)
         anchor_fallback_n = sum(int(sample.get("draft_anchor_fallback_n") or 0) for sample in selected)
+        audit_tokens = sum(int(sample.get("draft_audit_tokens") or 0) for sample in selected)
+        audit_matched = sum(int(sample.get("draft_audit_tokens_matched") or 0) for sample in selected)
+        audit_fallback_n = sum(int(sample.get("draft_audit_fallback_n") or 0) for sample in selected)
+        mismatch_counts: dict[str, int] = {}
+        for sample in selected:
+            for column in sample.get("draft_audit_first_mismatch") or []:
+                if column >= 0:
+                    key = str(column)
+                    mismatch_counts[key] = mismatch_counts.get(key, 0) + 1
         predicted = sum(int(sample["predicted_n"]) for sample in selected)
         parity = [sample["tokens"] == control_by_case.get(sample["case_id"]) for sample in selected]
         rows.append(
@@ -180,6 +223,11 @@ def summarize(samples: list[dict[str, Any]], widths: list[int]) -> list[dict[str
                 "draft_anchor_match_n": anchor_match_n,
                 "draft_anchor_fallback_n": anchor_fallback_n,
                 "draft_anchor_match_rate": anchor_match_n / anchor_n if anchor_n else None,
+                "draft_audit_tokens": audit_tokens,
+                "draft_audit_tokens_matched": audit_matched,
+                "draft_audit_fallback_n": audit_fallback_n,
+                "draft_audit_match_rate": audit_matched / audit_tokens if audit_tokens else None,
+                "draft_audit_first_mismatch_counts": mismatch_counts,
                 "greedy_parity": all(parity),
             }
         )
