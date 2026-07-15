@@ -84,7 +84,12 @@ minimum-L2 dual in the seven independent affect coordinates.
   collateral advantage is claimed.
 
 The evidence therefore supports a local anchor-logit actuator and a
-state-conditioned plant equation. It does not support semantic steering.
+state-conditioned plant equation. A later frozen GoEmotions slice also found a
+held-out anchor-free semantic read signal at layer 18 (macro AUROC 0.8428, macro
+ECE 0.0445), recorded in
+[`reports/treebeard-jspace-g1-primary-sensor-20260715.md`](../reports/treebeard-jspace-g1-primary-sensor-20260715.md).
+That is a sensor result, not evidence of semantic steering; G1 remains open for
+the predeclared linguistic control matrix.
 
 ## Recursive Fibonacci pooling candidate
 
@@ -154,7 +159,8 @@ finding is “multiscale pooling helps,” not “Fibonacci helps.”
 ## Advancement sequence
 
 1. G0 request-scoped actuator lifecycle isolation: complete.
-2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`.
+2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`: primary
+   train/calibration/test slice passed; linguistic controls remain open.
 3. Compare the Fibonacci bank to all matched pooling controls.
 4. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.
 5. Add request-scoped low-rank feedback with deadband, confidence abstention,
