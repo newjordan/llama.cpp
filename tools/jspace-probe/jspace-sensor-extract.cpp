@@ -32,6 +32,7 @@ struct extractor_args {
     std::string out_prefix;
     std::string verified_model_sha256;
     std::string verified_manifest_sha256;
+    std::string pooling = "last";
     std::vector<int32_t> layers;
     std::vector<char *> common_argv;
     bool self_test = false;
@@ -96,6 +97,7 @@ static extractor_args preprocess_args(int argc, char ** argv) {
     constexpr const char * manifest_prefix = "--manifest=";
     constexpr const char * out_prefix = "--out-prefix=";
     constexpr const char * layers_prefix = "--layers=";
+    constexpr const char * pooling_prefix = "--pooling=";
     constexpr const char * model_sha_prefix = "--verified-model-sha256=";
     constexpr const char * manifest_sha_prefix = "--verified-manifest-sha256=";
 
@@ -122,6 +124,10 @@ static extractor_args preprocess_args(int argc, char ** argv) {
             result.layers = parse_layers(require_value(i, "--layers"));
         } else if (arg.compare(0, std::strlen(layers_prefix), layers_prefix) == 0) {
             result.layers = parse_layers(arg.substr(std::strlen(layers_prefix)));
+        } else if (arg == "--pooling") {
+            result.pooling = require_value(i, "--pooling");
+        } else if (arg.compare(0, std::strlen(pooling_prefix), pooling_prefix) == 0) {
+            result.pooling = arg.substr(std::strlen(pooling_prefix));
         } else if (arg == "--verified-model-sha256") {
             result.verified_model_sha256 = parse_sha256(
                     require_value(i, "--verified-model-sha256"), "--verified-model-sha256");
@@ -138,15 +144,19 @@ static extractor_args preprocess_args(int argc, char ** argv) {
             result.common_argv.push_back(argv[i]);
         }
     }
+    if (result.pooling != "last" && result.pooling != "last-mean") {
+        throw std::invalid_argument("--pooling must be last or last-mean");
+    }
     return result;
 }
 
 static void print_usage(int, char ** argv) {
     std::printf("Usage: %s [common model options] --manifest FILE --out-prefix PATH --layers LIST\\n", argv[0]);
     std::printf("\\nJ-Space G1 options:\\n");
-    std::printf("  --manifest FILE                   frozen treebeard.jspace.g1.dataset.v1 JSON\\n");
+    std::printf("  --manifest FILE                   frozen G1 dataset/control JSON\\n");
     std::printf("  --out-prefix PATH                 write PATH.json and PATH.f32 atomically\\n");
     std::printf("  --layers 2,3,...                  ordered zero-based l_out layers to retain\\n");
+    std::printf("  --pooling last|last-mean          token summaries per retained layer\\n");
     std::printf("  --verified-model-sha256 SHA       runner-verified exact model identity\\n");
     std::printf("  --verified-manifest-sha256 SHA    runner-verified frozen dataset identity\\n");
     std::printf("  --self-test                       model-independent parser smoke test\\n\\n");
@@ -158,6 +168,7 @@ struct activation_capture {
     std::vector<bool> captured;
     std::string error;
     int64_t dimension = 0;
+    bool include_mean = false;
 
     void reset(size_t n_layers) {
         values.assign(n_layers, {});
@@ -191,15 +202,31 @@ static bool capture_activations(ggml_tensor * tensor, bool ask, void * user_data
         return true;
     }
     capture->dimension = tensor->ne[0];
-    const size_t nbytes = static_cast<size_t>(tensor->ne[0]) * sizeof(float);
+    const size_t dimension = static_cast<size_t>(tensor->ne[0]);
+    const size_t nbytes = dimension * sizeof(float);
     const size_t offset = static_cast<size_t>(tensor->ne[1] - 1) * tensor->nb[1];
     if (offset + nbytes > ggml_nbytes(tensor)) {
         capture->error = "final activation column is out of bounds: " + std::string(tensor->name);
         return true;
     }
     auto & values = capture->values[it->second];
-    values.resize(static_cast<size_t>(tensor->ne[0]));
+    values.resize(dimension * (capture->include_mean ? 2 : 1));
     ggml_backend_tensor_get(tensor, values.data(), offset, nbytes);
+    if (capture->include_mean) {
+        std::vector<float> column(dimension);
+        std::vector<double> sums(dimension, 0.0);
+        for (int64_t token = 0; token < tensor->ne[1]; ++token) {
+            ggml_backend_tensor_get(
+                tensor, column.data(), static_cast<size_t>(token) * tensor->nb[1], nbytes);
+            for (size_t feature = 0; feature < dimension; ++feature) {
+                sums[feature] += column[feature];
+            }
+        }
+        const double inverse_tokens = 1.0 / static_cast<double>(tensor->ne[1]);
+        for (size_t feature = 0; feature < dimension; ++feature) {
+            values[dimension + feature] = static_cast<float>(sums[feature] * inverse_tokens);
+        }
+    }
     if (!std::all_of(values.begin(), values.end(), [](float value) { return std::isfinite(value); })) {
         capture->error = "activation tensor contains a non-finite value: " + std::string(tensor->name);
         return true;
@@ -216,7 +243,9 @@ static json read_manifest(const std::string & path) {
     json document = json::parse(input);
     const std::string schema = document.value("schema", "");
     if ((schema != "treebeard.jspace.g1.dataset.v1" &&
-            schema != "treebeard.jspace.g1.controls.v1") ||
+            schema != "treebeard.jspace.g1.dataset.v2" &&
+            schema != "treebeard.jspace.g1.controls.v1" &&
+            schema != "treebeard.jspace.g1.controls.v2") ||
             !document.contains("rows") || !document["rows"].is_array() || document["rows"].empty()) {
         throw std::runtime_error("unsupported or empty J-Space G1 manifest");
     }
@@ -227,7 +256,8 @@ static json read_manifest(const std::string & path) {
                 throw std::runtime_error(std::string("manifest row has invalid field: ") + field);
             }
         }
-        if (schema == "treebeard.jspace.g1.dataset.v1" && row.value("anchor_echo", true)) {
+        if ((schema == "treebeard.jspace.g1.dataset.v1" ||
+                schema == "treebeard.jspace.g1.dataset.v2") && row.value("anchor_echo", true)) {
             throw std::runtime_error("manifest row is not certified anchor-free");
         }
         if (!sample_ids.insert(row["sample_id"].get<std::string>()).second) {
@@ -261,6 +291,7 @@ static int run_self_test() {
 static int run_extractor(common_params & params, const extractor_args & args) {
     json manifest = read_manifest(args.manifest_path);
     activation_capture capture;
+    capture.include_mean = args.pooling == "last-mean";
     for (size_t i = 0; i < args.layers.size(); ++i) {
         capture.tensor_indices.emplace("l_out-" + std::to_string(args.layers[i]), i);
     }
@@ -372,14 +403,16 @@ static int run_extractor(common_params & params, const extractor_args & args) {
 
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
-    const uint64_t raw_bytes = static_cast<uint64_t>(rows.size()) * args.layers.size() *
+    const uint64_t pooling_width = capture.include_mean ? 2 : 1;
+    const uint64_t raw_bytes = static_cast<uint64_t>(rows.size()) * args.layers.size() * pooling_width *
             static_cast<uint64_t>(llama_model_n_embd(model)) * sizeof(float);
     if (std::filesystem::file_size(raw_tmp) != raw_bytes) {
         throw std::runtime_error("activation output size does not match its declared shape");
     }
     json metadata = {
         { "schema", "treebeard.jspace.g1.activations.v1" },
-        { "status", "exact_runtime_last_token_residuals" },
+        { "status", capture.include_mean ?
+            "exact_runtime_last_mean_token_residuals" : "exact_runtime_last_token_residuals" },
         { "model", {
             { "description", description },
             { "decoder_only", true },
@@ -396,7 +429,9 @@ static int run_extractor(common_params & params, const extractor_args & args) {
             { "tensor_pattern", "l_out-{zero_based_layer}" },
             { "layers", args.layers },
             { "layer_types", "Qwen3.6 default: full attention iff (layer+1)%4==0; otherwise DeltaNet" },
-            { "position", "last token" },
+            { "position", capture.include_mean ? "last token, token mean" : "last token" },
+            { "pooling", capture.include_mean ?
+                json::array({ "last", "mean" }) : json::array({ "last" }) },
             { "chat_template", false },
             { "parse_special", false },
             { "add_bos_from_model", add_special },
@@ -406,8 +441,12 @@ static int run_extractor(common_params & params, const extractor_args & args) {
         { "raw", {
             { "path", raw_path.filename().string() },
             { "dtype", "little_endian_float32" },
-            { "shape", { rows.size(), args.layers.size(), llama_model_n_embd(model) } },
-            { "order", "C: sample, layer, embedding" },
+            { "shape", capture.include_mean ?
+                json::array({ rows.size(), args.layers.size(), 2, llama_model_n_embd(model) }) :
+                json::array({ rows.size(), args.layers.size(), llama_model_n_embd(model) }) },
+            { "order", capture.include_mean ?
+                "C: sample, layer, pooling(last,mean), embedding" :
+                "C: sample, layer, embedding" },
             { "bytes", raw_bytes },
         } },
         { "token_counts", {

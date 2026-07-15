@@ -45,6 +45,7 @@ MORPH_SUFFIXES = (
     "s",
 )
 SELECTION_SEED = "treebeard.jspace.g1.goemotions.v1"
+V2_SELECTION_SEED = "treebeard.jspace.g1.goemotions.residual-test.v2"
 
 
 def sha256_file(path: Path) -> str:
@@ -150,15 +151,132 @@ def parse_source(data_dir: Path, anchors_path: Path):
     return candidates, rejection_counts, anchor_words, anchor_roots
 
 
-def selection_rank(row):
+def selection_rank(row, seed=SELECTION_SEED):
     payload = "\0".join((
-        SELECTION_SEED,
+        seed,
         row["source_split"],
         row["label"],
         row["source_id"],
         row["normalized_text"],
     ))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def excluded_source_ids(manifest_paths):
+    excluded = set()
+    manifests = []
+    for path in manifest_paths:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document.get("rows"), list):
+            raise ValueError(f"exclusion manifest has no rows: {path}")
+        source_ids = {
+            row["source_id"] for row in document["rows"]
+            if isinstance(row.get("source_id"), str) and row["source_id"]
+        }
+        if len(source_ids) != len(document["rows"]):
+            raise ValueError(f"exclusion manifest has missing or duplicate source IDs: {path}")
+        excluded.update(source_ids)
+        manifests.append({
+            "manifest": path.name,
+            "sha256": sha256_file(path),
+            "source_ids": len(source_ids),
+        })
+    return excluded, manifests
+
+
+def freeze_residual_test_manifest(
+        data_dir: Path, anchors_path: Path, exclude_paths, count_per_axis: int):
+    candidates, rejection_counts, anchor_words, anchor_roots = parse_source(
+        data_dir, anchors_path
+    )
+    excluded, exclusions = excluded_source_ids(exclude_paths)
+    rows = []
+    available = {}
+    source_split_counts = Counter()
+    for label in AXES:
+        pool = [
+            row
+            for split in SOURCE_SPLITS
+            for row in candidates[(split, label)]
+            if row["source_id"] not in excluded
+        ]
+        available[label] = len(pool)
+        if len(pool) < count_per_axis:
+            raise ValueError(
+                f"residual pool/{label} has {len(pool)} eligible rows; "
+                f"{count_per_axis} required"
+            )
+        chosen = sorted(
+            pool, key=lambda row: selection_rank(row, V2_SELECTION_SEED)
+        )[:count_per_axis]
+        for row in chosen:
+            source_split_counts[row["source_split"]] += 1
+            rows.append({
+                "sample_id": f"residual-test:{label}:{row['source_split']}:{row['source_id']}",
+                "split": "test",
+                "source_split": row["source_split"],
+                "label": label,
+                "source_id": row["source_id"],
+                "text_sha256": hashlib.sha256(row["text"].encode("utf-8")).hexdigest(),
+                "anchor_echo": False,
+                "text": row["text"],
+            })
+
+    if len(rows) != len(AXES) * count_per_axis:
+        raise AssertionError("residual test manifest has the wrong row count")
+    if len({row["source_id"] for row in rows}) != len(rows):
+        raise AssertionError("residual test manifest contains duplicate source IDs")
+    if {row["source_id"] for row in rows} & excluded:
+        raise AssertionError("residual test manifest overlaps an exclusion manifest")
+    if len({row["text_sha256"] for row in rows}) != len(rows):
+        raise AssertionError("residual test manifest contains duplicate text")
+    if any(echo_tokens(row["text"], anchor_roots) for row in rows):
+        raise AssertionError("residual test manifest retained an anchor echo")
+
+    source_files = {
+        filename: sha256_file(data_dir / filename)
+        for filename in (*SOURCE_SPLITS.values(), "emotions.txt")
+    }
+    return {
+        "schema": "treebeard.jspace.g1.dataset.v2",
+        "source": {
+            "name": "GoEmotions simplified agreement-filtered residual pool",
+            "project": "https://github.com/google-research/google-research/tree/master/goemotions",
+            "paper": "https://aclanthology.org/2020.acl-main.372/",
+            "license": "Apache-2.0 (google-research repository)",
+            "files_sha256": source_files,
+        },
+        "policy": {
+            "axes": list(AXES),
+            "single_label_only": True,
+            "selection": "lowest SHA-256 rank across all residual upstream splits within class",
+            "selection_seed": V2_SELECTION_SEED,
+            "counts_per_axis": count_per_axis,
+            "upstream_split_handling": (
+                "pooled only after excluding every v1 primary and control source ID; "
+                "source_split remains recorded for audit"
+            ),
+            "representation": "arithmetic mean of every literal prompt-token l_out residual",
+            "anchor_scrub": {
+                "scope": "all eight axis anchor clusters plus axis names",
+                "casefolded_word_count": len(anchor_words),
+                "morphology_root_count": len(anchor_roots),
+                "suffixes": list(MORPH_SUFFIXES),
+                "anchor_manifest_sha256": sha256_file(anchors_path),
+            },
+            "cross_split_normalized_text_deduplication": True,
+            "exclusions": exclusions,
+            "test_use": "untouched until the v2 representation, model, calibration, and gates are frozen",
+        },
+        "audit": {
+            "eligible_after_v1_exclusion": available,
+            "excluded_source_ids": len(excluded),
+            "selected_source_splits": dict(sorted(source_split_counts.items())),
+            "rejection_counts": dict(sorted(rejection_counts.items())),
+            "rows": len(rows),
+        },
+        "rows": rows,
+    }
 
 
 def freeze_manifest(data_dir: Path, anchors_path: Path, counts):
@@ -264,6 +382,9 @@ def main():
     parser.add_argument("--train-per-axis", type=int, default=DEFAULT_COUNTS["train"])
     parser.add_argument("--calibration-per-axis", type=int, default=DEFAULT_COUNTS["calibration"])
     parser.add_argument("--test-per-axis", type=int, default=DEFAULT_COUNTS["test"])
+    parser.add_argument("--residual-test-v2", action="store_true")
+    parser.add_argument("--exclude-manifest", type=Path, action="append", default=[])
+    parser.add_argument("--residual-test-per-axis", type=int, default=20)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -271,14 +392,27 @@ def main():
         return 0
     if args.data_dir is None or args.anchors is None or args.out is None:
         parser.error("--data-dir, --anchors, and --out are required")
-    counts = {
-        "train": args.train_per_axis,
-        "calibration": args.calibration_per_axis,
-        "test": args.test_per_axis,
-    }
-    if any(value <= 0 for value in counts.values()):
-        parser.error("all per-axis counts must be positive")
-    document = freeze_manifest(args.data_dir, args.anchors, counts)
+    if args.residual_test_v2:
+        if not args.exclude_manifest:
+            parser.error("--residual-test-v2 requires at least one --exclude-manifest")
+        if args.residual_test_per_axis <= 0:
+            parser.error("--residual-test-per-axis must be positive")
+        document = freeze_residual_test_manifest(
+            args.data_dir, args.anchors, args.exclude_manifest,
+            args.residual_test_per_axis,
+        )
+        counts = {"test": args.residual_test_per_axis}
+    else:
+        if args.exclude_manifest:
+            parser.error("--exclude-manifest is only valid with --residual-test-v2")
+        counts = {
+            "train": args.train_per_axis,
+            "calibration": args.calibration_per_axis,
+            "test": args.test_per_axis,
+        }
+        if any(value <= 0 for value in counts.values()):
+            parser.error("all per-axis counts must be positive")
+        document = freeze_manifest(args.data_dir, args.anchors, counts)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
     args.out.write_text(encoded, encoding="utf-8")

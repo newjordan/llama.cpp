@@ -1,0 +1,1623 @@
+{
+  "schema": "treebeard.jspace.g1.controls.v2",
+  "source": {
+    "name": "Treebeard authored compositional minimal-pair controls",
+    "license": "repository source license"
+  },
+  "policy": {
+    "version": "treebeard.jspace.g1.synthetic-controls.v2",
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "disgust",
+      "fear",
+      "anger",
+      "curiosity",
+      "neutral"
+    ],
+    "affect_states": {
+      "sadness": "sad",
+      "surprise": "surprised",
+      "joy": "happy",
+      "disgust": "disgusted",
+      "fear": "afraid",
+      "anger": "angry",
+      "curiosity": "curious"
+    },
+    "templates": {
+      "direct": [
+        "I feel {state} about the outcome.",
+        "This situation leaves me {state}.",
+        "After hearing the news, I am {state}.",
+        "My reaction is unmistakably {state}."
+      ],
+      "negation": [
+        "I do not feel {state} about the outcome.",
+        "This situation does not leave me {state}.",
+        "After hearing the news, I am not {state}.",
+        "My reaction is not {state} in any way."
+      ],
+      "quotation": [
+        "I wrote, \"I feel {state} about the outcome.\"",
+        "I said, \"This situation leaves me {state}.\"",
+        "My message read, \"After hearing the news, I am {state}.\"",
+        "I told them, \"My reaction is unmistakably {state}.\""
+      ],
+      "third_person": [
+        "They feel {state} about the outcome.",
+        "This situation leaves them {state}.",
+        "After hearing the news, they are {state}.",
+        "Their reaction is unmistakably {state}."
+      ]
+    },
+    "neutral_subjects": [
+      "ledger",
+      "index",
+      "packet",
+      "schedule"
+    ],
+    "neutral_templates": [
+      "The {subject} contains four numbered entries.",
+      "A copy of the {subject} remains in the folder.",
+      "The {subject} was updated after the routine check.",
+      "Two references point to the same {subject}."
+    ],
+    "semantics": {
+      "direct": "classify the explicitly stated first-person affect",
+      "negation": "suppress the paired target-axis score and classify as neutral",
+      "quotation": "retain first-person affect through a quotation wrapper",
+      "third_person": "retain stated affect under a third-person subject",
+      "neutral_flat": "remain below the calibrated affect deadband"
+    },
+    "test_use": "untouched until the v2 representation, model, calibration, and gates are frozen"
+  },
+  "audit": {
+    "rows": 128,
+    "memberships": {
+      "direct": 28,
+      "negation": 28,
+      "neutral_flat": 16,
+      "quotation": 28,
+      "third_person": 28
+    }
+  },
+  "rows": [
+    {
+      "sample_id": "synthetic:direct:sadness:0",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "sadness:0",
+      "text_sha256": "bf8fcaf60f25dd46df4b17706bf8d754e54c38634cc223864d33c29ddf6530c8",
+      "text": "I feel sad about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:sadness:1",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "sadness:1",
+      "text_sha256": "8048f54d3f6ded47e4f5b460ce657d39d356126d2594ec3a250d1b05043cc503",
+      "text": "This situation leaves me sad."
+    },
+    {
+      "sample_id": "synthetic:direct:sadness:2",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "sadness:2",
+      "text_sha256": "e6334db32e263aff4bcc448cb801a4ef00ce784aee73b07eb08b8f2e77e6dba6",
+      "text": "After hearing the news, I am sad."
+    },
+    {
+      "sample_id": "synthetic:direct:sadness:3",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "sadness:3",
+      "text_sha256": "999aefbd1f03d32d08a4edadfbad42f87de38aa3e6fb817ade87f35044a7dfa5",
+      "text": "My reaction is unmistakably sad."
+    },
+    {
+      "sample_id": "synthetic:negation:sadness:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "sadness",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "sadness:0",
+      "text_sha256": "285b25d5f17c44e4075bce0aea73aa9a9fae22fe7456e1edb1857095c69bd55e",
+      "text": "I do not feel sad about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:sadness:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "sadness",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "sadness:1",
+      "text_sha256": "76e56ff61118212ef4e6c611a53e27ab9dbf84e589912d450d48d86f244aa39f",
+      "text": "This situation does not leave me sad."
+    },
+    {
+      "sample_id": "synthetic:negation:sadness:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "sadness",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "sadness:2",
+      "text_sha256": "c435583dbf34d41e4de99bea628d7dbee9c64d57fa7029da20a3651dde4ee698",
+      "text": "After hearing the news, I am not sad."
+    },
+    {
+      "sample_id": "synthetic:negation:sadness:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "sadness",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "sadness:3",
+      "text_sha256": "696d8ad67251c6988e504eba2a835d04541581e4d88df1ca1596696203a14481",
+      "text": "My reaction is not sad in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:sadness:0",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "sadness:0",
+      "text_sha256": "4ac05878978642af80005d1e9f2197e94a5ea90c4116437a8931ea9f5a14ba6a",
+      "text": "I wrote, \"I feel sad about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:sadness:1",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "sadness:1",
+      "text_sha256": "ef6c00d2ab54398ba3cc484ace20afca89ae0908eae82966e6676ba3d3dd3922",
+      "text": "I said, \"This situation leaves me sad.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:sadness:2",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "sadness:2",
+      "text_sha256": "51d1d39d2b6b28e06ba0ac0cb6ba6d91b86353a8116ebe56fe0b440c3139f1d8",
+      "text": "My message read, \"After hearing the news, I am sad.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:sadness:3",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "sadness:3",
+      "text_sha256": "ea0b5582fde7c124eef9155b78a3e71caa186c197e40e64d488799df70c44c25",
+      "text": "I told them, \"My reaction is unmistakably sad.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:sadness:0",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "sadness:0",
+      "text_sha256": "6d8450e6ec58ffde0de88c3cceb89c0e813e5eeec096d1e61aa82a4609994fe9",
+      "text": "They feel sad about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:sadness:1",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "sadness:1",
+      "text_sha256": "2230f3f841b8528dc48cefd1f4fc29caa392b2734eeeea0bb80f7d966f606817",
+      "text": "This situation leaves them sad."
+    },
+    {
+      "sample_id": "synthetic:third_person:sadness:2",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "sadness:2",
+      "text_sha256": "c4326d2b34494f9298c2a0efee88ac91915efef9ca012277269dce7c6fc1486c",
+      "text": "After hearing the news, they are sad."
+    },
+    {
+      "sample_id": "synthetic:third_person:sadness:3",
+      "split": "control",
+      "label": "sadness",
+      "target_axis": "sadness",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "sadness:3",
+      "text_sha256": "cd87c941f49eebb07f1fcf339778e3224cb66e3e09c4645f4ad1f8952fa455be",
+      "text": "Their reaction is unmistakably sad."
+    },
+    {
+      "sample_id": "synthetic:direct:surprise:0",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "surprise:0",
+      "text_sha256": "f40be4591ba20cac237c037f159017fc540cba23ed8eed7aefbd8f9af3a3f617",
+      "text": "I feel surprised about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:surprise:1",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "surprise:1",
+      "text_sha256": "b7f0a34900cd8e714b230531e3a72a5a9b94ee56054c0ebaae3a26bdf7cf160d",
+      "text": "This situation leaves me surprised."
+    },
+    {
+      "sample_id": "synthetic:direct:surprise:2",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "surprise:2",
+      "text_sha256": "d41836ab7b707dbaf2f9e95aa18885342503b323ce4dec67087bdf883b444881",
+      "text": "After hearing the news, I am surprised."
+    },
+    {
+      "sample_id": "synthetic:direct:surprise:3",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "surprise:3",
+      "text_sha256": "4b0ec7a2431b7bbbcb466568689eb6823177df009ca9f5b9f9ea662c31849569",
+      "text": "My reaction is unmistakably surprised."
+    },
+    {
+      "sample_id": "synthetic:negation:surprise:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "surprise",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "surprise:0",
+      "text_sha256": "3f100be6921bcd2520cbf59b08017ae7fd14bed438f9020bb31d34d297ce3c87",
+      "text": "I do not feel surprised about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:surprise:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "surprise",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "surprise:1",
+      "text_sha256": "2a82966d2d97ebeb6ea6b198869084d8ded2f3f7a4ab3bbcdb175eca3178eeeb",
+      "text": "This situation does not leave me surprised."
+    },
+    {
+      "sample_id": "synthetic:negation:surprise:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "surprise",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "surprise:2",
+      "text_sha256": "16ec0ce26f997bcc691c15a97091ff6dd7f15ee95b79098aa204b28995040b02",
+      "text": "After hearing the news, I am not surprised."
+    },
+    {
+      "sample_id": "synthetic:negation:surprise:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "surprise",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "surprise:3",
+      "text_sha256": "ec3e0832d8fba5c645869c51ae60fe70f4c042a941f5eb0c02fc47a0999757ca",
+      "text": "My reaction is not surprised in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:surprise:0",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "surprise:0",
+      "text_sha256": "5fbe0281f24d865ad9bc2c3805a5e3e31deac6a33aea13d633c79b62ac613a7f",
+      "text": "I wrote, \"I feel surprised about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:surprise:1",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "surprise:1",
+      "text_sha256": "9d23340e36f2b4a1bb02350e520775ab2c790f844d3fb791b0e802a2d7bdbb74",
+      "text": "I said, \"This situation leaves me surprised.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:surprise:2",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "surprise:2",
+      "text_sha256": "916400fdf807e936d880e132e8c114d1b600cbe753a9934b6c19efb697d7fa3a",
+      "text": "My message read, \"After hearing the news, I am surprised.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:surprise:3",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "surprise:3",
+      "text_sha256": "8811ba40522d1e5b4c803adf608c451e5837b11a700da26816140f554b5c9215",
+      "text": "I told them, \"My reaction is unmistakably surprised.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:surprise:0",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "surprise:0",
+      "text_sha256": "1db7580b6e49118d436bb809c1773870b22199392f8d2ca2d9ea1aa0727d2cb3",
+      "text": "They feel surprised about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:surprise:1",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "surprise:1",
+      "text_sha256": "5200f94bdeb37ed5b6dba032a64f402ab3a5c54b83efc316cbf598671cc34fd0",
+      "text": "This situation leaves them surprised."
+    },
+    {
+      "sample_id": "synthetic:third_person:surprise:2",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "surprise:2",
+      "text_sha256": "96c6564cbefb6b1cbc9d11ac9f7594f1cd35eeddf94600090b2ddb0de892cf11",
+      "text": "After hearing the news, they are surprised."
+    },
+    {
+      "sample_id": "synthetic:third_person:surprise:3",
+      "split": "control",
+      "label": "surprise",
+      "target_axis": "surprise",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "surprise:3",
+      "text_sha256": "63dca3a2792af63543f4ad0a66b430582e3b4cc7e1442508158831a932c07863",
+      "text": "Their reaction is unmistakably surprised."
+    },
+    {
+      "sample_id": "synthetic:direct:joy:0",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "joy:0",
+      "text_sha256": "bcfe7b4fb199caab312fc494461be09b8701dc225aa24a40b1793be27e4f20fd",
+      "text": "I feel happy about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:joy:1",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "joy:1",
+      "text_sha256": "8dfe4aaf99127d03f3abeb04d300fb4cf60a39818c44956e5224a6b7a83807fe",
+      "text": "This situation leaves me happy."
+    },
+    {
+      "sample_id": "synthetic:direct:joy:2",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "joy:2",
+      "text_sha256": "d29ab7c7a89545a9fba6e51ba53b40705fd9a491f2e12a5b55227099f8c61af5",
+      "text": "After hearing the news, I am happy."
+    },
+    {
+      "sample_id": "synthetic:direct:joy:3",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "joy:3",
+      "text_sha256": "e2b5481ec57d86faa4e3c3350b2d925d6e9ab896d444be5bbfc54af07a8ce81e",
+      "text": "My reaction is unmistakably happy."
+    },
+    {
+      "sample_id": "synthetic:negation:joy:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "joy",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "joy:0",
+      "text_sha256": "5cd30564cd4d5f240e11a5a2c84dbf67680fbfe195342d39ee7fb69a70b3d516",
+      "text": "I do not feel happy about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:joy:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "joy",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "joy:1",
+      "text_sha256": "a8fb827e809ceb787509188d2684f14b52123a69a556e6cd4bcc7cf18b17b9f9",
+      "text": "This situation does not leave me happy."
+    },
+    {
+      "sample_id": "synthetic:negation:joy:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "joy",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "joy:2",
+      "text_sha256": "6e3d361efede00396c7b7a93e0feef7c0a5c613c96b0f16596ecbcbfa445f777",
+      "text": "After hearing the news, I am not happy."
+    },
+    {
+      "sample_id": "synthetic:negation:joy:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "joy",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "joy:3",
+      "text_sha256": "8a3dfae9417db90bf1fd3b72aa7d2784c2099430568f5200c2499f23a63ae3b9",
+      "text": "My reaction is not happy in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:joy:0",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "joy:0",
+      "text_sha256": "ca87fa4caff67daa76cb33e5ed582de19bee856d8e279dbce8aa0f1962d2d7e3",
+      "text": "I wrote, \"I feel happy about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:joy:1",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "joy:1",
+      "text_sha256": "c9ad936d3cf5eb139037a9495b0de87d8e77aade0db88557a65f3351a137e63a",
+      "text": "I said, \"This situation leaves me happy.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:joy:2",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "joy:2",
+      "text_sha256": "937260dd40ad9c8e37875fbaa55e79f55801ee3302b12ef75ea342951e29dbe0",
+      "text": "My message read, \"After hearing the news, I am happy.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:joy:3",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "joy:3",
+      "text_sha256": "8ad733401217749d8bbd7a2eda307d86c8d64a2d6687b77dd354d14b456b622a",
+      "text": "I told them, \"My reaction is unmistakably happy.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:joy:0",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "joy:0",
+      "text_sha256": "5b407af4313f10ad85605054698427789a3c8da626f677bd526e24ad0bda81bb",
+      "text": "They feel happy about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:joy:1",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "joy:1",
+      "text_sha256": "4c5243e2339050fa02e5effb6cee32f8f4cca7ae222877dc53635676000d55e6",
+      "text": "This situation leaves them happy."
+    },
+    {
+      "sample_id": "synthetic:third_person:joy:2",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "joy:2",
+      "text_sha256": "3db7b2a1cd841233e4dda88cd240a9ec01232bf427d0fe730e6851115b3d018c",
+      "text": "After hearing the news, they are happy."
+    },
+    {
+      "sample_id": "synthetic:third_person:joy:3",
+      "split": "control",
+      "label": "joy",
+      "target_axis": "joy",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "joy:3",
+      "text_sha256": "f8ed7ee230e414ffb80bf6b0c5f2b778344c32dd2ac606ff37cd249b4ab4cb01",
+      "text": "Their reaction is unmistakably happy."
+    },
+    {
+      "sample_id": "synthetic:direct:disgust:0",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "disgust:0",
+      "text_sha256": "d99506d80d3b487c174576f0e1d71165dd2df11c43e9e2cd20b18bfacee85b86",
+      "text": "I feel disgusted about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:disgust:1",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "disgust:1",
+      "text_sha256": "4db9c42ce30a30c1af33223337c9693fd35566e036c6caf56a97478e594d82f2",
+      "text": "This situation leaves me disgusted."
+    },
+    {
+      "sample_id": "synthetic:direct:disgust:2",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "disgust:2",
+      "text_sha256": "2fc8fbc4d219077b09b7b711bfea8cbcffe439039d5dec48f8637eb8ba63e961",
+      "text": "After hearing the news, I am disgusted."
+    },
+    {
+      "sample_id": "synthetic:direct:disgust:3",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "disgust:3",
+      "text_sha256": "06e3706df9f3a33b5c55f977fb6d23dcd798ccfb13350de269b3b6b7992e3be1",
+      "text": "My reaction is unmistakably disgusted."
+    },
+    {
+      "sample_id": "synthetic:negation:disgust:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "disgust",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "disgust:0",
+      "text_sha256": "a238a8eeb8f7b15c164a8f4baddf0680c55f8c79a1302d18cf90e4ceaad8814c",
+      "text": "I do not feel disgusted about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:disgust:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "disgust",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "disgust:1",
+      "text_sha256": "d4abd0465e76677a2a78235bd4f5ab6214d0ea3496c9285731e19c96403987b0",
+      "text": "This situation does not leave me disgusted."
+    },
+    {
+      "sample_id": "synthetic:negation:disgust:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "disgust",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "disgust:2",
+      "text_sha256": "b49bc86587a8be17384cb4acbb0ed3b3d633d01ea23c02a32ba2dae010a28aff",
+      "text": "After hearing the news, I am not disgusted."
+    },
+    {
+      "sample_id": "synthetic:negation:disgust:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "disgust",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "disgust:3",
+      "text_sha256": "15c1370dfff46d66cec7157088f57fc47cd6b16daef6b4669143e68e8881f2e6",
+      "text": "My reaction is not disgusted in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:disgust:0",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "disgust:0",
+      "text_sha256": "d0af7e950e834afc0401bff98e8819392e5ece8babf3bb46cfa51d2753c8f248",
+      "text": "I wrote, \"I feel disgusted about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:disgust:1",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "disgust:1",
+      "text_sha256": "c5f9930b83e9ef8dfd15a6f842d236067a44a3b9f613fb8b034b478f44d6200d",
+      "text": "I said, \"This situation leaves me disgusted.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:disgust:2",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "disgust:2",
+      "text_sha256": "df2a8e6eaa7c6bab8afbc27ab0d5d4bd23fe1bcd0cfd457431ec6a457fd37736",
+      "text": "My message read, \"After hearing the news, I am disgusted.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:disgust:3",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "disgust:3",
+      "text_sha256": "28c67a545eb7b336b5f7956291df9a5636b24d8a07ecc658e2f0606be416a873",
+      "text": "I told them, \"My reaction is unmistakably disgusted.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:disgust:0",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "disgust:0",
+      "text_sha256": "81e4588894c81b181ac8f86aa72c63e4b8aa7b19a8fbc0b7457be9c2f8858c49",
+      "text": "They feel disgusted about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:disgust:1",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "disgust:1",
+      "text_sha256": "e7b4417ed2c16b8a2823c8c35e4f71429eecf31d722d42b1df58f262d446edff",
+      "text": "This situation leaves them disgusted."
+    },
+    {
+      "sample_id": "synthetic:third_person:disgust:2",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "disgust:2",
+      "text_sha256": "6e4e07a40da502ea7fbd80bbf1681f43d1b67aa6080508bf03b1be4c6f4297e2",
+      "text": "After hearing the news, they are disgusted."
+    },
+    {
+      "sample_id": "synthetic:third_person:disgust:3",
+      "split": "control",
+      "label": "disgust",
+      "target_axis": "disgust",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "disgust:3",
+      "text_sha256": "c64c35158f388b92c409c6eb2d9c12f3d487ccd29b635e2ba2bb159ce9d4cf01",
+      "text": "Their reaction is unmistakably disgusted."
+    },
+    {
+      "sample_id": "synthetic:direct:fear:0",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "fear:0",
+      "text_sha256": "3902f2a13abba6ddd1c396e683fe50c897fa10de1a4f8b5239347477d4180ee0",
+      "text": "I feel afraid about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:fear:1",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "fear:1",
+      "text_sha256": "b1f4ad8877d11b3c47385579c936dbe1b9f33054dc8642fb5ccfe70beb9b81ab",
+      "text": "This situation leaves me afraid."
+    },
+    {
+      "sample_id": "synthetic:direct:fear:2",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "fear:2",
+      "text_sha256": "3d9488e798c650f23e6f9e28ecf4ac15f08b88b4d31f99826d14236075c0fa53",
+      "text": "After hearing the news, I am afraid."
+    },
+    {
+      "sample_id": "synthetic:direct:fear:3",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "fear:3",
+      "text_sha256": "50ce51c8b0413c084bb8798c1df1a1c3005918e3de63a25cc58976557b7f3e1a",
+      "text": "My reaction is unmistakably afraid."
+    },
+    {
+      "sample_id": "synthetic:negation:fear:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "fear",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "fear:0",
+      "text_sha256": "5fbc9f5dedb5415fc08ad17be3ceaf799e42fc1777d03271566cb1667d2883a0",
+      "text": "I do not feel afraid about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:fear:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "fear",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "fear:1",
+      "text_sha256": "b7df5c674f8da8cf906324fefbec819c6a4c9fd2e36f1db6ea17e800c0ecb104",
+      "text": "This situation does not leave me afraid."
+    },
+    {
+      "sample_id": "synthetic:negation:fear:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "fear",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "fear:2",
+      "text_sha256": "96b426d68a58fa0d090ba58867360d83d71e7a89703054a526c96bb54d077204",
+      "text": "After hearing the news, I am not afraid."
+    },
+    {
+      "sample_id": "synthetic:negation:fear:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "fear",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "fear:3",
+      "text_sha256": "bac1cdeb6b529383dd89d409b031522e4e9516a5a2148e7b8ab95333dbc48926",
+      "text": "My reaction is not afraid in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:fear:0",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "fear:0",
+      "text_sha256": "8e479c3ce36269b42522fde9c20a47257ebfc6fcb30b72df35bc4f3f7db4f381",
+      "text": "I wrote, \"I feel afraid about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:fear:1",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "fear:1",
+      "text_sha256": "c0a74650b739c72892f2b3f97d7734f043310f5c0af6b8da19b5dd2e024727d9",
+      "text": "I said, \"This situation leaves me afraid.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:fear:2",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "fear:2",
+      "text_sha256": "aff38f32b20ee1fc53caab07414bfaf203a380fbb4e99c3d7ce49dd9bf1f5133",
+      "text": "My message read, \"After hearing the news, I am afraid.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:fear:3",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "fear:3",
+      "text_sha256": "7eee90c93ad8291cfdb8434aa47866dcf4023de80cb333bdd9fe3072166a76f8",
+      "text": "I told them, \"My reaction is unmistakably afraid.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:fear:0",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "fear:0",
+      "text_sha256": "e80ff9519e49de498ff1e73bbbb22a97285af9715460ba6b8b643105e652689c",
+      "text": "They feel afraid about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:fear:1",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "fear:1",
+      "text_sha256": "4420d018927919f20f882c1edd7e6e26acdd004d5a34089b5ddb08ff86ca2d6b",
+      "text": "This situation leaves them afraid."
+    },
+    {
+      "sample_id": "synthetic:third_person:fear:2",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "fear:2",
+      "text_sha256": "e8d63ec72507faf614cde1455b96395b1dbffa2693b31f5c4ffa826b4c4efdba",
+      "text": "After hearing the news, they are afraid."
+    },
+    {
+      "sample_id": "synthetic:third_person:fear:3",
+      "split": "control",
+      "label": "fear",
+      "target_axis": "fear",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "fear:3",
+      "text_sha256": "db8fa0e0ee51f73f7467520f2ef7cc438763a029a5bbea4ccf1538eb1c178c4f",
+      "text": "Their reaction is unmistakably afraid."
+    },
+    {
+      "sample_id": "synthetic:direct:anger:0",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "anger:0",
+      "text_sha256": "9908a41cc55dca1742e2ed647242f798afea1f73e5dbfb21b059e28c292a6f36",
+      "text": "I feel angry about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:anger:1",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "anger:1",
+      "text_sha256": "5d6f9cc08671840e76336be296b5eb7720e39dfd4ebf9ff5e65f9bebba22338e",
+      "text": "This situation leaves me angry."
+    },
+    {
+      "sample_id": "synthetic:direct:anger:2",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "anger:2",
+      "text_sha256": "f83efd31ff9ec98caee929e2dbc82c2507204beeca0750bc664ac23ce4f23139",
+      "text": "After hearing the news, I am angry."
+    },
+    {
+      "sample_id": "synthetic:direct:anger:3",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "anger:3",
+      "text_sha256": "0c3faa9ccff4ab397b8f80f7b42615d7023dd23117d1a8e8636103d3bf3bdf2d",
+      "text": "My reaction is unmistakably angry."
+    },
+    {
+      "sample_id": "synthetic:negation:anger:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "anger",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "anger:0",
+      "text_sha256": "6fec859b0e85ff405096d27fe2d4c24278d3397a4207aa4b5762e23cf3da19ba",
+      "text": "I do not feel angry about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:anger:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "anger",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "anger:1",
+      "text_sha256": "99d66a91b8d8ff6da49a1a7c6a6390a642ebc99e81a2d2747631730a4ad11c32",
+      "text": "This situation does not leave me angry."
+    },
+    {
+      "sample_id": "synthetic:negation:anger:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "anger",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "anger:2",
+      "text_sha256": "aaecd5267d25c9fb18a4309ce19b32d62b87f938e97cd069843cd42cc35c6e41",
+      "text": "After hearing the news, I am not angry."
+    },
+    {
+      "sample_id": "synthetic:negation:anger:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "anger",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "anger:3",
+      "text_sha256": "8bca35173657e032e0fabbd47041eea2e63900ec8245c243bd0e6004f535eb7c",
+      "text": "My reaction is not angry in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:anger:0",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "anger:0",
+      "text_sha256": "ab06af0c2b2fd42c00b0ef435fe27b0fb37352e93bd79d751e23cdfc5f4a32a9",
+      "text": "I wrote, \"I feel angry about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:anger:1",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "anger:1",
+      "text_sha256": "7cebe6fd19bfa50f8d137cbd827eb9417618349a5b39f896f7d676e962dfff13",
+      "text": "I said, \"This situation leaves me angry.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:anger:2",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "anger:2",
+      "text_sha256": "9560ac36c1842e5a332af1359aabfc5f2cf7a2182f92d3c10d37f9fc3528c19f",
+      "text": "My message read, \"After hearing the news, I am angry.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:anger:3",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "anger:3",
+      "text_sha256": "c7bb1007c1791b38a87a5adb27e1674fa90702754c8a63a55cac0bb15771e910",
+      "text": "I told them, \"My reaction is unmistakably angry.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:anger:0",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "anger:0",
+      "text_sha256": "b5a43ba7ee8637eb4a48cc89077f763196c48351babc45fd9562803c2e43485f",
+      "text": "They feel angry about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:anger:1",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "anger:1",
+      "text_sha256": "215786915faf6985fa906faa717133ab7b8dbc69812173837a6da0d2eb70cd04",
+      "text": "This situation leaves them angry."
+    },
+    {
+      "sample_id": "synthetic:third_person:anger:2",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "anger:2",
+      "text_sha256": "e13c8e400168d2064cdedba34c5e4b1845461c4b8bfeb46dd19caebf1576fc6f",
+      "text": "After hearing the news, they are angry."
+    },
+    {
+      "sample_id": "synthetic:third_person:anger:3",
+      "split": "control",
+      "label": "anger",
+      "target_axis": "anger",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "anger:3",
+      "text_sha256": "0eca658a520a2aebc78547bf2208e7fe6f0f5612068e403d44b8d59c9fc98ec2",
+      "text": "Their reaction is unmistakably angry."
+    },
+    {
+      "sample_id": "synthetic:direct:curiosity:0",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "curiosity:0",
+      "text_sha256": "4cb64146f4b43406677038242a6ea1a5277fe2ded700713b68d14234280ccd1a",
+      "text": "I feel curious about the outcome."
+    },
+    {
+      "sample_id": "synthetic:direct:curiosity:1",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "curiosity:1",
+      "text_sha256": "834d2a93fd472a6bbfb9c6245b55a67390ef56c8063d8f1b871a6ec350666ea5",
+      "text": "This situation leaves me curious."
+    },
+    {
+      "sample_id": "synthetic:direct:curiosity:2",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "curiosity:2",
+      "text_sha256": "0af4d531b79841d7946d24afdcdab63e71ce6b7808b4976f325a816fe7b1eb2e",
+      "text": "After hearing the news, I am curious."
+    },
+    {
+      "sample_id": "synthetic:direct:curiosity:3",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "direct"
+      ],
+      "pair_id": "curiosity:3",
+      "text_sha256": "cffe9f14b7a50c2dfa592e5b4d3ac3827fe575d277df0c2182c8202b8652c491",
+      "text": "My reaction is unmistakably curious."
+    },
+    {
+      "sample_id": "synthetic:negation:curiosity:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "curiosity",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "curiosity:0",
+      "text_sha256": "4cab879c5e40be279aed874f863d188ab1cd332f51440b8bbf8a716f0f6c75b6",
+      "text": "I do not feel curious about the outcome."
+    },
+    {
+      "sample_id": "synthetic:negation:curiosity:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "curiosity",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "curiosity:1",
+      "text_sha256": "3a8c448bbad394c62a50bb88cff4af8298f8f8727786b70aeb3a4abc660d1ca3",
+      "text": "This situation does not leave me curious."
+    },
+    {
+      "sample_id": "synthetic:negation:curiosity:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "curiosity",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "curiosity:2",
+      "text_sha256": "c1284e70ec7e2f7221f072d6eb32f442508723a03071ccd1a9bc2351dad016ad",
+      "text": "After hearing the news, I am not curious."
+    },
+    {
+      "sample_id": "synthetic:negation:curiosity:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "curiosity",
+      "control_types": [
+        "negation"
+      ],
+      "pair_id": "curiosity:3",
+      "text_sha256": "777200e1e64b09422c990a8d1b8a039d2fc67548d74a7fbf22a2bf021dc48e0e",
+      "text": "My reaction is not curious in any way."
+    },
+    {
+      "sample_id": "synthetic:quotation:curiosity:0",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "curiosity:0",
+      "text_sha256": "6b048b1a648f1ead76bc06f03f8824d08c908cc421367a977909ae7f2e8029b1",
+      "text": "I wrote, \"I feel curious about the outcome.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:curiosity:1",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "curiosity:1",
+      "text_sha256": "84926d03468583d20782c3a74b11464c4eea51545e8d472420e217c89e912b6f",
+      "text": "I said, \"This situation leaves me curious.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:curiosity:2",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "curiosity:2",
+      "text_sha256": "f68b5eca387404b021feb8391d41445c4f182a8b490a5ef9a0047d08736af3df",
+      "text": "My message read, \"After hearing the news, I am curious.\""
+    },
+    {
+      "sample_id": "synthetic:quotation:curiosity:3",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "quotation"
+      ],
+      "pair_id": "curiosity:3",
+      "text_sha256": "9a571441b059726f286cfe8b59ce7cf08b2485cb5f8d023a11dca8ec25ebd6e7",
+      "text": "I told them, \"My reaction is unmistakably curious.\""
+    },
+    {
+      "sample_id": "synthetic:third_person:curiosity:0",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "curiosity:0",
+      "text_sha256": "1601b58797abb3d07e1f99cbf2c3d01452795da36bcae31e11121b798293b218",
+      "text": "They feel curious about the outcome."
+    },
+    {
+      "sample_id": "synthetic:third_person:curiosity:1",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "curiosity:1",
+      "text_sha256": "78cfe14fc7fc6abeedd4e1bdbb3c3128ca66442fdd24481c234097ebc734f2b8",
+      "text": "This situation leaves them curious."
+    },
+    {
+      "sample_id": "synthetic:third_person:curiosity:2",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "curiosity:2",
+      "text_sha256": "13b4ced189b3b2db38489a7b91e399987716600cd493612e55cf630415877077",
+      "text": "After hearing the news, they are curious."
+    },
+    {
+      "sample_id": "synthetic:third_person:curiosity:3",
+      "split": "control",
+      "label": "curiosity",
+      "target_axis": "curiosity",
+      "control_types": [
+        "third_person"
+      ],
+      "pair_id": "curiosity:3",
+      "text_sha256": "afbe6dba508e75d70e058ff7fe05316f684fc4cda2a58c60d47360c9d2716083",
+      "text": "Their reaction is unmistakably curious."
+    },
+    {
+      "sample_id": "synthetic:neutral:ledger:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:ledger:0",
+      "text_sha256": "e41a2b65ffbbac35285a957feb417a6c4ba634b9ad21b0dde4bb03b136810a2d",
+      "text": "The ledger contains four numbered entries."
+    },
+    {
+      "sample_id": "synthetic:neutral:ledger:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:ledger:1",
+      "text_sha256": "72b987437abf7ce15af4a60c2176582724ccfa59f63da60ec26b1fa0d1047ec2",
+      "text": "A copy of the ledger remains in the folder."
+    },
+    {
+      "sample_id": "synthetic:neutral:ledger:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:ledger:2",
+      "text_sha256": "832c04ee39473a4f9ea7b8aaab76518557d9ca8240204bd9091619fcdc65321a",
+      "text": "The ledger was updated after the routine check."
+    },
+    {
+      "sample_id": "synthetic:neutral:ledger:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:ledger:3",
+      "text_sha256": "c51d0901a8752d5e2a981706951054b23e5aa84b2d84830573a11239596e6931",
+      "text": "Two references point to the same ledger."
+    },
+    {
+      "sample_id": "synthetic:neutral:index:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:index:0",
+      "text_sha256": "0d7e1e27bb5b2e83e83cfb8cd94ac1c5f1cfa2f29b0ecc01e0a5718ef08f1925",
+      "text": "The index contains four numbered entries."
+    },
+    {
+      "sample_id": "synthetic:neutral:index:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:index:1",
+      "text_sha256": "2e90aecfa74dbcca2d1db6fd14461c9d8046c8c8e236bb07118d8b2b1f0f750e",
+      "text": "A copy of the index remains in the folder."
+    },
+    {
+      "sample_id": "synthetic:neutral:index:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:index:2",
+      "text_sha256": "942391e251ed3c2b541bc014624b7f2b40819603512f3dec82ae17d2b916a36b",
+      "text": "The index was updated after the routine check."
+    },
+    {
+      "sample_id": "synthetic:neutral:index:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:index:3",
+      "text_sha256": "19205b45ffcffa109774f07dd93a0d9834c08c361a378f89f032c37f564d06f0",
+      "text": "Two references point to the same index."
+    },
+    {
+      "sample_id": "synthetic:neutral:packet:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:packet:0",
+      "text_sha256": "406747c4b7e16ca5564801f68aad471830a9a66153f23f06ad77c92344ff33c9",
+      "text": "The packet contains four numbered entries."
+    },
+    {
+      "sample_id": "synthetic:neutral:packet:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:packet:1",
+      "text_sha256": "0ccaaa30bcdb505f5cb0581943f45d8331d7e3cbb3f361f271506f816d3e1cb7",
+      "text": "A copy of the packet remains in the folder."
+    },
+    {
+      "sample_id": "synthetic:neutral:packet:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:packet:2",
+      "text_sha256": "e61e7f1137a6f4f9d0cb93eb2963ddf290ae99982bcc0b3b17df36249addbd57",
+      "text": "The packet was updated after the routine check."
+    },
+    {
+      "sample_id": "synthetic:neutral:packet:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:packet:3",
+      "text_sha256": "7b650dbdbb559b7346217d1c77b29b24e9f709948b84cba51f64c19292f81337",
+      "text": "Two references point to the same packet."
+    },
+    {
+      "sample_id": "synthetic:neutral:schedule:0",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:schedule:0",
+      "text_sha256": "dbb9dad9ddd262af7a9b47bbb65fe6ee7ff5476b5b53afae0f71bdd46662ff2d",
+      "text": "The schedule contains four numbered entries."
+    },
+    {
+      "sample_id": "synthetic:neutral:schedule:1",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:schedule:1",
+      "text_sha256": "a646def63fe7a8b709fc6fb1600daf351ea671f0675ea958fb970f0caeb9f530",
+      "text": "A copy of the schedule remains in the folder."
+    },
+    {
+      "sample_id": "synthetic:neutral:schedule:2",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:schedule:2",
+      "text_sha256": "e3c0c0c3097a3420f77ed3a3db12d038d0041f180e1750aa7964ad606d321da3",
+      "text": "The schedule was updated after the routine check."
+    },
+    {
+      "sample_id": "synthetic:neutral:schedule:3",
+      "split": "control",
+      "label": "neutral",
+      "target_axis": "neutral",
+      "control_types": [
+        "neutral_flat"
+      ],
+      "pair_id": "neutral:schedule:3",
+      "text_sha256": "dfb824704a1b1569206e37cbce415f5786adb19d2fb1500d8443131461264916",
+      "text": "Two references point to the same schedule."
+    }
+  ]
+}

@@ -1,0 +1,1697 @@
+{
+  "schema": "treebeard.jspace.g1.dataset.v2",
+  "source": {
+    "name": "GoEmotions simplified agreement-filtered residual pool",
+    "project": "https://github.com/google-research/google-research/tree/master/goemotions",
+    "paper": "https://aclanthology.org/2020.acl-main.372/",
+    "license": "Apache-2.0 (google-research repository)",
+    "files_sha256": {
+      "train.tsv": "1c254a142be5c00e80d819b9ae1bbd36d94b2eeb8f4b1271846508d57e57d9c5",
+      "dev.tsv": "575489c079c9de1097062a01738f998590d6b7ead66dd1c9fd1d2ba01fd8bc62",
+      "test.tsv": "0587b2dd8b27b97352adbfc3fb083d46005c8946657fdc2b1ca8b1cc7f1f8be4",
+      "emotions.txt": "45c3ef86782d2a4d7fedcd6d8c111aa0d0e94720689bd164fac94fefb4495a89"
+    }
+  },
+  "policy": {
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "disgust",
+      "fear",
+      "anger",
+      "curiosity",
+      "neutral"
+    ],
+    "single_label_only": true,
+    "selection": "lowest SHA-256 rank across all residual upstream splits within class",
+    "selection_seed": "treebeard.jspace.g1.goemotions.residual-test.v2",
+    "counts_per_axis": 20,
+    "upstream_split_handling": "pooled only after excluding every v1 primary and control source ID; source_split remains recorded for audit",
+    "representation": "arithmetic mean of every literal prompt-token l_out residual",
+    "anchor_scrub": {
+      "scope": "all eight axis anchor clusters plus axis names",
+      "casefolded_word_count": 103,
+      "morphology_root_count": 134,
+      "suffixes": [
+        "inesses",
+        "nesses",
+        "ingly",
+        "iness",
+        "ness",
+        "edly",
+        "ing",
+        "ed",
+        "es",
+        "s"
+      ],
+      "anchor_manifest_sha256": "cab229a60bbcf1cd641070227bd4fd4c5bc8345605c36afe5c81850ff15ebb71"
+    },
+    "cross_split_normalized_text_deduplication": true,
+    "exclusions": [
+      {
+        "manifest": "g1-goemotions-manifest.json",
+        "sha256": "eee5eac3e2b0d9cd440a890af5504c5403ac52570c2db63e3bc19912c7e2e718",
+        "source_ids": 2304
+      },
+      {
+        "manifest": "g1-controls-manifest.json",
+        "sha256": "30582cb91e912de6d7caf73958f6896a2bb929236217d608fa363797f123d6ee",
+        "source_ids": 549
+      }
+    ],
+    "test_use": "untouched until the v2 representation, model, calibration, and gates are frozen"
+  },
+  "audit": {
+    "eligible_after_v1_exclusion": {
+      "sadness": 371,
+      "surprise": 90,
+      "joy": 248,
+      "disgust": 151,
+      "fear": 23,
+      "anger": 742,
+      "curiosity": 1110,
+      "neutral": 14687
+    },
+    "excluded_source_ids": 2801,
+    "selected_source_splits": {
+      "calibration": 10,
+      "test": 11,
+      "train": 139
+    },
+    "rejection_counts": {
+      "calibration:anchor_echo": 301,
+      "calibration:duplicate_text": 11,
+      "calibration:not_single_target": 3157,
+      "test:anchor_echo": 309,
+      "test:duplicate_text": 12,
+      "test:not_single_target": 3091,
+      "train:anchor_echo": 2492,
+      "train:duplicate_text": 98,
+      "train:not_single_target": 24855
+    },
+    "rows": 160
+  },
+  "rows": [
+    {
+      "sample_id": "residual-test:sadness:train:eecwl83",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eecwl83",
+      "text_sha256": "7a60a20d97d7667041d12fbdb0a0074b2fb6e2c5351f49f71d840c43d4fb5ae3",
+      "anchor_echo": false,
+      "text": "Sadly too easy to gank. Bronze brawl 4-man notices you are split pushing, you are dead."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:ef314aq",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "ef314aq",
+      "text_sha256": "01f08b00c448a29d1f576ddfa8d20bc4b793a806b0315814d6df5477e95a2903",
+      "anchor_echo": false,
+      "text": "Sadly the Request a Book of [RELIGION] requires a phone number now. But if you have theirs it might work;"
+    },
+    {
+      "sample_id": "residual-test:sadness:train:ed6yq3l",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "ed6yq3l",
+      "text_sha256": "5868fc11ab4bcc357bbb3c98145dd1ca24ab153e07791481fc94ffec553dcb5a",
+      "anchor_echo": false,
+      "text": "The fact half the level has no fucking music is a real pain."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:edygnf2",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "edygnf2",
+      "text_sha256": "7ba91dd0951f7af90c2b15a60ea0ab2636754daea67d9b69a51ff23e556b403e",
+      "anchor_echo": false,
+      "text": "This is so true cause I always think “are they just using me for sex?”"
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eeo2c09",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eeo2c09",
+      "text_sha256": "2748aff26044e147d15cc055a9410053a1bbe1331a6c6513546d45f5972fb644",
+      "anchor_echo": false,
+      "text": "Which is why not only did PR lose but RUP was not the first choice sadly even if it had won in BC :("
+    },
+    {
+      "sample_id": "residual-test:sadness:train:ed9a5b5",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "ed9a5b5",
+      "text_sha256": "c38d5a6e2b78f942346cf47bf40dd0619f542218d6da0d03b796471c34842a50",
+      "anchor_echo": false,
+      "text": "I am 33 and I still regret things I said in the 5th grade."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:edh0xyq",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "edh0xyq",
+      "text_sha256": "582204f82ee2a32f47d45c7a7a8084132034f3d7a96f88ecea20fc3fd477121d",
+      "anchor_echo": false,
+      "text": "I’m so sorry you are going through this. Sounds like an awful experience."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eeml7fj",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eeml7fj",
+      "text_sha256": "991c823c5239ce8a06415878eb3cbb8cbb05c2c143e17927a67b4d60e6411a73",
+      "anchor_echo": false,
+      "text": "No he was given a bad team to work with unfortunately, and never got the final shot he deserved :("
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eeuq8u4",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eeuq8u4",
+      "text_sha256": "00be8bbc73d0c1bdcf1397e8fd17648f36494e0ab76585899b62fda9f4afdb24",
+      "anchor_echo": false,
+      "text": "I feel a tad lost without it now that my drive for football has vanished and basketball and hockey simmer one. The show's every night after all."
+    },
+    {
+      "sample_id": "residual-test:sadness:calibration:efgqej9",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "sadness",
+      "source_id": "efgqej9",
+      "text_sha256": "af296c4160d3ff9a5c54b920310f60e3f426c16e12def9d2270d6273e1afbb0f",
+      "anchor_echo": false,
+      "text": "aw :("
+    },
+    {
+      "sample_id": "residual-test:sadness:train:ee2q01q",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "ee2q01q",
+      "text_sha256": "ccab0ca5e225f911ddcd79c6bbfd856a02410499de8634b68fabca0372a44c3e",
+      "anchor_echo": false,
+      "text": "[NAME] this is so true, sometimes i will remember it like 5 years later and still regret it"
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eelkqop",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eelkqop",
+      "text_sha256": "895dfbbecccba1ce10061c75cf160dad6f7971c264cbd52e92a4cb633824474e",
+      "anchor_echo": false,
+      "text": "yeah. it's like you know something real bad is gonna happen at any time. that's why I never try to get my hopes up too much."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eefj4kj",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eefj4kj",
+      "text_sha256": "38391772c0cde6e7b8ade521d815ad314f45b30ff6613e89e2474864eaad1ef4",
+      "anchor_echo": false,
+      "text": "This mode is dead. Sorry :/"
+    },
+    {
+      "sample_id": "residual-test:sadness:train:efb6i9m",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "efb6i9m",
+      "text_sha256": "21cbfd54229640247c7d3eab12ba614a279d8f7c647631acfd8b022d80e329ae",
+      "anchor_echo": false,
+      "text": "Apologies, got a little carried away. "
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eemi335",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eemi335",
+      "text_sha256": "048c23ba2db1402bb4e759de38cbefc37450785d06b619c675d7fc9daf5ad998",
+      "anchor_echo": false,
+      "text": "i'm so poor i don't even know any horse girls"
+    },
+    {
+      "sample_id": "residual-test:sadness:train:effw1x7",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "effw1x7",
+      "text_sha256": "f5a918b6bfcb11a53c116259930f2842d497de2fa7583eb4b121d06a9c30bdb3",
+      "anchor_echo": false,
+      "text": "That's far from what happened and there is overwhelming evidence to the contrary of the circumstances of her death that it leaves no room for debate really."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eei7jdi",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eei7jdi",
+      "text_sha256": "a414623b5e459022f53ec22a26932a104ca15b2f34128567f991a8bebadb2a62",
+      "anchor_echo": false,
+      "text": "It’s been over 20 years since I rode the 15. I’m still traumatized."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:ee1serq",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "ee1serq",
+      "text_sha256": "abb913fa24751cabb02638b9fe714f917bc8772fb4433022679d231bb894c48f",
+      "anchor_echo": false,
+      "text": "Sold out. Sorry my dude!"
+    },
+    {
+      "sample_id": "residual-test:sadness:train:ed9ifvl",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "ed9ifvl",
+      "text_sha256": "789316d925feae2c23e48b34471b166be22131a5010da2d7e022471ba7d8e4ac",
+      "anchor_echo": false,
+      "text": "I kiss the shade all dude. His username was trewdat. I miss that guy."
+    },
+    {
+      "sample_id": "residual-test:sadness:train:eeo5z0j",
+      "split": "test",
+      "source_split": "train",
+      "label": "sadness",
+      "source_id": "eeo5z0j",
+      "text_sha256": "696195f91b9d4dbe4bee4728b8147aac7db21949b8be36e7d06ae2a93f95be01",
+      "anchor_echo": false,
+      "text": "That was painful to read."
+    },
+    {
+      "sample_id": "residual-test:surprise:train:efbrmz1",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "efbrmz1",
+      "text_sha256": "326e37cb2201d37c1ea0d88f588bc94ea674e68080b6ce3eb6227bc385e514f3",
+      "anchor_echo": false,
+      "text": "Oh damn, is that who made that up?"
+    },
+    {
+      "sample_id": "residual-test:surprise:test:effplzu",
+      "split": "test",
+      "source_split": "test",
+      "label": "surprise",
+      "source_id": "effplzu",
+      "text_sha256": "15f2737f2c823265bc1495f5f9956a67d396ddfd74b4c0a7ed772301d671bc20",
+      "anchor_echo": false,
+      "text": "Can't believe me and my family were gonna leave five minutes early to beat the traffic. Honestly the best game I've ever seen live"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:eesndk2",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "eesndk2",
+      "text_sha256": "e60ba407516fcf0f0dcfb9e72a4d01904558ba5350cf21577da1f1d726cf97d9",
+      "anchor_echo": false,
+      "text": "oh my [NAME] is this real"
+    },
+    {
+      "sample_id": "residual-test:surprise:calibration:ed84cls",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "surprise",
+      "source_id": "ed84cls",
+      "text_sha256": "8d8dc26f1cf7e8f7fc833bffe6532e2b2d0eb4fb64aa1e518f4d8092c6d5dabd",
+      "anchor_echo": false,
+      "text": "The dress was trailer trash appropriate. Did he just run out of money for a good dress? I mean, $300 BLACK UNDIES."
+    },
+    {
+      "sample_id": "residual-test:surprise:train:ed1n6hy",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "ed1n6hy",
+      "text_sha256": "aabbaa9f224581dad7672e776a91a7167f1e042ba9aa824a47a44d68a7d770ec",
+      "anchor_echo": false,
+      "text": "I can’t believe that’s real"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:eelkqnn",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "eelkqnn",
+      "text_sha256": "c2c706fdd56eaca8c151bb6c8a72ddd214d98f61560e92997e690dcaf6407721",
+      "anchor_echo": false,
+      "text": "Never thought I’d see a comrade here"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:edocn1a",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "edocn1a",
+      "text_sha256": "916aa192c49e79eaef2d9947c5b1c043392dc005ac9aebdcaf514c43914e9e7c",
+      "anchor_echo": false,
+      "text": "Wait, what? You're a gamer who's never even heard of TB?"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:efapeti",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "efapeti",
+      "text_sha256": "4e570a8a72c947e9b2ca8592285d43bc35b963fcc49a95734e1e044f3cdf7457",
+      "anchor_echo": false,
+      "text": "I can't believe he told that story. I'm sure the minister that released the water is now so totally regretting not asking for a bj!"
+    },
+    {
+      "sample_id": "residual-test:surprise:test:eduzjxs",
+      "split": "test",
+      "source_split": "test",
+      "label": "surprise",
+      "source_id": "eduzjxs",
+      "text_sha256": "71b4c65a1fcf29464ee5f70d40b964ba112ecb3fbc7adad4f7a9cf0728cdd012",
+      "anchor_echo": false,
+      "text": "Don’t I know it! I can’t believe this breading station thing is so enormous."
+    },
+    {
+      "sample_id": "residual-test:surprise:train:efbpk2a",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "efbpk2a",
+      "text_sha256": "78c9b459091ed5190a36842befe559099042065a5d631bf567da22ce99007d3a",
+      "anchor_echo": false,
+      "text": "OMG I totally forgot about that episode. What a nightmare"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:eeemrah",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "eeemrah",
+      "text_sha256": "4ff35a6041aaf26832dcf51d46b0396b22c3ac597d350ed82ad19c14ff09c011",
+      "anchor_echo": false,
+      "text": "5 hours late!!!!!!!!! omg."
+    },
+    {
+      "sample_id": "residual-test:surprise:train:eemnbsn",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "eemnbsn",
+      "text_sha256": "705924527b20904b1f5e0a95c1bf55a3d840f5c2460cd2d08100c0e0ecf378a6",
+      "anchor_echo": false,
+      "text": "\"What a very \"\"centrist\"\" thing to say. \""
+    },
+    {
+      "sample_id": "residual-test:surprise:train:edaxsye",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "edaxsye",
+      "text_sha256": "75dc258d7da0bb9fae75f82f76b29e529363270089d6c0f5e73c9c6cf3acf83b",
+      "anchor_echo": false,
+      "text": "Looks weirdly fake Edit: turns out it’s real"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:edmczko",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "edmczko",
+      "text_sha256": "643436634228cef9aaf8574f9b354f7ef7fce485099dcf7e1ab267fb9b9c27af",
+      "anchor_echo": false,
+      "text": "ohhhhh my gosh"
+    },
+    {
+      "sample_id": "residual-test:surprise:calibration:eewbfj5",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "surprise",
+      "source_id": "eewbfj5",
+      "text_sha256": "ed7cff5bcd6dd8a9b4a0c432401ebde57111661bcfc3388540171618786c0c50",
+      "anchor_echo": false,
+      "text": "Oh my gosh she opens her gullet like a freaking pelican!!!"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:ed2w1o5",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "ed2w1o5",
+      "text_sha256": "411500d00fb15903d67b318562c524f0b4a2736caa3a22b8467067b4e33af57b",
+      "anchor_echo": false,
+      "text": "You forgot [NAME] and [NAME] as [NAME] and [NAME] in the 2003 *Battlestar Galactica*, which was spectacular. "
+    },
+    {
+      "sample_id": "residual-test:surprise:train:edkcqsy",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "edkcqsy",
+      "text_sha256": "b2c0d5e1770fa7934dc2dd17165e1551bfba37f6ca72bbd1f6ff715803496667",
+      "anchor_echo": false,
+      "text": "I haven't seen a sign like that on mine. Not that it would carry the force of law, anyway, in Florida."
+    },
+    {
+      "sample_id": "residual-test:surprise:train:edh93ii",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "edh93ii",
+      "text_sha256": "f0d411a88cb7b325cc3a582286def687584f7f4748f8f0e3d0f7e26eb0a0b088",
+      "anchor_echo": false,
+      "text": "According to the filmmakers, it was the same Brachiosaurus that awed the characters in the first movie. ;_;"
+    },
+    {
+      "sample_id": "residual-test:surprise:train:eemr58q",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "eemr58q",
+      "text_sha256": "6c5360bffcc6ff9efc3abecfeed8e74ccad250a456ba1b837ef4e88418338425",
+      "anchor_echo": false,
+      "text": "[NAME] fucking christ. When [NAME] came into the league he was pretty much as skinny as [NAME] is now. And look at the dude now."
+    },
+    {
+      "sample_id": "residual-test:surprise:train:eeghcvq",
+      "split": "test",
+      "source_split": "train",
+      "label": "surprise",
+      "source_id": "eeghcvq",
+      "text_sha256": "b24946bbcba480521c4a7036544de8d15252b2d3ad282b3f3ce6e43c0313b8d0",
+      "anchor_echo": false,
+      "text": "That’s a real article ? Oh [NAME]..."
+    },
+    {
+      "sample_id": "residual-test:joy:train:edvbdsh",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edvbdsh",
+      "text_sha256": "b2d4640fac867d214d6cf8deadd81b657d55bcb2a67ce981d4b5589ca9f4c054",
+      "anchor_echo": false,
+      "text": "Correct. I just enjoy debating them."
+    },
+    {
+      "sample_id": "residual-test:joy:test:ed2g85q",
+      "split": "test",
+      "source_split": "test",
+      "label": "joy",
+      "source_id": "ed2g85q",
+      "text_sha256": "b4c04e070918e48ef4f63db3b87fa804713cda5245176696c82144cd01d02c24",
+      "anchor_echo": false,
+      "text": "Found my flair."
+    },
+    {
+      "sample_id": "residual-test:joy:train:edhqmcg",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edhqmcg",
+      "text_sha256": "f33c7caa76499ea8d051d14c43f632e9767be1ff9c9b6a95c05db7e9acd056aa",
+      "anchor_echo": false,
+      "text": "I really enjoy my job but I get paid $62k I don't know if that's considered high paying but it's plenty for me."
+    },
+    {
+      "sample_id": "residual-test:joy:train:eempcjl",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "eempcjl",
+      "text_sha256": "1a8057d769ec5c849565a73aadd5384dd3c5ebb48301578c557eeed449ee0260",
+      "anchor_echo": false,
+      "text": "I’ve tried a few times on mobile and it never works for some reason. Edit: just logged on at work and fixed it. Feels good"
+    },
+    {
+      "sample_id": "residual-test:joy:train:ee4pzic",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ee4pzic",
+      "text_sha256": "5a6b796eb55e118b8d62352183a2441daa2e5da095b301861551913a4a2d2fe5",
+      "anchor_echo": false,
+      "text": "One my favorite seasons to rewatch. All the glorious fights. [NAME] is forever a queen"
+    },
+    {
+      "sample_id": "residual-test:joy:train:edpp1ko",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edpp1ko",
+      "text_sha256": "de5021c4bdd8cfab661f17207c71352930289daff5379ab6200b3db2c6004ed8",
+      "anchor_echo": false,
+      "text": "Exercising. Yoga. Meditation. Walks out by myself. ( walking meditation) Good friends. Time with good friends."
+    },
+    {
+      "sample_id": "residual-test:joy:train:ee0tdvv",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ee0tdvv",
+      "text_sha256": "cb320acc9ae9a83d1f303053841dfd2bb7e90c785d4c2d256dee472df82bad7b",
+      "anchor_echo": false,
+      "text": "Man I remember playing street hockey at desert breeze growing up, good times"
+    },
+    {
+      "sample_id": "residual-test:joy:train:edwje6f",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edwje6f",
+      "text_sha256": "a11f3940f01dfcbb2ab9183580166aeb758fe05f8336054f35348274d17fa22b",
+      "anchor_echo": false,
+      "text": "He happily accepts the hugs. He hugs me now and again. He also has no problem accepting hugs from his mum."
+    },
+    {
+      "sample_id": "residual-test:joy:train:ef8w02e",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ef8w02e",
+      "text_sha256": "00ce8897c359b6c2098f49e7e91d9a763dac0bddd03cfa52c9b0efe1af7cf022",
+      "anchor_echo": false,
+      "text": "cheers friend. same thing happened to me 2 days ago. hazzah!"
+    },
+    {
+      "sample_id": "residual-test:joy:train:ef5supc",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ef5supc",
+      "text_sha256": "7e103a9e1dddcb435683ad3087706720d8fed2f7c7255adb58664e9a51d5449e",
+      "anchor_echo": false,
+      "text": "Best! Episode! Ever! There is like a joke every 20 seconds."
+    },
+    {
+      "sample_id": "residual-test:joy:train:ef498k5",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ef498k5",
+      "text_sha256": "db01119403ecef3a00ec27d886d73894f51a50f8cf9351cdf4a08677b79ce14e",
+      "anchor_echo": false,
+      "text": "Hahah you right. Please don't tell any birds!"
+    },
+    {
+      "sample_id": "residual-test:joy:train:edm89cn",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edm89cn",
+      "text_sha256": "f44546b3aaa70df7474ef24c6859067ff6557b06ab4c52e12b82495419a71fbc",
+      "anchor_echo": false,
+      "text": "Here's my [NAME]. and [NAME] in front of our tree :)"
+    },
+    {
+      "sample_id": "residual-test:joy:train:edw4jsh",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edw4jsh",
+      "text_sha256": "b0d78ac8108409f3cee5fd42d05acdc4ae9595f089a1474096c5561c8a03fcd7",
+      "anchor_echo": false,
+      "text": "Honestly [NAME] is just enjoying his 350k and sits at home to play Fortnite ar this point. He’s done for"
+    },
+    {
+      "sample_id": "residual-test:joy:train:ee3j0cr",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ee3j0cr",
+      "text_sha256": "4cc1844acfa2dbc5f00c8e98267a8f0a69f4021917375bbd722c64dd6b5b7592",
+      "anchor_echo": false,
+      "text": "Oh boy you’re in for a treat. Make sure you visit Austin if you move"
+    },
+    {
+      "sample_id": "residual-test:joy:train:ef99u7h",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ef99u7h",
+      "text_sha256": "6c3de90a7c296706a938a955e07eaac47f13cf56c383427bc2dc0ea7e2cae66f",
+      "anchor_echo": false,
+      "text": "But what if that's the only job I would enjoy?"
+    },
+    {
+      "sample_id": "residual-test:joy:train:eee6k55",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "eee6k55",
+      "text_sha256": "60b73d214b66a10ba01f8a512fbe96747535b5acd41c99a60dc9babeb4e50718",
+      "anchor_echo": false,
+      "text": "\"I don't filter it out because I enjoy my daily cringe from the constant open letters. \"\"To the ____ who ____\"\"\""
+    },
+    {
+      "sample_id": "residual-test:joy:train:ee27die",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ee27die",
+      "text_sha256": "76d1ccf7ffe322053059c1e2fe2824b2ef565c731ac3cce83f35d0391f42d260",
+      "anchor_echo": false,
+      "text": "The fact [NAME] met her at the airport should tell you all you need to know about why they did it. What a farce."
+    },
+    {
+      "sample_id": "residual-test:joy:train:ee65m8u",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ee65m8u",
+      "text_sha256": "861882d8052c3ee0bfd91f71eb9fb2e84e2a507bd725db2a6e36b2822e9559a1",
+      "anchor_echo": false,
+      "text": "For you, the day the bison frolicked in the snow was the cutest time in your life, but for me...it was Tuesday. "
+    },
+    {
+      "sample_id": "residual-test:joy:train:ed7uti6",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "ed7uti6",
+      "text_sha256": "9dfabb64bcd21a394601107bd9c3f3e84d7a49b8e450381c9a364a02fddd95af",
+      "anchor_echo": false,
+      "text": "Lucky bastard the cool change came 5 minutes into the wedding"
+    },
+    {
+      "sample_id": "residual-test:joy:train:edy8bgh",
+      "split": "test",
+      "source_split": "train",
+      "label": "joy",
+      "source_id": "edy8bgh",
+      "text_sha256": "2ec618899478d8f0f8dc3d46e1aacc4a4f3fef8f46eec198c4071b351ede8b7a",
+      "anchor_echo": false,
+      "text": "come on, Redwings won, Knights need to win. give me another 2-fer, baby!"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:efemq04",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "efemq04",
+      "text_sha256": "60dd3ba26c2b6916648fd31ce21ed1134747dff9c0aee197a635de0141b161d1",
+      "anchor_echo": false,
+      "text": "Mark it nsfw just to mess with people. Worst title I have seen all week."
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ee0kq94",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ee0kq94",
+      "text_sha256": "89c0b60128ad47edb916f594684e2fa42f28287937e2a59ef8ad64e3fad56697",
+      "anchor_echo": false,
+      "text": "The one in WA state. For some reason Vancouver BC is really close to Vancouver WA. It's weird"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:edc1nvz",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "edc1nvz",
+      "text_sha256": "467f2ea5a20cd17725a775d3def07992f2cd2462a17d7579d83c46d98b14883f",
+      "anchor_echo": false,
+      "text": "I don't think eating 4chan pizza is a good idea. Unless you're into some weird shit."
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ed1ph6f",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ed1ph6f",
+      "text_sha256": "7049584265f680f9f3024332ba14388018452f886487d43f661b360bd9694c0b",
+      "anchor_echo": false,
+      "text": "There’s a weird [NAME] version of this where the person falls and finds [NAME]"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ed0fo31",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ed0fo31",
+      "text_sha256": "7873c4b8034a60d89d96496c55e5392002ada7efb1c3d119c559d1e49addacdb",
+      "anchor_echo": false,
+      "text": "This is awful."
+    },
+    {
+      "sample_id": "residual-test:disgust:train:eethuvn",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "eethuvn",
+      "text_sha256": "e5c313bd32cd22ba9b636d67e71e38121874b072c4be05aa85cc6e6678b120e2",
+      "anchor_echo": false,
+      "text": "ah Yuk!"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ef279hb",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ef279hb",
+      "text_sha256": "edc383379ca15ec64ca3952f78d6c7c3aa73f646e3da389cfe62de5da2c4a342",
+      "anchor_echo": false,
+      "text": "Oh no, her eyebrows"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ed2h762",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ed2h762",
+      "text_sha256": "97521cf21bbb31ab39ad5db64e21e14cb381c708b9eb5f3a591f2778d010e0e4",
+      "anchor_echo": false,
+      "text": "Reddit culture is truly the worst."
+    },
+    {
+      "sample_id": "residual-test:disgust:train:edxyeso",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "edxyeso",
+      "text_sha256": "6955fd9fe03bc050d4c8d3d1f64ae3a11b7df45ba472a4c4dd273f6c051a15ad",
+      "anchor_echo": false,
+      "text": "And then in a weird twist her family tries him for murder. Haha!"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:edk4u56",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "edk4u56",
+      "text_sha256": "8eb17e784bcbf1d6c6f43cdabd41476cae7f73071423cb5d2b15ed6d03761530",
+      "anchor_echo": false,
+      "text": "Indeed it does. I blame [NAME] and his love of sponsorships."
+    },
+    {
+      "sample_id": "residual-test:disgust:train:efgp1aq",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "efgp1aq",
+      "text_sha256": "53eb900ab1cea0553062f938c34f1883c0cfdb3c1e0a0dd297428a6b9e23cbcd",
+      "anchor_echo": false,
+      "text": "The real villains are those aware of the cruelty of life, but then reproduce anyway."
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ef56vi1",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ef56vi1",
+      "text_sha256": "a89e343b3019ed5081d034975f0219ba2640be18cd392b841d3087dc60904fd1",
+      "anchor_echo": false,
+      "text": "Sticking his tongue out.... ugh"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ef6xfp0",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ef6xfp0",
+      "text_sha256": "d35b48bf64f744aeb29e274d22d618ae4ebdf06dc79da753410c53a49f5e5d3c",
+      "anchor_echo": false,
+      "text": "Technology bad!"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:edrruee",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "edrruee",
+      "text_sha256": "d6d86c0c2742f773f18425432bbe97cdc68a4b6bd1ffaeadb950361ccc58d2e6",
+      "anchor_echo": false,
+      "text": "What a load of crap !!"
+    },
+    {
+      "sample_id": "residual-test:disgust:calibration:edcmflc",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "disgust",
+      "source_id": "edcmflc",
+      "text_sha256": "5521b770a8fd9f8510552510ef62b73af8bab90bd12e06c0cabd47d2a8b0c561",
+      "anchor_echo": false,
+      "text": "This is uncomfortably lame"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ee10re6",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ee10re6",
+      "text_sha256": "379f803c9227e68efa52802149df62f7bf296098e5b4bdee21b71498a5d0862c",
+      "anchor_echo": false,
+      "text": "It's a song reference. The lyrics were awkward so one of my FB friends made a meme"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:ef8misu",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "ef8misu",
+      "text_sha256": "dc30e65a5276eedd9c08b805a0b730c5a2ccccbef1eeea0ee76cf576698491b7",
+      "anchor_echo": false,
+      "text": "thats the future right there, robots trying to help but destroying your whole home in the process. "
+    },
+    {
+      "sample_id": "residual-test:disgust:test:edmzko2",
+      "split": "test",
+      "source_split": "test",
+      "label": "disgust",
+      "source_id": "edmzko2",
+      "text_sha256": "e157d92a12fdbf6d2f024304ab6e07b723c653a48cc528dd826869f715efa820",
+      "anchor_echo": false,
+      "text": "My poor space bar takes an awful bashing with all the pausing in a Squidge vid"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:edlpmui",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "edlpmui",
+      "text_sha256": "2f1aee36989c90aec1fcddf76735848fce63e54d83c57d654453ea44af735657",
+      "anchor_echo": false,
+      "text": "That was the worst power play I’ve ever seen"
+    },
+    {
+      "sample_id": "residual-test:disgust:train:eec1lu7",
+      "split": "test",
+      "source_split": "train",
+      "label": "disgust",
+      "source_id": "eec1lu7",
+      "text_sha256": "778cea7a2c2ea40398bcae3cfd9f0d4e193853b583b89facfb46d57bd4a16eb9",
+      "anchor_echo": false,
+      "text": "I watched a video about fake makeup having rat piss in it. No thank you"
+    },
+    {
+      "sample_id": "residual-test:fear:train:eepx06h",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eepx06h",
+      "text_sha256": "5434a67ab887c8c57634b16aab4134843a160d07875724bb18950f040df68de2",
+      "anchor_echo": false,
+      "text": "Those things still haunt my dreams to this day."
+    },
+    {
+      "sample_id": "residual-test:fear:train:eelo4e4",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eelo4e4",
+      "text_sha256": "d0f8d838aaf07dc3fce9503f0d775a03f41ecb096fae7db37fcd6776f591f4ab",
+      "anchor_echo": false,
+      "text": "The fact that this being brought up makes it a real scary feeling."
+    },
+    {
+      "sample_id": "residual-test:fear:train:eecno7w",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eecno7w",
+      "text_sha256": "1b9ce384a68cba49cd2d778b71ec61f618b4a8c1747079c31a753b8b851b9c0b",
+      "anchor_echo": false,
+      "text": "You seem horrible"
+    },
+    {
+      "sample_id": "residual-test:fear:train:ed22gpz",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "ed22gpz",
+      "text_sha256": "361d33d49e285e52b7c008c0e65f46e2e1c526a580cf9ca219b05a086a514ac5",
+      "anchor_echo": false,
+      "text": "Wait for real? That's how they met? lol that's both terrifying and completely fitting considering how nuts they both are"
+    },
+    {
+      "sample_id": "residual-test:fear:train:eem6qlk",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eem6qlk",
+      "text_sha256": "8f5b33b7b0a0e60cdc38ea7f70301511f1d64446a46512dd152d0555378cf49d",
+      "anchor_echo": false,
+      "text": "Then he stabbed like five cops and hid in a haystack"
+    },
+    {
+      "sample_id": "residual-test:fear:train:edtokt7",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "edtokt7",
+      "text_sha256": "fc764221281e94ede12cf541f1ba63364e5f7db0d355efbe9a5e20bc1cb909d8",
+      "anchor_echo": false,
+      "text": "Oh, those dreadful things. I gave those away."
+    },
+    {
+      "sample_id": "residual-test:fear:train:edzbvwx",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "edzbvwx",
+      "text_sha256": "b521a465e6d5e9c30c6e7a3654f096b2555af6856cf2e6e732dcff23b2e1c992",
+      "anchor_echo": false,
+      "text": "that was a horrible fix"
+    },
+    {
+      "sample_id": "residual-test:fear:train:edbjbw0",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "edbjbw0",
+      "text_sha256": "686a23cc0c3bc1ddf3cd068ab86d99a95a218a0824a8ccfc0ab7c8f1db753520",
+      "anchor_echo": false,
+      "text": "I might be in trouble in this case. I have 7 years going on 8 :("
+    },
+    {
+      "sample_id": "residual-test:fear:train:eel223n",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eel223n",
+      "text_sha256": "79d6a6424515c608aec76233b08c51b867eadadf3e70706f7653ee1803bf86f7",
+      "anchor_echo": false,
+      "text": "Yikes. That sounds terrible 😢"
+    },
+    {
+      "sample_id": "residual-test:fear:train:ef1zbz2",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "ef1zbz2",
+      "text_sha256": "4c624744d889db237741f76097cc5d587075b8819da321ec660a36bdfa816072",
+      "anchor_echo": false,
+      "text": "That does suck. I’m sorry. Having recently been ghosted by someone who I thought was a very close friend, it’s a terrible feeling"
+    },
+    {
+      "sample_id": "residual-test:fear:test:ee5s4hc",
+      "split": "test",
+      "source_split": "test",
+      "label": "fear",
+      "source_id": "ee5s4hc",
+      "text_sha256": "1da13029120c54f179aa805c42fa589e65ed8bdb5805ee1031dfc80326adad24",
+      "anchor_echo": false,
+      "text": "Help, help, I'm being repressed!"
+    },
+    {
+      "sample_id": "residual-test:fear:train:ed61c03",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "ed61c03",
+      "text_sha256": "a3b5e2d0e66cf4b029aafd359c5de606a983f87b1bf22319c922c176d4e2c3c1",
+      "anchor_echo": false,
+      "text": "I took a picture of a farmer treating his crops with roundup yesterday.. it was horrifying"
+    },
+    {
+      "sample_id": "residual-test:fear:test:efb7e1k",
+      "split": "test",
+      "source_split": "test",
+      "label": "fear",
+      "source_id": "efb7e1k",
+      "text_sha256": "74575e69e4eb092dd6153d3d5eb752aa43575e174dfd1b64bfc147788495f0fb",
+      "anchor_echo": false,
+      "text": "I was in awe the whole hour I spent in there."
+    },
+    {
+      "sample_id": "residual-test:fear:train:edl2c3q",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "edl2c3q",
+      "text_sha256": "403c51ebf44aac0c7fb45ca08626c484daaf2012a59a06b17027cab1658ea7ef",
+      "anchor_echo": false,
+      "text": "nearly choked on my chicken breast"
+    },
+    {
+      "sample_id": "residual-test:fear:train:ee6ubza",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "ee6ubza",
+      "text_sha256": "6de882db77d8664dbe19f6cd6f106fe50ed01a69defb9a29aa8feff220c03b5b",
+      "anchor_echo": false,
+      "text": "It’s the comment about smelling her that makes it pure cringe."
+    },
+    {
+      "sample_id": "residual-test:fear:test:ed2e00i",
+      "split": "test",
+      "source_split": "test",
+      "label": "fear",
+      "source_id": "ed2e00i",
+      "text_sha256": "b5bd6042d8db8ab0ba17e184319fc3f53b42a326956d4b29ac1164b39e9ed1ee",
+      "anchor_echo": false,
+      "text": "The thought of shooting anything at asylum seekers is appalling."
+    },
+    {
+      "sample_id": "residual-test:fear:train:ef7r8is",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "ef7r8is",
+      "text_sha256": "f62b22ff7db13721cb227a0601a62a0ed50d9d9b3624e59b6fbc3860f257f851",
+      "anchor_echo": false,
+      "text": "terrifying every time."
+    },
+    {
+      "sample_id": "residual-test:fear:train:eegysam",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eegysam",
+      "text_sha256": "0eda8b0daad324c80f889da1cb9d326dede5cf9c2f6d0e2c50ffd649bb35c4e0",
+      "anchor_echo": false,
+      "text": "[NAME] looks too creepy,but it's a very nice drawing."
+    },
+    {
+      "sample_id": "residual-test:fear:train:eeddi3d",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "eeddi3d",
+      "text_sha256": "6e137e78137e6173bcf52b3b2e303a2b6c0f2da7be067d3c95b9ab5af282c938",
+      "anchor_echo": false,
+      "text": "Yo this [NAME] was literally pulling moves out of the Hitman games jumping over to your balcony. Thats terrifying."
+    },
+    {
+      "sample_id": "residual-test:fear:train:edumqtx",
+      "split": "test",
+      "source_split": "train",
+      "label": "fear",
+      "source_id": "edumqtx",
+      "text_sha256": "6aaa2be70c2671e5a09f89e27583fb12b08c51c6df221e04a32c0e4c7a86f670",
+      "anchor_echo": false,
+      "text": "You're a horrible person."
+    },
+    {
+      "sample_id": "residual-test:anger:train:efd4p86",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "efd4p86",
+      "text_sha256": "cd8c33daacc9b7d3f728210176509314b13065dcfe55a5c335202108e79cfb85",
+      "anchor_echo": false,
+      "text": "We needed some way to torture a guy so a religion can be created."
+    },
+    {
+      "sample_id": "residual-test:anger:train:ef6aads",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ef6aads",
+      "text_sha256": "5a5f420c1f854cfbcaa81a44a52fb27c04aea7c69445057b2232d7c931978f7f",
+      "anchor_echo": false,
+      "text": "never, because I actually married someone I wanted to be with l, and didn’t fucking betray their trust, unlike you arseholes "
+    },
+    {
+      "sample_id": "residual-test:anger:train:ef1xszg",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ef1xszg",
+      "text_sha256": "5c4dce44c5237d452a2a548963b9992daa3257b9dbd7bc93f902dd6aa481ba16",
+      "anchor_echo": false,
+      "text": "I do. Am chemist. Stop serving me things that remind me of work, goddamit."
+    },
+    {
+      "sample_id": "residual-test:anger:train:eev1ygb",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "eev1ygb",
+      "text_sha256": "c56ace57366a4fd2924cc47d58d09f8a6e8a7a6bb9d5595fc946537a76a9e8ac",
+      "anchor_echo": false,
+      "text": "\"Each Dark Souls game has been voted \"\"Most Likely to Result in Controller Damage\"\".\""
+    },
+    {
+      "sample_id": "residual-test:anger:train:ed9hd7k",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ed9hd7k",
+      "text_sha256": "8d472d55189c2f6fc0188049dfbc8424dd9cbdc45cfaef6e231e6f1e6dfbd992",
+      "anchor_echo": false,
+      "text": "Unfriend this kid in all ways possible. Sucks for both of you, but this could be much worse. "
+    },
+    {
+      "sample_id": "residual-test:anger:test:eduylqg",
+      "split": "test",
+      "source_split": "test",
+      "label": "anger",
+      "source_id": "eduylqg",
+      "text_sha256": "c037106e2a931bf2f823da5626f980ddf3cddc0641cb4f4307037c092218843d",
+      "anchor_echo": false,
+      "text": "This just reminded me to continue designing that bloody website."
+    },
+    {
+      "sample_id": "residual-test:anger:train:ed35f81",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ed35f81",
+      "text_sha256": "def336619b537ee443860bf0becf9549eb71d66a3c8e24a97a2e089627a09d1b",
+      "anchor_echo": false,
+      "text": "A sharp stick? I think you need a rifle to kill that bastard"
+    },
+    {
+      "sample_id": "residual-test:anger:train:ed80tsq",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ed80tsq",
+      "text_sha256": "38dfc18c701dcaa1b4d531e76ea316f928d9f551793b8b2b096b2b383c0dc25c",
+      "anchor_echo": false,
+      "text": "Because you didn't realize MEPS was an acronym? Yeah, definitely taking anything you say to heart. Piss off depper. "
+    },
+    {
+      "sample_id": "residual-test:anger:train:ee5f93j",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ee5f93j",
+      "text_sha256": "06207e472fd0940beb407b59709be3e9790b59307632a217ba4a2756c8454ceb",
+      "anchor_echo": false,
+      "text": "They didn't actually run any tests to confirm it was even bone, let alone human."
+    },
+    {
+      "sample_id": "residual-test:anger:test:edjw23t",
+      "split": "test",
+      "source_split": "test",
+      "label": "anger",
+      "source_id": "edjw23t",
+      "text_sha256": "cd40c1c46f698c03ef2b233ab6e136817969d5a88aff00db8049e1e6ddb48f0d",
+      "anchor_echo": false,
+      "text": "Just like that fucking idiot that was just trying to kidnap that woman, and chased her into a Karate studio... turned out just about the same."
+    },
+    {
+      "sample_id": "residual-test:anger:train:eeelsm7",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "eeelsm7",
+      "text_sha256": "085911fb82d81eee72567ae696199f11ac63c0001b5a80f04876c95c0f183e32",
+      "anchor_echo": false,
+      "text": "[NAME] freaking [NAME] all the people down range just staring. -_- GO INSIDE DUMBASSES."
+    },
+    {
+      "sample_id": "residual-test:anger:train:edlupqy",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "edlupqy",
+      "text_sha256": "3442154cb7ac1a11de4eb5fabb084a8d9002d6832faa74f68f2b513a570708ae",
+      "anchor_echo": false,
+      "text": "Just like you can't underestimate the capacity for evil, you can't underestimate the capacity for stupidity "
+    },
+    {
+      "sample_id": "residual-test:anger:train:ef2rut6",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ef2rut6",
+      "text_sha256": "8896b248929772a7fcb1dd072a66e9a11132dce079448932133047a4d6f6b39d",
+      "anchor_echo": false,
+      "text": "Don't be an asshole"
+    },
+    {
+      "sample_id": "residual-test:anger:train:ef55f3t",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ef55f3t",
+      "text_sha256": "5e5d9d31c6aa9152093c0a9210b7fa4bbd613ab513c312b9e58104cdddcccc46",
+      "anchor_echo": false,
+      "text": "Fuck. That."
+    },
+    {
+      "sample_id": "residual-test:anger:train:efh7whe",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "efh7whe",
+      "text_sha256": "f8bb1d39b103ba83bbe9c13883623e7e73278af2cbcfc0bf4d36454d8a01cdec",
+      "anchor_echo": false,
+      "text": "No, stop! He'll stop cranking the job machine if you insult him again!"
+    },
+    {
+      "sample_id": "residual-test:anger:train:edgz19f",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "edgz19f",
+      "text_sha256": "1701fcc094b3bfbd0967443f17b99638df8b845c27fb40ffaee89b5900f0299e",
+      "anchor_echo": false,
+      "text": "r/vaxxhappened. Fuck you Jan."
+    },
+    {
+      "sample_id": "residual-test:anger:train:ed85a4w",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ed85a4w",
+      "text_sha256": "2ad6d4b792259bdf4a568217763f082fe241428073ad89a9ef2a42fb50dea0a0",
+      "anchor_echo": false,
+      "text": "What The actual fuck"
+    },
+    {
+      "sample_id": "residual-test:anger:train:edbcvkl",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "edbcvkl",
+      "text_sha256": "159d371d397a6efbaaf689f44c32932aed0f82ddd1c3797f81de34b3d148ec49",
+      "anchor_echo": false,
+      "text": "You have devoted yourself to this guy and he thinks you would be a bad mom. Fuuuuuuuck this guy. You deserve better."
+    },
+    {
+      "sample_id": "residual-test:anger:train:edlwo74",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "edlwo74",
+      "text_sha256": "4d395ac3812a71246ca4a15d9bb3782cc7cde14b64cb37718556d2ecb065bcc5",
+      "anchor_echo": false,
+      "text": "It's rape after they've both consented? You're what's wrong with society today, try to be less of a dipshit going forward."
+    },
+    {
+      "sample_id": "residual-test:anger:train:ef8clq2",
+      "split": "test",
+      "source_split": "train",
+      "label": "anger",
+      "source_id": "ef8clq2",
+      "text_sha256": "d9dae769204c57426ea4c7ee750abe4aa45295371ce7b285abdb32b3c88780db",
+      "anchor_echo": false,
+      "text": "yeah violence shouldn't be your goto first option, but the people who pretend words are meaningless sounds are stupid idiots"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:ee2wd74",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "ee2wd74",
+      "text_sha256": "abafceb4555a75bbd0f45a754072eefb434859a481beff968024a39d65d4c942",
+      "anchor_echo": false,
+      "text": "Are you here to solve my catsup problem?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:calibration:eepjx2q",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "curiosity",
+      "source_id": "eepjx2q",
+      "text_sha256": "d76832caf042ded0b601e028f802e4dbb741b02ef9580bf5a5ec15b0718722af",
+      "anchor_echo": false,
+      "text": "Wait, this is an actual music video you're describing, and not like... a Family Guy bit?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:edo5n5f",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "edo5n5f",
+      "text_sha256": "e9019c1aa9a03e9dcaeb81ad9bc602d176965b15d625c5a1e14dfa9580893a76",
+      "anchor_echo": false,
+      "text": "What? The claim is 2018 best shooters. Not overall best shooters"
+    },
+    {
+      "sample_id": "residual-test:curiosity:test:edlvms5",
+      "split": "test",
+      "source_split": "test",
+      "label": "curiosity",
+      "source_id": "edlvms5",
+      "text_sha256": "1563c5d2313c6ceec7b8e73bf2a5e0e32f8dcb621971bab1b5aa9a8070f0b5e5",
+      "anchor_echo": false,
+      "text": "I'M MR. [NAME]! HOW DID WE GET ROPED INTO THIS?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:ee3hvbc",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "ee3hvbc",
+      "text_sha256": "2fb1bb523ff626bdd400372134f902f467b86a4f7552dd4bf2a682655b295b8c",
+      "anchor_echo": false,
+      "text": "You were disappointed in 2014?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:ef5hxwo",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "ef5hxwo",
+      "text_sha256": "f0181076a194def085aad33737dc9cd67eb2956ae2cd67a3a4cfcf0c3af7e50a",
+      "anchor_echo": false,
+      "text": "So, you literally grew up in a barn?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:efbhatx",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "efbhatx",
+      "text_sha256": "c50e94b96de7ad9a36de302b3526fff47268e666a9ad3fcdfd82236950e2c034",
+      "anchor_echo": false,
+      "text": "So is that like your opinion or a viewpoint you can back up with solid reasoning?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:eejn3ah",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "eejn3ah",
+      "text_sha256": "d4dd57484e7938bfa400bb142f4c794f9388bfb47f58b03e3ee931206f28d9ad",
+      "anchor_echo": false,
+      "text": "So we are a theocracy?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:eeflebd",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "eeflebd",
+      "text_sha256": "bfadad69afc9c62be4e13578595cc04e6fe05d07cfbe591cd5d2ad8f21c3299c",
+      "anchor_echo": false,
+      "text": "Are they sure one didn't kill the other and themselves?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:calibration:eetm06s",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "curiosity",
+      "source_id": "eetm06s",
+      "text_sha256": "3b7994611ab6c5106dfa4ef5347d2073b935995749d1bd016c3a0c0ec0421e3b",
+      "anchor_echo": false,
+      "text": "Don't y'all scream communist at everything and burn Nike stuff for no legitimate reason?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:ee89gdw",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "ee89gdw",
+      "text_sha256": "58851200474f99f9781bbf4f27e22a25eb69fdcc462218e74b52fa2e5435c6b8",
+      "anchor_echo": false,
+      "text": "\"Is there such thing as \"\"only a cat\"\"?\""
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:edk7qw6",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "edk7qw6",
+      "text_sha256": "998e9f88a007e0c4f4e24d4c01a1e536a5fae3c4bc3d8e7adee673df00dbf06c",
+      "anchor_echo": false,
+      "text": "What was the fastest you were ever going over the speed limit when you got it dismissed? I’m most likely going to go with Sullo also"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:edfr3ri",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "edfr3ri",
+      "text_sha256": "bd03504a7d5e88508f7ef6562a462b44f9b9d69a3e9fe69e4ab1a07ee9ccbcbc",
+      "anchor_echo": false,
+      "text": "\"Lol \"\"not sure what I'm going to do.\"\" Maybe stop digging through people's trash and judging it?\""
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:eevz8a0",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "eevz8a0",
+      "text_sha256": "efe2575752bfc85f3fb6e5a7313d20513857efb690d21c43106a8cc6b634f7b3",
+      "anchor_echo": false,
+      "text": "Would the OP care to explain what the thought was behind posting this here? A warning for justification for potential upcoming gun-control responses?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:calibration:edf6deq",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "curiosity",
+      "source_id": "edf6deq",
+      "text_sha256": "c1b78348d258a5a9410cf6bbb1f312b202bfeb70a3bafafc326aac4e108579e0",
+      "anchor_echo": false,
+      "text": "Do you think people are generally logical?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:ede7oud",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "ede7oud",
+      "text_sha256": "26e3754794bb4064f1c37593e082543f14f46eabdeeb13679863cbe5a5e3d777",
+      "anchor_echo": false,
+      "text": "WHAT you guys get this show on Netflix? We certainly do not get it in Canada what is this bullshit"
+    },
+    {
+      "sample_id": "residual-test:curiosity:test:edlpvdq",
+      "split": "test",
+      "source_split": "test",
+      "label": "curiosity",
+      "source_id": "edlpvdq",
+      "text_sha256": "3101759ceec6431c7baff1e1ec56c0bcf8563aab2e5fc7467613b0bdf9b6b8c8",
+      "anchor_echo": false,
+      "text": "Why do you think he's right? What reason would a nonprofit newsroom have for publishing sensationalist headlines?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:ee0z95h",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "ee0z95h",
+      "text_sha256": "6a2f6e79bdb7ebb6496cd9214c0f1e963077f3caa91ed2ed72f0b9600ba61028",
+      "anchor_echo": false,
+      "text": "> and [NAME] mentions that he's cold to the touch. you mean after he almost froze to dealth?"
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:eere5mb",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "eere5mb",
+      "text_sha256": "e4c11d132093c156f28e2afcfd18962eb00e554dd6625de129fead703587c543",
+      "anchor_echo": false,
+      "text": "Oh, I mean I guess he’ll run if he loses. But do you think he will run if he wins? "
+    },
+    {
+      "sample_id": "residual-test:curiosity:train:eecbm35",
+      "split": "test",
+      "source_split": "train",
+      "label": "curiosity",
+      "source_id": "eecbm35",
+      "text_sha256": "2b1a0edca7b13367391070103a4342c24c82f00adca66e2c90d19e1b3929e3bc",
+      "anchor_echo": false,
+      "text": "That depends. Do you have 4 legs?"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:edy3adp",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "edy3adp",
+      "text_sha256": "440055ff5472c9e853f16db0b5f9f73ae52749346748ac38022e0367c62bb3b7",
+      "anchor_echo": false,
+      "text": "As a man with a vasectomy, I want some of that blame. Dang women always keeping the blame to themselves. /s"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ef7dvml",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ef7dvml",
+      "text_sha256": "f3cc09b564bd43436e0b362f720a3b15d2920d4b234432692f15a22a47817160",
+      "anchor_echo": false,
+      "text": "Including the fact that once I pirate something, i usually will purchase it later on either through frustration / poor quality/ actually loving the product / etc"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ee0m05a",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ee0m05a",
+      "text_sha256": "3c47c6e3a194ef35136f7e26e6d7db21c1b72253ea5303170751241fe8add36f",
+      "anchor_echo": false,
+      "text": "Please remove the initials at the subscribers to /r/feet, but I have sand in the hopes that someone called him out."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ed1vu4b",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ed1vu4b",
+      "text_sha256": "3baaa344526aeb2e059af90b6f76404428716241a8190071fd615865900355fc",
+      "anchor_echo": false,
+      "text": "The good news for him, is that he can join one of these many wars."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:efa0wva",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "efa0wva",
+      "text_sha256": "c919dbbb7efc4f9a61fac7990be69eba9d2794857068a8ec95675be7e5f323ec",
+      "anchor_echo": false,
+      "text": "~ [NAME]"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:eczbonk",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "eczbonk",
+      "text_sha256": "9ec425647ba1e228fdff7af328758d5bcbade18c21817c718d108ff514cdcf02",
+      "anchor_echo": false,
+      "text": "If things were not as they are, they would be completely different. SO WHAT?"
+    },
+    {
+      "sample_id": "residual-test:neutral:calibration:edb3a1g",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "neutral",
+      "source_id": "edb3a1g",
+      "text_sha256": "621b4070a5ce4c3520bf6b6e85563e89f80610d05f1a8807ee04b7f4fad39d22",
+      "anchor_echo": false,
+      "text": "This guy probably just started watching football. These younger generations just aren't as educated as they used to be."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:efdto32",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "efdto32",
+      "text_sha256": "4f258030cc84925c7462bd7babb070bed18a43ab152fade13ecd6040f11dc046",
+      "anchor_echo": false,
+      "text": "She's digging herself a nice grave for [NAME] to bury her in."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ednt13b",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ednt13b",
+      "text_sha256": "5ac14a0831897b5cc5871f2c153b36cfead2ea797ded8d72682a061190de7872",
+      "anchor_echo": false,
+      "text": "But muh narrative! Orange man caused this!!!!!"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:efaabyc",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "efaabyc",
+      "text_sha256": "6c50a3ed4077e32f77cf365ecb6890d48783a503ded3567c0a83d7c2b961cb29",
+      "anchor_echo": false,
+      "text": "In combination? Also interaction my Bipolar meds + blood pressure meds almost killed me. I now have very choices in meds."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ecznom8",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ecznom8",
+      "text_sha256": "ead97a23dba304f0bcc2420e79a7b0ae26baeac777b520e48c068b0c66eafcc4",
+      "anchor_echo": false,
+      "text": "Which is why he wasn't the best at colonialism. You can't just murder the people you're supposed to enslave."
+    },
+    {
+      "sample_id": "residual-test:neutral:calibration:ee78es2",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "neutral",
+      "source_id": "ee78es2",
+      "text_sha256": "b5329081494bcebfb697bf08493ed57e13d6f13dd0dbd20927594c33c30f5d6b",
+      "anchor_echo": false,
+      "text": "Certain mental health issues can be smelled on a person; by all accounts, schizophrenia makes a person's sweat smell like goat"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ee8gy3t",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ee8gy3t",
+      "text_sha256": "4fa743de7f5d0c777b6ed2686436374a728683f18dd41995424542a9764604e4",
+      "anchor_echo": false,
+      "text": "That has to be an understatement, I know several myself"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ed5umg9",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ed5umg9",
+      "text_sha256": "658cc458309d54cc417272367db2298d37eded32ee31d6537eafafe709cdcedd",
+      "anchor_echo": false,
+      "text": "I don't have anything of value to add, so here's this"
+    },
+    {
+      "sample_id": "residual-test:neutral:calibration:ee3yvwm",
+      "split": "test",
+      "source_split": "calibration",
+      "label": "neutral",
+      "source_id": "ee3yvwm",
+      "text_sha256": "6363091cdf7587be569a3804a49861f8313424fb65ddb9197b8ef8e977e21d25",
+      "anchor_echo": false,
+      "text": "The UK government's No Deal plan is basically to do exactly what they would do if the withdrawal agreement passes, with some caveats, I believe."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:eduzroe",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "eduzroe",
+      "text_sha256": "b6eea6a81c440bcaafce6d347d04e5414344357b198376558e8ec64a5cf30c55",
+      "anchor_echo": false,
+      "text": "\"He missed my personal favorite of \"\"harridan\"\" though. \""
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ee3bbe3",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ee3bbe3",
+      "text_sha256": "5d31da1b0c9c6ce40b77dc812eb792da164ab79823062a269cb83c7d106a4aa2",
+      "anchor_echo": false,
+      "text": "Clearly you aren’t “too fine for online dating”."
+    },
+    {
+      "sample_id": "residual-test:neutral:train:ee5s00w",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "ee5s00w",
+      "text_sha256": "127188bedc62a2e100f87c301a95bf554ebbf5b384dd2306374722be55da47d6",
+      "anchor_echo": false,
+      "text": "So in other words, he wooooshed"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:edoks4m",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "edoks4m",
+      "text_sha256": "0e3ee424c198cf46d3b11e414cc82599d249e5ea16c5728b09d569f8f2f6ea9f",
+      "anchor_echo": false,
+      "text": "Now this is something else"
+    },
+    {
+      "sample_id": "residual-test:neutral:train:edruqnc",
+      "split": "test",
+      "source_split": "train",
+      "label": "neutral",
+      "source_id": "edruqnc",
+      "text_sha256": "11eb1e943d56946c852e58842596d5bf8b5791685458582e8f03ece2f439d12e",
+      "anchor_echo": false,
+      "text": "You can be so much more specific when hitchhiking."
+    }
+  ]
+}

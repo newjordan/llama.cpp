@@ -156,8 +156,12 @@ Run the model-independent deterministic smoke test with:
 
 ## G1 semantic-sensor extraction
 
-`llama-jspace-sensor-extract` captures exact-runtime, last-token post-block
-residuals from a frozen `treebeard.jspace.g1.dataset.v1` manifest. It is a
+`llama-jspace-sensor-extract` captures exact-runtime post-block residuals from
+a frozen G1 dataset or control manifest. The default `--pooling last` retains
+the last prompt-token column. The opt-in `--pooling last-mean` writes that
+column followed by the exact arithmetic mean of every prompt-token column,
+with raw shape `[sample, layer, 2, embedding]` and pooling order `last,mean`.
+It is a
 separate path from the anchor-logit probe: control vectors, embedding mode,
 chat templates, and special-token parsing are forbidden. Every sample starts
 after `llama_memory_clear(data=true)` and must fit in one microbatch, so a layer
@@ -177,6 +181,7 @@ after completion.
   --verified-model-sha256 25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506 \
   --verified-manifest-sha256 eee5eac3e2b0d9cd440a890af5504c5403ac52570c2db63e3bc19912c7e2e718 \
   --layers 2,3,10,11,18,19,26,27,34,35,38,39 \
+  --pooling last-mean \
   --out-prefix /path/to/qwen36-g1-12layer
 ```
 

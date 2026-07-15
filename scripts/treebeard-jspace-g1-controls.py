@@ -43,6 +43,48 @@ BALANCED_COUNTS = {
     "quotation": 2,
     "third_person": 15,
 }
+SYNTHETIC_STATES = {
+    "sadness": "sad",
+    "surprise": "surprised",
+    "joy": "happy",
+    "disgust": "disgusted",
+    "fear": "afraid",
+    "anger": "angry",
+    "curiosity": "curious",
+}
+SYNTHETIC_TEMPLATES = {
+    "direct": (
+        "I feel {state} about the outcome.",
+        "This situation leaves me {state}.",
+        "After hearing the news, I am {state}.",
+        "My reaction is unmistakably {state}.",
+    ),
+    "negation": (
+        "I do not feel {state} about the outcome.",
+        "This situation does not leave me {state}.",
+        "After hearing the news, I am not {state}.",
+        "My reaction is not {state} in any way.",
+    ),
+    "quotation": (
+        "I wrote, \"I feel {state} about the outcome.\"",
+        "I said, \"This situation leaves me {state}.\"",
+        "My message read, \"After hearing the news, I am {state}.\"",
+        "I told them, \"My reaction is unmistakably {state}.\"",
+    ),
+    "third_person": (
+        "They feel {state} about the outcome.",
+        "This situation leaves them {state}.",
+        "After hearing the news, they are {state}.",
+        "Their reaction is unmistakably {state}.",
+    ),
+}
+NEUTRAL_SUBJECTS = ("ledger", "index", "packet", "schedule")
+NEUTRAL_TEMPLATES = (
+    "The {subject} contains four numbered entries.",
+    "A copy of the {subject} remains in the folder.",
+    "The {subject} was updated after the routine check.",
+    "Two references point to the same {subject}.",
+)
 
 
 def sha256_file(path: Path):
@@ -203,6 +245,70 @@ def freeze_controls(data_dir: Path, anchors_path: Path, primary_manifest_path: P
     }
 
 
+def freeze_synthetic_v2_controls():
+    rows = []
+    for axis, state in SYNTHETIC_STATES.items():
+        for control, templates in SYNTHETIC_TEMPLATES.items():
+            for index, template in enumerate(templates):
+                text = template.format(state=state)
+                expected = "neutral" if control == "negation" else axis
+                rows.append({
+                    "sample_id": f"synthetic:{control}:{axis}:{index}",
+                    "split": "control",
+                    "label": expected,
+                    "target_axis": axis,
+                    "control_types": [control],
+                    "pair_id": f"{axis}:{index}",
+                    "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "text": text,
+                })
+    for subject in NEUTRAL_SUBJECTS:
+        for index, template in enumerate(NEUTRAL_TEMPLATES):
+            text = template.format(subject=subject)
+            rows.append({
+                "sample_id": f"synthetic:neutral:{subject}:{index}",
+                "split": "control",
+                "label": "neutral",
+                "target_axis": "neutral",
+                "control_types": ["neutral_flat"],
+                "pair_id": f"neutral:{subject}:{index}",
+                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "text": text,
+            })
+
+    if len(rows) != 128 or len({row["text"] for row in rows}) != len(rows):
+        raise AssertionError("unexpected synthetic v2 control corpus shape")
+    memberships = Counter(row["control_types"][0] for row in rows)
+    return {
+        "schema": "treebeard.jspace.g1.controls.v2",
+        "source": {
+            "name": "Treebeard authored compositional minimal-pair controls",
+            "license": "repository source license",
+        },
+        "policy": {
+            "version": "treebeard.jspace.g1.synthetic-controls.v2",
+            "axes": list(AXES),
+            "affect_states": SYNTHETIC_STATES,
+            "templates": SYNTHETIC_TEMPLATES,
+            "neutral_subjects": NEUTRAL_SUBJECTS,
+            "neutral_templates": NEUTRAL_TEMPLATES,
+            "semantics": {
+                "direct": "classify the explicitly stated first-person affect",
+                "negation": "suppress the paired target-axis score and classify as neutral",
+                "quotation": "retain first-person affect through a quotation wrapper",
+                "third_person": "retain stated affect under a third-person subject",
+                "neutral_flat": "remain below the calibrated affect deadband",
+            },
+            "test_use": "untouched until the v2 representation, model, calibration, and gates are frozen",
+        },
+        "audit": {
+            "rows": len(rows),
+            "memberships": dict(sorted(memberships.items())),
+        },
+        "rows": rows,
+    }
+
+
 def self_test():
     assert PATTERNS["negation"].search("This is not correct.")
     assert PATTERNS["third_person"].search("They entered quietly.")
@@ -216,15 +322,21 @@ def main():
     parser.add_argument("--anchors", type=Path)
     parser.add_argument("--primary-manifest", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--synthetic-v2", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return 0
-    if any(value is None for value in (
-            args.data_dir, args.anchors, args.primary_manifest, args.out)):
-        parser.error("data, anchors, primary manifest, and output are required")
-    document = freeze_controls(args.data_dir, args.anchors, args.primary_manifest)
+    if args.out is None:
+        parser.error("--out is required")
+    if args.synthetic_v2:
+        document = freeze_synthetic_v2_controls()
+    else:
+        if any(value is None for value in (
+                args.data_dir, args.anchors, args.primary_manifest)):
+            parser.error("data, anchors, and primary manifest are required")
+        document = freeze_controls(args.data_dir, args.anchors, args.primary_manifest)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
     args.out.write_text(encoded, encoding="utf-8")
@@ -232,7 +344,7 @@ def main():
         "status": "pass",
         "out": str(args.out),
         "sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-        "unique_rows": document["audit"]["unique_rows"],
+        "unique_rows": document["audit"].get("unique_rows", document["audit"].get("rows")),
         "memberships": document["audit"]["memberships"],
     }, separators=(",", ":")))
     return 0
