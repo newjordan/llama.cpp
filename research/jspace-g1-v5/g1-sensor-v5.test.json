@@ -1,0 +1,182 @@
+{
+  "schema": "treebeard.jspace.g1.test.v5",
+  "status": "pass",
+  "inputs": {
+    "manifest_sha256": "9c94e76883359a7aa685185148ae17ee49f918b029ca41a0daec84fce73822c7",
+    "metadata_sha256": "949f85562a6997c0bedea19fc2251f429c980abeecbd2bd6ef4e690a0cb4c205",
+    "raw_sha256": "d0297892c5af45a795d6b78d4110e23d0258c706f6c550dea48fb4c1696a95ec",
+    "artifact_sha256": "6f50e2ea6c7cca8c6ee361d6611f0e764c1539a8a05d59f0c50f553fe0ace7d4"
+  },
+  "overall": {
+    "rows": 649,
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "disgust",
+      "fear",
+      "anger",
+      "neutral"
+    ],
+    "macro_auroc": 0.9155390320629212,
+    "axis_auroc": {
+      "sadness": 0.9172317661241712,
+      "surprise": 0.8541855033152501,
+      "joy": 0.9248417721518988,
+      "disgust": 0.9571917808219178,
+      "fear": 0.9032351242056614,
+      "anger": 0.9252938517179023,
+      "neutral": 0.9267934261036468
+    },
+    "macro_ece": 0.04293094498732502,
+    "top1_accuracy": 0.6610169491525424,
+    "neutral_fpr": 0.046875,
+    "affect_recall": 0.727447216890595,
+    "routed_accuracy": 0.6425269645608629,
+    "abstention_coverage": 0.539291217257319,
+    "abstention_precision": 0.8257142857142857
+  },
+  "sources": {
+    "empatheticdialogues": {
+      "rows": 384,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.9334147135416667,
+      "axis_auroc": {
+        "sadness": 0.94208984375,
+        "surprise": 0.86689453125,
+        "joy": 0.931396484375,
+        "disgust": 0.9615234375,
+        "fear": 0.9451171875,
+        "anger": 0.953466796875
+      },
+      "macro_ece": 0.046995273124451266,
+      "top1_accuracy": 0.6666666666666666,
+      "neutral_fpr": null,
+      "affect_recall": 0.7786458333333334,
+      "routed_accuracy": 0.6380208333333334,
+      "abstention_coverage": 0.5494791666666666,
+      "abstention_precision": 0.8530805687203792
+    },
+    "dailydialog": {
+      "rows": 265,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger",
+        "neutral"
+      ],
+      "macro_auroc": 0.8506875547097864,
+      "axis_auroc": {
+        "sadness": 0.8996781115879828,
+        "surprise": 0.8417381974248928,
+        "joy": 0.9067864806866953,
+        "disgust": 0.8560606060606061,
+        "fear": 0.6960116731517509,
+        "anger": 0.8767435622317596,
+        "neutral": 0.8777942518248175
+      },
+      "macro_ece": 0.04730663016574599,
+      "top1_accuracy": 0.6528301886792452,
+      "neutral_fpr": 0.046875,
+      "affect_recall": 0.583941605839416,
+      "routed_accuracy": 0.6490566037735849,
+      "abstention_coverage": 0.5245283018867924,
+      "abstention_precision": 0.7841726618705036
+    }
+  },
+  "dailydialog_gated_axes_excluding_single_disgust": {
+    "rows": 265,
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "fear",
+      "anger",
+      "neutral"
+    ],
+    "macro_auroc": 0.8497920461513165,
+    "axis_auroc": {
+      "sadness": 0.8996781115879828,
+      "surprise": 0.8417381974248928,
+      "joy": 0.9067864806866953,
+      "fear": 0.6960116731517509,
+      "anger": 0.8767435622317596,
+      "neutral": 0.8777942518248175
+    },
+    "macro_ece": 0.04876814060226178,
+    "top1_accuracy": 0.6528301886792452,
+    "neutral_fpr": 0.046875,
+    "affect_recall": 0.583941605839416,
+    "routed_accuracy": 0.6490566037735849,
+    "abstention_coverage": 0.5245283018867924,
+    "abstention_precision": 0.7841726618705036
+  },
+  "empatheticdialogues_anchor_strata": {
+    "non_echo": {
+      "rows": 274,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.9063597176902422,
+      "axis_auroc": {
+        "sadness": 0.9491470612013906,
+        "surprise": 0.7533006412674462,
+        "joy": 0.9203049203049203,
+        "disgust": 0.9513241913535015,
+        "fear": 0.9175475687103594,
+        "anger": 0.9465339233038348
+      },
+      "macro_ece": 0.05286199625202798,
+      "top1_accuracy": 0.6131386861313869,
+      "neutral_fpr": null,
+      "affect_recall": 0.7116788321167883,
+      "routed_accuracy": 0.572992700729927,
+      "abstention_coverage": 0.5109489051094891,
+      "abstention_precision": 0.8071428571428572
+    },
+    "echo": {
+      "rows": 110,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.9611835440135422,
+      "axis_auroc": {
+        "sadness": 0.871012482662968,
+        "surprise": 0.9718252347897101,
+        "joy": 0.9846938775510204,
+        "disgust": 0.9795102448775612,
+        "fear": 0.9919743178170144,
+        "anger": 0.9680851063829787
+      },
+      "macro_ece": 0.05847684545396994,
+      "top1_accuracy": 0.8,
+      "neutral_fpr": null,
+      "affect_recall": 0.9454545454545454,
+      "routed_accuracy": 0.8,
+      "abstention_coverage": 0.6454545454545455,
+      "abstention_precision": 0.9436619718309859
+    }
+  },
+  "label_shuffle_mean_macro_auroc": 0.5008848996962973,
+  "test_gate_pass": true
+}
