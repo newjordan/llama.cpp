@@ -6376,12 +6376,31 @@ static int ggml_sycl_try_fuse_moe_down_reduce(
     return count - 1;
 }
 
-static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+enum ggml_sycl_fusion_profile_kind {
+    GGML_SYCL_FUSION_PROFILE_NONE,
+    GGML_SYCL_FUSION_PROFILE_MOE_PIPELINE,
+    GGML_SYCL_FUSION_PROFILE_MOE_DUAL_SWIGLU,
+    GGML_SYCL_FUSION_PROFILE_MOE_DOWN_REDUCE,
+    GGML_SYCL_FUSION_PROFILE_TOPK_MOE,
+    GGML_SYCL_FUSION_PROFILE_DELTANET_GLUE,
+    GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD,
+    GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL,
+    GGML_SYCL_FUSION_PROFILE_COUNT,
+};
+
+static int ggml_sycl_try_fuse(
+        ggml_backend_sycl_context & ctx,
+        ggml_cgraph * cgraph,
+        int i,
+        ggml_sycl_fusion_profile_kind * profile_kind) {
+    GGML_ASSERT(profile_kind != nullptr);
+    *profile_kind = GGML_SYCL_FUSION_PROFILE_NONE;
     ggml_tensor * node = cgraph->nodes[i];
 
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int skip = ggml_sycl_try_fuse_moe_pipeline(ctx, cgraph, i);
         if (skip != 0) {
+            *profile_kind = GGML_SYCL_FUSION_PROFILE_MOE_PIPELINE;
             return skip;
         }
     }
@@ -6425,6 +6444,7 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
                            ctx, gate, up, glu)) {
                 ggml_sycl_trace_moe_dual_swiglu(
                     "dual-integrated-hit", gate, glu);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_MOE_DUAL_SWIGLU;
                 return 2;
             } else {
                 ggml_sycl_trace_moe_dual_swiglu(
@@ -6436,6 +6456,7 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
     if (node->op == GGML_OP_MUL_MAT_ID) {
         const int skip = ggml_sycl_try_fuse_moe_down_reduce(ctx, cgraph, i);
         if (skip != 0) {
+            *profile_kind = GGML_SYCL_FUSION_PROFILE_MOE_DOWN_REDUCE;
             return skip;
         }
     }
@@ -6450,6 +6471,7 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
     if (!disable_topk_moe) {
         const int skip = ggml_sycl_try_fuse_topk_moe(ctx, cgraph, i);
         if (skip != 0) {
+            *profile_kind = GGML_SYCL_FUSION_PROFILE_TOPK_MOE;
             return skip;
         }
     }
@@ -6479,6 +6501,7 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
                 ggml_is_contiguous(c) && ggml_nelements(c) == a->ne[0];
             if (ok) {
                 ggml_sycl_op_fused_add_softplus_mul(ctx, a, b, c, mul);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DELTANET_GLUE;
                 return 2;
             }
         }
@@ -6510,6 +6533,7 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
                 ggml_is_contiguous_rows(mul->src[0]) && ggml_is_contiguous_rows(mul->src[1]) &&
                 ggml_is_contiguous(add->src[0]) && ggml_is_contiguous_rows(add->src[1])) {
                 ggml_sycl_op_rms_norm_fused_add(ctx, node, mul, add);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD;
                 return 2;
             }
         }
@@ -6521,6 +6545,7 @@ static int ggml_sycl_try_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgr
                 types_ok(mul) && bcast_ok &&
                 ggml_is_contiguous_rows(mul->src[0]) && ggml_is_contiguous_rows(mul->src[1])) {
                 ggml_sycl_op_rms_norm_fused(ctx, node, mul);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL;
                 return 1;
             }
         }
@@ -6538,7 +6563,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     static const bool prof = getenv("SIQ_PROF") != nullptr;
     static double op_us[GGML_OP_COUNT] = { 0 };
     static long   op_n [GGML_OP_COUNT] = { 0 };
-    static double unary_us = 0, fused_us = 0; static long unary_n = 0, fused_n = 0;
+    static double unary_us = 0;
+    static long unary_n = 0;
+    static double fusion_us[GGML_SYCL_FUSION_PROFILE_COUNT] = { 0 };
+    static long fusion_n[GGML_SYCL_FUSION_PROFILE_COUNT] = { 0 };
     static int    geval = 0;
     auto now_us = []() {
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -6555,9 +6583,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         {
             const double tf0 = prof ? now_us() : 0.0;
-            const int nodes_to_skip = ggml_sycl_try_fuse(*sycl_ctx, cgraph, i);
+            ggml_sycl_fusion_profile_kind fusion_kind = GGML_SYCL_FUSION_PROFILE_NONE;
+            const int nodes_to_skip = ggml_sycl_try_fuse(
+                *sycl_ctx, cgraph, i, &fusion_kind);
             if (nodes_to_skip != 0) {
-                if (prof) { sycl_ctx->stream()->wait(); fused_us += now_us() - tf0; fused_n++; }
+                GGML_ASSERT(fusion_kind > GGML_SYCL_FUSION_PROFILE_NONE &&
+                            fusion_kind < GGML_SYCL_FUSION_PROFILE_COUNT);
+                if (prof) {
+                    sycl_ctx->stream()->wait();
+                    fusion_us[fusion_kind] += now_us() - tf0;
+                    fusion_n[fusion_kind]++;
+                }
                 i += nodes_to_skip;
                 continue;
             }
@@ -6591,7 +6627,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (op_n[op] > 0) rows.push_back({ ggml_op_name((ggml_op) op), op_us[op], op_n[op] });
         }
         if (unary_n > 0) rows.push_back({ "UNARY", unary_us, unary_n });
-        if (fused_n > 0) rows.push_back({ "FUSED", fused_us, fused_n });
+        static constexpr const char * fusion_names[GGML_SYCL_FUSION_PROFILE_COUNT] = {
+            "FUSED_NONE",
+            "FUSED_MOE_PIPE",
+            "FUSED_MOE_DUAL",
+            "FUSED_MOE_DOWN",
+            "FUSED_TOPK_MOE",
+            "FUSED_DN_GLUE",
+            "FUSED_RMS_ADD",
+            "FUSED_RMS",
+        };
+        for (int kind = GGML_SYCL_FUSION_PROFILE_NONE + 1;
+             kind < GGML_SYCL_FUSION_PROFILE_COUNT; ++kind) {
+            if (fusion_n[kind] > 0) {
+                rows.push_back({ fusion_names[kind], fusion_us[kind], fusion_n[kind] });
+            }
+        }
         std::sort(rows.begin(), rows.end(), [](const row & a, const row & b){ return a.us > b.us; });
         double tot = 0; for (auto & r : rows) tot += r.us;
         fprintf(stderr, "[siq-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",

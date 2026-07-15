@@ -10,7 +10,7 @@ same-binary performance gates.
 - Model: Qwen3.6-35B-A3B Q5_K_XL, top-8 MoE.
 - Device/runtime: Intel Arc Pro B70, SYCL.
 - Serving shape: 12 slots, unified KV, 262144-token trained context.
-- Current production service: `turbo-statetree-rc2.service` on port 8093.
+- Current production service: `turbo-statetree-rc4.service` on port 8093.
 - Observed generated throughput: about 79 tok/s at one active slot and about
   194 aggregate tok/s at 12 active slots.
 - The naive 12x single-slot ceiling is not a performance claim. It only makes
@@ -223,6 +223,28 @@ State: queued after the composite MoE pipeline.
 
 Perf gate: improve workload-level completed tokens per second without worsening
 p95 time-to-first-token or inter-token latency beyond the declared budget.
+
+### T8 - Single-token ordered expert-down epilogue
+
+State: production-activated and parked at the major-play entry gate.
+
+- [x] Split opaque fused profile time into named fusion buckets.
+- [x] Attribute the steady one-token graph and identify residual expert-down
+  MMID as 16.9% of serialized time.
+- [x] Preserve ordered routing multiply/reduction semantics across Q5_K, Q6_K,
+  and Q8_0; pass 11/11 SYCL-vs-CPU fixtures.
+- [x] Handle allocator reuse by snapshotting the eight routing weights and
+  eight expert IDs before direct output.
+- [x] Prove live production activation across about 40 MoE layers.
+
+Decision: park and remove the experimental kernel/recognizer. Activation
+collapsed residual `MUL_MAT_ID` from 38.2 to 1.2 calls/eval and moved
+`FUSED_MOE_DOWN` from 2.6 to 39.6 calls/eval, but the identical 128-token
+screen improved only from 36.7296 to 37.9101 tok/s (+3.21%). This misses the
+10% entry gate; a concurrency sweep is not warranted. Retain only the named
+profiling instrumentation. Evidence:
+`reports/treebeard-single-token-moe-down-fusion-20260715.md` and
+`results/treebeard-single-wavefront-b70/20260715-003634`.
 
 ## Decision order
 
