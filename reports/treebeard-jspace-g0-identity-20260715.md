@@ -2,8 +2,8 @@
 
 Date: 2026-07-15
 
-Status: identity-admission slice accepted; G0 remains open for disabled-path
-bit identity and per-sequence lifecycle isolation.
+Status: identity-admission slice accepted. Disabled-path bit identity was
+accepted subsequently; G0 remains open for per-sequence lifecycle isolation.
 
 ## Frozen identity
 
@@ -62,8 +62,8 @@ runner attestation; the probe does not rehash the multi-gigabyte model on every
 invocation. Production harnesses must compute the full hash before supplying
 it.
 
-This result does not satisfy all of G0. The next stop gate is bit-identical
-logits, sampled tokens, and logical state between a no-artifact run and the same
-binary with the controller explicitly disabled. After that, controller and
-observer state must prove isolation across reset, cancellation, fork, commit,
-slot reuse, and snapshot behavior.
+This result did not satisfy all of G0 by itself. Disabled-path logits, sampled
+tokens, and logical state were accepted later in
+`reports/treebeard-jspace-g0-disabled-invariance-20260715.md`. Controller and
+observer state must still prove isolation across reset, cancellation, fork,
+commit, slot reuse, and snapshot behavior.

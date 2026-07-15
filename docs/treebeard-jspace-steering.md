@@ -14,14 +14,18 @@ without loading any Qwen3.5 lens, token IDs, layer choices, thresholds, or
 baselines. The target artifact is exactly
 `Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf`.
 
-The first G0 slice now fails closed on probe-vector identity. Every diagnostic
+The first two G0 slices now fail closed on probe-vector identity and require
+exact disabled-path behavior. Every diagnostic
 `--probe-vector` requires a runner-attested full model SHA-256, and its GGUF
 metadata must match the supported Phase-0 schema, exact base-model digest,
 requested axis name, and one of the three defined direction normalizations.
 This check happens before model allocation or vector-tensor loading and the
-accepted identity is emitted in the result. This is not a full G0 pass:
-disabled-path bit identity and per-sequence reset/cancel/fork/commit/reuse
-isolation remain open.
+accepted identity is emitted in the result. The B70 gate now also proves
+bit-identical full-vocabulary logits, greedy tokens, and serialized sequence
+state across no-API replay, no-artifact graph rebuild, and explicit
+enable-then-disable. That work exposed and fenced a non-reproducible oneDNN FP32
+MoE-router GEMM while keeping routing on device. This is not a full G0 pass:
+per-sequence reset/cancel/fork/commit/reuse isolation remains open.
 
 ## Control architecture
 
@@ -146,7 +150,7 @@ finding is “multiscale pooling helps,” not “Fibonacci helps.”
 
 ## Advancement sequence
 
-1. Finish G0 disabled-path identity and request-scoped lifecycle isolation.
+1. Finish G0 request-scoped lifecycle isolation.
 2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`.
 3. Compare the Fibonacci bank to all matched pooling controls.
 4. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.
