@@ -213,16 +213,34 @@ regression larger than 1.0%.
 
 ### T7 - Continuous-batch shape control
 
-State: queued after the composite MoE pipeline.
+State: measured; short admission coalescing is parked.
 
-- [ ] Measure active-column distribution and shape churn under realistic request
+- [x] Measure active-column distribution and shape churn under staggered request
   arrivals rather than forced steady 12-way decode alone.
-- [ ] Test short admission/coalescing windows and decode-lane bucketing.
-- [ ] Optimize aggregate throughput subject to explicit first-token and per-token
-  latency ceilings; do not hide batching delay inside tok/s.
+- [x] Screen an 8 ms adjacent-arrival gap against synchronized admission on one
+  byte-identical candidate runtime.
+- [ ] Test decode-lane bucketing only when a workload exposes a persistent
+  multi-lane backlog; the short-turn scheduler did not.
+- [ ] Run the streaming p95 first-token/inter-token gate only for a candidate
+  that clears the workload-speed screen; the 8 ms candidate did not qualify.
 
-Perf gate: improve workload-level completed tokens per second without worsening
-p95 time-to-first-token or inter-token latency beyond the declared budget.
+Decision: park short admission coalescing. With 12 agents generating 32 tokens
+from a reused 512-token prefix, the 8 ms stagger changed workload p50/mean from
+46.442/46.436 to 47.099/47.031 tok/s (+1.41%/+1.28%). Server per-slot p50 was
+flat to slightly lower. At the final cumulative profile point, synchronized
+admission had 106 full-width and three 11-column generation calls; the 8 ms
+stagger had 104 full-width and four 11-column calls. The existing scheduler is
+already full-width for roughly 96-97% of classified steady generation calls,
+so an admission wait cannot clear the 10% major-play gate. Both controls also
+reproduced the existing width-zero backend batch-shape divergence: two of four
+repeated waves changed greedy output. Evidence:
+`reports/treebeard-continuous-batch-shape-20260715.md` and
+`results/treebeard-single-wavefront-b70/20260715-010408`,
+`results/treebeard-single-wavefront-b70/20260715-010643`.
+
+Perf gate: improve workload-level completed tokens per second by at least 10%
+without worsening p95 time-to-first-token or inter-token latency beyond the
+declared budget.
 
 ### T8 - Single-token ordered expert-down epilogue
 

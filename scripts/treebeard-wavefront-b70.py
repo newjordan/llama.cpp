@@ -477,12 +477,18 @@ def run_wave(
     seed: int,
     timeout: float,
     serial_anchor: bool,
+    arrival_gap_ms: float = 0.0,
 ) -> dict[str, Any]:
     barrier = threading.Barrier(active_agents)
 
     def one(slot: int) -> dict[str, Any]:
         barrier.wait()
-        return completion(base_url, prompt, slot, width, n_predict, seed + slot, timeout, serial_anchor)
+        scheduled_offset_ms = slot * arrival_gap_ms
+        if scheduled_offset_ms > 0:
+            time.sleep(scheduled_offset_ms / 1000.0)
+        sample = completion(base_url, prompt, slot, width, n_predict, seed + slot, timeout, serial_anchor)
+        sample["scheduled_offset_ms"] = scheduled_offset_ms
+        return sample
 
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=active_agents) as executor:
@@ -491,6 +497,7 @@ def run_wave(
     return {
         "width": width,
         "active_agents": active_agents,
+        "arrival_gap_ms": arrival_gap_ms,
         "wall_s": wall_s,
         "wall_tps": active_agents * n_predict / wall_s,
         "predicted_tps": statistics.mean(float(request["predicted_tps"]) for request in requests),
@@ -521,6 +528,7 @@ def run_concurrency_suite(
     sample_file: Any,
     reuse_case_prefix: bool,
     serial_anchor: bool,
+    arrival_gap_ms: float,
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     all_samples: list[dict[str, Any]] = []
     summaries: dict[str, list[dict[str, Any]]] = {}
@@ -533,7 +541,10 @@ def run_concurrency_suite(
         if not reuse_case_prefix:
             for slot in range(active_agents):
                 erase_slot(base_url, slot, timeout)
-        run_wave(base_url, prompt, active_agents, 0, min(16, n_predict), seed, timeout, serial_anchor)
+        run_wave(
+            base_url, prompt, active_agents, 0, min(16, n_predict), seed, timeout,
+            serial_anchor, arrival_gap_ms,
+        )
         case_samples: list[dict[str, Any]] = []
         for repeat in range(repeats):
             offset = repeat % max(1, len(nonzero))
@@ -555,6 +566,7 @@ def run_concurrency_suite(
                     seed + case_index * 1000,
                     timeout,
                     serial_anchor,
+                    arrival_gap_ms,
                 )
                 phase = (
                     "before" if order_index == 0
@@ -606,6 +618,12 @@ def main() -> int:
     parser.add_argument("--run-concurrency", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reuse-case-prefix", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--serial-anchor", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--arrival-gap-ms",
+        type=float,
+        default=0.0,
+        help="fixed delay between adjacent concurrent request admissions",
+    )
     args = parser.parse_args()
 
     depths = parse_int_list(args.depths)
@@ -620,6 +638,8 @@ def main() -> int:
         raise SystemExit("repeat counts and n-predict must be positive")
     if args.parallel <= 0:
         raise SystemExit("parallel must be positive")
+    if args.arrival_gap_ms < 0:
+        raise SystemExit("arrival-gap-ms must be non-negative")
 
     base_url = f"http://127.0.0.1:{args.port}"
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -643,6 +663,7 @@ def main() -> int:
             "run_concurrency": args.run_concurrency,
             "reuse_case_prefix": args.reuse_case_prefix,
             "serial_anchor": args.serial_anchor,
+            "arrival_gap_ms": args.arrival_gap_ms,
         },
         "passed": False,
         "failures": [],
@@ -696,6 +717,7 @@ def main() -> int:
                     sample_file,
                     args.reuse_case_prefix,
                     args.serial_anchor,
+                    args.arrival_gap_ms,
                 )
             else:
                 concurrency_samples, concurrency_summary = [], {}

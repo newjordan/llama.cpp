@@ -6948,6 +6948,24 @@ private:
 
         int32_t i_next = 0;
 
+        struct batch_shape_key {
+            int32_t active_generating;
+            int32_t submitted_tokens;
+
+            bool operator<(const batch_shape_key & other) const {
+                return active_generating < other.active_generating ||
+                       (active_generating == other.active_generating &&
+                        submitted_tokens < other.submitted_tokens);
+            }
+        };
+        struct batch_shape_stat {
+            uint64_t calls  = 0;
+            uint64_t tokens = 0;
+        };
+        static const bool batch_shape_prof = getenv("TREEBEARD_BATCH_SHAPE_PROF") != nullptr;
+        static std::map<batch_shape_key, batch_shape_stat> batch_shape_stats;
+        static uint64_t batch_shape_calls = 0;
+
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -6965,6 +6983,32 @@ private:
             const int ret = llama_decode(ctx_tgt, batch_view);
 
             metrics.on_decoded(slots);
+
+            if (batch_shape_prof && ret == 0) {
+                const batch_shape_key key {
+                    static_cast<int32_t>(generating.size()),
+                    batch_view.n_tokens,
+                };
+                auto & stat = batch_shape_stats[key];
+                stat.calls++;
+                stat.tokens += batch_view.n_tokens;
+                batch_shape_calls++;
+
+                if (batch_shape_calls % 100 == 0) {
+                    SRV_INF("[treebeard-batch-shape] after=%" PRIu64 " successful decode calls\n",
+                            batch_shape_calls);
+                    for (const auto & entry : batch_shape_stats) {
+                        SRV_INF("[treebeard-batch-shape] active=%d submitted=%d calls=%" PRIu64
+                                " share=%.4f tokens=%" PRIu64 "\n",
+                                entry.first.active_generating,
+                                entry.first.submitted_tokens,
+                                entry.second.calls,
+                                static_cast<double>(entry.second.calls) /
+                                    static_cast<double>(batch_shape_calls),
+                                entry.second.tokens);
+                    }
+                }
+            }
 
             if (ret != 0) {
                 {

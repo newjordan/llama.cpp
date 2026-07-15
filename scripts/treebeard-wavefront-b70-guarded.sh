@@ -25,6 +25,8 @@ DISABLE_SYCL_OPT=${TREEBEARD_WAVEFRONT_DISABLE_SYCL_OPT:-0}
 SIQ_PROF=${TREEBEARD_WAVEFRONT_SIQ_PROF:-0}
 SERIAL_ANCHOR=${TREEBEARD_WAVEFRONT_SERIAL_ANCHOR:-1}
 STRICT_PARITY=${TREEBEARD_WAVEFRONT_STRICT_PARITY:-1}
+ARRIVAL_GAP_MS=${TREEBEARD_WAVEFRONT_ARRIVAL_GAP_MS:-0}
+BATCH_SHAPE_PROF=${TREEBEARD_WAVEFRONT_BATCH_SHAPE_PROF:-0}
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-single-wavefront-b70/$RUN_ID"
 CANDIDATE_PID=
@@ -158,6 +160,9 @@ fi
 if [[ "$SIQ_PROF" == 1 ]]; then
     mode_env+=(SIQ_PROF=1)
 fi
+if [[ "$BATCH_SHAPE_PROF" == 1 ]]; then
+    mode_env+=(TREEBEARD_BATCH_SHAPE_PROF=1)
+fi
 
 env \
     GGML_SYCL_ENABLE_FUSION=1 \
@@ -214,6 +219,7 @@ python3 "$HARNESS" \
     --depths "$DEPTHS" --widths "$WIDTHS" --concurrency-widths "$WIDTHS" \
     --cases "$CASES" --repeats "$REPEATS" --concurrency-repeats "$CONCURRENCY_REPEATS" \
     --n-predict "$N_PREDICT" --timeout 1800 \
+    --arrival-gap-ms "$ARRIVAL_GAP_MS" \
     "$concurrency_arg" "$anchor_arg" "$parity_arg" --reuse-case-prefix \
     --out "$OUT/wavefront-b70.json" \
     2>&1 | tee "$OUT/wavefront-b70-console.log"
