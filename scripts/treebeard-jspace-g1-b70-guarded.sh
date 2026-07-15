@@ -10,6 +10,7 @@ MANIFEST=${TREEBEARD_JSPACE_G1_MANIFEST:-$ROOT/research/jspace-g1-20260715/g1-go
 MANIFEST_SHA=${TREEBEARD_JSPACE_G1_MANIFEST_SHA:-eee5eac3e2b0d9cd440a890af5504c5403ac52570c2db63e3bc19912c7e2e718}
 LAYERS=${TREEBEARD_JSPACE_G1_LAYERS:-2,3,10,11,18,19,26,27,34,35,38,39}
 POOLING=${TREEBEARD_JSPACE_G1_POOLING:-last}
+ROUTING_VERBALIZERS=${TREEBEARD_JSPACE_G1_ROUTING_VERBALIZERS:-}
 EXPECTED_ROWS=${TREEBEARD_JSPACE_G1_EXPECTED_ROWS:-2304}
 EXPECTED_SCHEMA=${TREEBEARD_JSPACE_G1_EXPECTED_SCHEMA:-treebeard.jspace.g1.dataset.v1}
 PREFIX_NAME=${TREEBEARD_JSPACE_G1_PREFIX_NAME:-qwen36-g1-12layer}
@@ -22,6 +23,10 @@ RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-jspace-g1-b70/$RUN_ID"
 PREFIX="$OUT/$PREFIX_NAME"
 
+if [[ -n "$ROUTING_VERBALIZERS" ]]; then
+    ROUTING_WIDTH=$(awk -F, '{print NF}' <<< "$ROUTING_VERBALIZERS")
+    EXPECTED_STATUS=exact_runtime_routing_verbalizer_logits
+else
 case "$POOLING" in
     last)
         POOLING_WIDTH=1
@@ -36,6 +41,7 @@ case "$POOLING" in
         exit 1
         ;;
 esac
+fi
 
 mkdir -p "$OUT/maintenance" "$OUT/candidate"
 printf '%s\n' "$OUT" > "$ROOT/results/treebeard-jspace-g1-b70/latest-run.txt"
@@ -127,6 +133,8 @@ git -C "$WORKTREE" diff -- \
     scripts/treebeard-jspace-g1-v2-evaluate.py \
     scripts/treebeard-jspace-g1-v3-meld-manifest.py \
     scripts/treebeard-jspace-g1-v3-evaluate.py \
+    scripts/treebeard-jspace-g1-v4-manifest.py \
+    scripts/treebeard-jspace-g1-v4-evaluate.py \
     scripts/treebeard-jspace-g1-b70-guarded.sh \
     tools/jspace-probe/CMakeLists.txt tools/jspace-probe/README.md \
     tools/jspace-probe/jspace-sensor-extract.cpp \
@@ -148,6 +156,13 @@ set +u
 source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
 set -u
 
+capture_args=()
+if [[ -n "$ROUTING_VERBALIZERS" ]]; then
+    capture_args+=(--routing-verbalizers "$ROUTING_VERBALIZERS")
+else
+    capture_args+=(--layers "$LAYERS" --pooling "$POOLING")
+fi
+
 env \
     GGML_SYCL_ENABLE_FUSION=1 \
     GGML_SYCL_DISABLE_GRAPH=1 \
@@ -159,13 +174,30 @@ env \
     --manifest "$MANIFEST" \
     --verified-manifest-sha256 "$MANIFEST_SHA" \
     --verified-model-sha256 "$MODEL_SHA" \
-    --layers "$LAYERS" \
-    --pooling "$POOLING" \
+    "${capture_args[@]}" \
     --out-prefix "$PREFIX" \
     > "$OUT/candidate/extractor-result.json" \
     2> "$OUT/candidate/extractor.log"
 
-jq -e --arg manifest_sha "$MANIFEST_SHA" --arg model_sha "$MODEL_SHA" \
+if [[ -n "$ROUTING_VERBALIZERS" ]]; then
+    jq -e --arg manifest_sha "$MANIFEST_SHA" --arg model_sha "$MODEL_SHA" \
+        --arg dataset_schema "$EXPECTED_SCHEMA" --arg status "$EXPECTED_STATUS" \
+        --argjson rows "$EXPECTED_ROWS" --argjson width "$ROUTING_WIDTH" \
+        '.schema == "treebeard.jspace.g1.routing-logits.v1" and
+         .status == $status and
+         .dataset.runner_verified_sha256 == $manifest_sha and
+         .dataset.schema == $dataset_schema and
+         .model.runner_verified_sha256 == $model_sha and
+         .raw.dtype == "little_endian_float32" and
+         .raw.shape == [$rows,$width] and
+         (.rows | length) == $rows and
+         (.capture.verbalizers | length) == $width and
+         .capture.chat_template == false and
+         .capture.parse_special == false and
+         .capture.one_decode_per_sample == true' \
+        "$PREFIX.json" >/dev/null
+else
+    jq -e --arg manifest_sha "$MANIFEST_SHA" --arg model_sha "$MODEL_SHA" \
     --arg dataset_schema "$EXPECTED_SCHEMA" --arg status "$EXPECTED_STATUS" \
     --argjson rows "$EXPECTED_ROWS" --argjson pooling_width "$POOLING_WIDTH" \
     '.schema == "treebeard.jspace.g1.activations.v1" and
@@ -181,7 +213,8 @@ jq -e --arg manifest_sha "$MANIFEST_SHA" --arg model_sha "$MODEL_SHA" \
      .capture.chat_template == false and
      .capture.parse_special == false and
      .capture.one_decode_per_sample == true' \
-    "$PREFIX.json" >/dev/null
+        "$PREFIX.json" >/dev/null
+fi
 expected_bytes=$(jq -r '.raw.bytes' "$PREFIX.json")
 actual_bytes=$(stat -c '%s' "$PREFIX.f32")
 [[ "$expected_bytes" == "$actual_bytes" ]]
