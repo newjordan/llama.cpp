@@ -1,0 +1,130 @@
+{
+  "schema": "treebeard.jspace.g1.fit.v3",
+  "status": "fail",
+  "evidence_boundary": "fit has no test-manifest argument and indexes only v1 train plus the frozen MELD-train source-calibration capture",
+  "inputs": {
+    "training_metadata_sha256": "b51d524b7f35a997a039bff5ca0e5b2d8febd2b6e61b8972800886d604caa007",
+    "training_raw_sha256": "a2aaafc55e210a6530aa12427577c2a85d35060c34db8af420daf7e3ab2cd4de",
+    "training_rows": 1568,
+    "calibration_manifest_sha256": "b66dd8fa848f4481a7db045c317a440c32c776fc56ef9ba599f60df618f580a6",
+    "calibration_metadata_sha256": "2e09a31b21fafa252057e10849517282c0582f8b331219fa77ee9f0d68123069",
+    "calibration_raw_sha256": "90a0c52376145b67113332580be86a87a7529df2c3fc4d8b5ae7c481c0a29e7e",
+    "calibration_rows": 672
+  },
+  "method": {
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "disgust",
+      "fear",
+      "anger",
+      "neutral"
+    ],
+    "unsupported_axes": [
+      "curiosity"
+    ],
+    "representation": "mean all literal prompt tokens",
+    "layer": 35,
+    "ridge": 1.0,
+    "directions": "seven-axis diagonal-variance one-vs-rest mean discriminant",
+    "calibration": "per-axis logistic calibration on standardized sensor score plus standardized log1p exact Qwen token count",
+    "length_coefficient_l2": 0.1
+  },
+  "gates": {
+    "macro_auroc_min": 0.8,
+    "macro_ece_max": 0.05,
+    "neutral_fpr_max": 0.05,
+    "abstention_coverage_min": 0.15,
+    "abstention_precision_min": 0.75,
+    "each_length_band_macro_auroc_min": 0.7,
+    "label_shuffle_mean_macro_auroc": [
+      0.4,
+      0.6
+    ]
+  },
+  "calibration": {
+    "macro_auroc": 0.668539703207672,
+    "axis_auroc": {
+      "sadness": 0.7071578414351852,
+      "surprise": 0.6957284432870371,
+      "joy": 0.7446831597222222,
+      "disgust": 0.6905924479166666,
+      "fear": 0.5334382233796297,
+      "anger": 0.6323423032407407,
+      "neutral": 0.6758355034722222
+    },
+    "macro_ece": 0.023377574371505443,
+    "axis_ece": {
+      "sadness": 0.022503991629783778,
+      "surprise": 0.023038434279224473,
+      "joy": 0.021651012059994975,
+      "disgust": 0.029854590206929012,
+      "fear": 0.02002772694665944,
+      "anger": 0.025413419345413815,
+      "neutral": 0.02115384613253258
+    },
+    "length_band_macro_auroc": {
+      "short": 0.6570870535714286,
+      "medium": 0.6703636532738095,
+      "long": 0.68896484375
+    },
+    "length_platt": {
+      "sadness": [
+        0.9493934287529995,
+        -0.0384122117499899,
+        -1.8496348192134942
+      ],
+      "surprise": [
+        0.5957746417936085,
+        0.1079487117451892,
+        -2.1724695448108307
+      ],
+      "joy": [
+        1.205368256703874,
+        0.2751267426062159,
+        -2.2240196930423703
+      ],
+      "disgust": [
+        0.9842915554607536,
+        -0.5069230034082352,
+        -1.3761404588018689
+      ],
+      "fear": [
+        0.15115401066825584,
+        0.09736879168517286,
+        -1.7483472240771645
+      ],
+      "anger": [
+        0.6889606847399138,
+        0.18214614147867297,
+        -1.9287964459342462
+      ],
+      "neutral": [
+        0.96994019564079,
+        -0.4170668163017735,
+        -2.0355365392994376
+      ]
+    }
+  },
+  "deadband": {
+    "threshold": 0.49548951051848983,
+    "neutral_rows": 96,
+    "allowed_false_positives": 4,
+    "realized_neutral_fpr": 0.041666666666666664
+  },
+  "abstention": {
+    "threshold": 0.6784344779252901,
+    "coverage": 0.008928571428571428,
+    "precision": 0.8333333333333334
+  },
+  "label_shuffle_control": {
+    "replicates": 32,
+    "mean_macro_auroc": 0.5006311002862517
+  },
+  "artifact": {
+    "path": "/home/frosty40/turbo/worktrees/treebeard-moe-down-reduce/research/jspace-g1-v3/g1-sensor-v3.npz",
+    "sha256": "9de4e233c001b2583aa4158e6b3b7ed92b5accd575743b9eef2337506ebd02ae"
+  },
+  "calibration_gate_pass": false
+}

@@ -92,6 +92,13 @@ That is a sensor result, not evidence of semantic steering. Its subsequent
 lexical-echo control scored 0.7558 against the frozen 0.80 floor, so G1 is
 parked as recorded in
 [`reports/treebeard-jspace-g1-control-stop-20260715.md`](../reports/treebeard-jspace-g1-control-stop-20260715.md).
+A mean-pooled v2 sensor also failed its calibration/coverage gates. The
+source-disjoint v3 attempt then scored only 0.6685 macro AUROC on its frozen
+MELD-train calibration gate, with 0.89% usable coverage. It stopped before any
+MELD-test activation capture, as recorded in
+[`reports/treebeard-jspace-g1-v3-stop-20260715.md`](../reports/treebeard-jspace-g1-v3-stop-20260715.md).
+These results do not admit G2 and make threshold-only retuning an unsupported
+next step.
 
 ## Recursive Fibonacci pooling candidate
 
@@ -162,7 +169,7 @@ finding is “multiscale pooling helps,” not “Fibonacci helps.”
 
 1. G0 request-scoped actuator lifecycle isolation: complete.
 2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`: primary slice
-   passed, lexical-echo control failed; G1 parked.
+   passed, lexical-echo and subsequent source-transfer gates failed; G1 parked.
 3. Compare the Fibonacci bank to all matched pooling controls: not entered for
    the parked v1 sensor.
 4. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.
