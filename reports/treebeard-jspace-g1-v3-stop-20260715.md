@@ -90,3 +90,18 @@ layer 18 reached `0.731448`. No captured representation reached the `0.80`
 discrimination or `0.15` coverage floors. This bounds a layer/pooling-only v4:
 the next credible sensor must change the training-domain or feature geometry
 and must use a newly frozen external evaluation source.
+
+A second diagnostic used four deterministic sample-ID hash folds of the same
+consumed MELD rows. Adding the training folds to GoEmotions with equal domain
+weight raised held-out macro AUROC from `0.741668` to `0.765938`, but the worst
+fold was `0.732162`. The best fixed cheap ensemble—last-token layers 18, 19,
+26, and 27 with train-fold calibration—reached only `0.770262` mean macro
+AUROC, a `0.741168` worst fold, and `0.716107` minimum mean per-axis AUROC.
+
+This closes a multi-domain diagonal-discriminant or captured-layer-ensemble
+retry under the current G1 family. Neither result meets the frozen `0.80`
+representation floor, and selecting another external gate after both
+diagnostics would spend unbiased data on a candidate already below its
+falsification threshold. A future G1 must introduce a materially different
+supervised objective or state representation, not another layer, pooling,
+ridge, threshold, or equal-weight ensemble sweep.
