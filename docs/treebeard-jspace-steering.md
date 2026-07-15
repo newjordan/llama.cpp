@@ -14,6 +14,15 @@ without loading any Qwen3.5 lens, token IDs, layer choices, thresholds, or
 baselines. The target artifact is exactly
 `Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf`.
 
+The first G0 slice now fails closed on probe-vector identity. Every diagnostic
+`--probe-vector` requires a runner-attested full model SHA-256, and its GGUF
+metadata must match the supported Phase-0 schema, exact base-model digest,
+requested axis name, and one of the three defined direction normalizations.
+This check happens before model allocation or vector-tensor loading and the
+accepted identity is emitted in the result. This is not a full G0 pass:
+disabled-path bit identity and per-sequence reset/cancel/fork/commit/reuse
+isolation remain open.
+
 ## Control architecture
 
 Mood Lens is a read-only instrument. A controller needs four separately tested
@@ -137,10 +146,11 @@ finding is “multiscale pooling helps,” not “Fibonacci helps.”
 
 ## Advancement sequence
 
-1. Fit and freeze held-out, anchor-free semantic sensors `C[l]`.
-2. Compare the Fibonacci bank to all matched pooling controls.
-3. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.
-4. Add request-scoped low-rank feedback with deadband, confidence abstention,
+1. Finish G0 disabled-path identity and request-scoped lifecycle isolation.
+2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`.
+3. Compare the Fibonacci bank to all matched pooling controls.
+4. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.
+5. Add request-scoped low-rank feedback with deadband, confidence abstention,
    trust-region limits, and protected-task bypasses.
-5. Only then run the B70 latency/backend-parity and twelve-slot isolation gate.
-6. Use Treebeard no-op shadow branches only where the linear plant is uncertain.
+6. Only then run the B70 latency/backend-parity and twelve-slot isolation gate.
+7. Use Treebeard no-op shadow branches only where the linear plant is uncertain.

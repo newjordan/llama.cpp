@@ -102,6 +102,8 @@ The broader sensor/actuator/controller design and frozen evidence boundary are
 documented in [`docs/treebeard-jspace-steering.md`](../../docs/treebeard-jspace-steering.md).
 The exact-Qwen3.6 multi-batch pooling smoke is recorded in
 [`reports/treebeard-jspace-fibonacci-smoke-20260713.md`](../../reports/treebeard-jspace-fibonacci-smoke-20260713.md).
+The fail-closed artifact admission check is recorded in
+[`reports/treebeard-jspace-g0-identity-20260715.md`](../../reports/treebeard-jspace-g0-identity-20260715.md).
 
 The baseline full-vocabulary logits stay in-process (about 1 MiB for Qwen3.6)
 and are not serialized. Each sweep run reports full-vocabulary
