@@ -246,6 +246,28 @@ profiling instrumentation. Evidence:
 `reports/treebeard-single-token-moe-down-fusion-20260715.md` and
 `results/treebeard-single-wavefront-b70/20260715-003634`.
 
+### T9 - Linear-attention multi-projection fusion
+
+State: profiled and parked at the major-play entry gate.
+
+- [x] Attribute generic scaled `MUL_MAT` nodes by normalized weight family.
+- [x] Report fixed 50-eval windows so one-time kernel/JIT setup cannot inflate a
+  steady-state family.
+- [x] Measure the four linear-attention projections that share one input:
+  QKV, z, alpha, and beta.
+- [x] Bound the removable work before implementing a composite kernel.
+
+Decision: park before kernel implementation. In the final 50-eval steady
+window, QKV + z + alpha + beta consumed 205.8 ms of 1,334.7 ms serialized time
+(15.42%). Their four distinct quantized weight matrices must still be streamed.
+Using the measured roughly 9.5 us floor of the surrounding serialized glue as
+the dispatch-cost bound, eliminating three submissions can reclaim only about
+42.8 ms per 50 evals, or 3.21% end to end. Shared activation reads are small
+relative to the irreducible weights. This misses the 10% implementation entry
+gate. Evidence:
+`results/treebeard-single-wavefront-b70/20260715-005316` and
+`reports/treebeard-linear-attention-projection-fusion-20260715.md`.
+
 ## Decision order
 
 Execute T1 first because it is the smallest architecture-enabling slice and

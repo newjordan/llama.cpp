@@ -21,6 +21,7 @@
 #include <float.h>
 #include <limits>
 #include <optional>
+#include <string>
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
@@ -6567,9 +6568,68 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     static long unary_n = 0;
     static double fusion_us[GGML_SYCL_FUSION_PROFILE_COUNT] = { 0 };
     static long fusion_n[GGML_SYCL_FUSION_PROFILE_COUNT] = { 0 };
+    struct named_profile_stat {
+        std::string name;
+        double us;
+        long n;
+    };
+    static std::vector<named_profile_stat> mul_mat_stats;
     static int    geval = 0;
     auto now_us = []() {
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    auto normalize_profile_name = [](const char * raw_name) {
+        std::string name = raw_name != nullptr ? raw_name : "unnamed";
+        for (size_t pos = 0; pos < name.size();) {
+            if (name[pos] < '0' || name[pos] > '9') {
+                ++pos;
+                continue;
+            }
+            size_t end = pos;
+            while (end < name.size() && name[end] >= '0' && name[end] <= '9') {
+                ++end;
+            }
+            name.replace(pos, end - pos, "*");
+            ++pos;
+        }
+        return name;
+    };
+    auto mul_mat_profile_name = [&](const ggml_tensor * node) {
+        const std::string node_name = ggml_get_name(node);
+        const bool generic_name = node_name.empty() || node_name == "unnamed" ||
+                                  node_name.rfind("node_", 0) == 0;
+        if (!generic_name) {
+            return normalize_profile_name(node_name.c_str());
+        }
+
+        const ggml_tensor * weights = node->src[0];
+        if (weights != nullptr) {
+            const std::string weight_name = ggml_get_name(weights);
+            if (!weight_name.empty() && weight_name.rfind("node_", 0) != 0) {
+                return std::string("weight:") + normalize_profile_name(weight_name.c_str());
+            }
+
+            char signature[192];
+            snprintf(signature, sizeof(signature),
+                     "shape:%s[%" PRId64 "x%" PRId64 "x%" PRId64 "]->%s[%" PRId64 "x%" PRId64 "]",
+                     ggml_type_name(weights->type), weights->ne[0], weights->ne[1], weights->ne[2],
+                     ggml_type_name(node->type), node->ne[0], node->ne[1]);
+            return std::string(signature);
+        }
+
+        return normalize_profile_name(node_name.c_str());
+    };
+    auto add_named_profile_stat = [](std::vector<named_profile_stat> & stats,
+                                     std::string name, double us) {
+        const auto it = std::find_if(stats.begin(), stats.end(), [&](const named_profile_stat & stat) {
+            return stat.name == name;
+        });
+        if (it != stats.end()) {
+            it->us += us;
+            it->n++;
+        } else {
+            stats.push_back({ std::move(name), us, 1 });
+        }
     };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -6613,6 +6673,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const double dt = now_us() - t0;
             if (node->op == GGML_OP_UNARY) { unary_us += dt; unary_n++; }
             else { op_us[node->op] += dt; op_n[node->op]++; }
+            if (node->op == GGML_OP_MUL_MAT) {
+                add_named_profile_stat(mul_mat_stats, mul_mat_profile_name(node), dt);
+            }
         }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -6651,6 +6714,29 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             fprintf(stderr, "  %-14s %9.1f ms  %6.1f%%  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
                     r.name, r.us/1000.0, 100.0*r.us/tot, r.n, r.us/r.n, (double)r.n/geval);
         }
+        auto named_rows = mul_mat_stats;
+        std::sort(named_rows.begin(), named_rows.end(),
+                  [](const named_profile_stat & a, const named_profile_stat & b) {
+                      return a.us > b.us;
+                  });
+        double named_total_us = 0.0;
+        for (const auto & row : named_rows) {
+            named_total_us += row.us;
+        }
+        fprintf(stderr,
+                "[siq-prof-mul-mat] after %d graph evals window-total=%.1f ms families=%zu\n",
+                geval, named_total_us / 1000.0, named_rows.size());
+        const size_t named_limit = std::min<size_t>(named_rows.size(), 32);
+        for (size_t row_index = 0; row_index < named_limit; ++row_index) {
+            const auto & r = named_rows[row_index];
+            fprintf(stderr,
+                    "  %-54s %9.1f ms  %6.1f%%-mm"
+                    "  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
+                    r.name.c_str(), r.us / 1000.0,
+                    100.0 * r.us / named_total_us,
+                    r.n, r.us / r.n, (double) r.n / 50.0);
+        }
+        mul_mat_stats.clear();
     }
 }
 
