@@ -26,6 +26,8 @@ VERIFY_TOKENS=${TREEBEARD_JSPACE_VERIFY_TOKENS:-8}
 VERIFY_LIFECYCLE_TOKENS=${TREEBEARD_JSPACE_VERIFY_LIFECYCLE_TOKENS:-0}
 RUN_SERVER_LIFECYCLE=${TREEBEARD_JSPACE_RUN_SERVER_LIFECYCLE:-0}
 CANDIDATE_PORT=${TREEBEARD_JSPACE_SERVER_PORT:-18093}
+CUSTOM_PROMPT=${TREEBEARD_JSPACE_PROMPT:-}
+TOKEN_IDS=${TREEBEARD_JSPACE_TOKEN_IDS:-13}
 CANDIDATE_PID=
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-jspace-b70/$RUN_ID"
@@ -37,6 +39,11 @@ PROMPTS=(
     '{"task":"sum","arguments":[2,3],"result":'
     'Before the overnight maintenance window, the operator checks the queue, verifies every identifier against the signed manifest, reviews the capacity chart, confirms that no request is still active, records the current service revision, tests the rollback command, asks a second engineer to inspect the checklist, closes the stale dashboards, and writes a short handoff note. After those checks are complete, the operator starts the maintenance job, watches each stage report its status, compares the new measurements with the frozen baseline, and keeps the previous release ready until the final health probe succeeds.'
 )
+if [[ -n "$CUSTOM_PROMPT" ]]; then
+    CASE_IDS=(custom)
+    PROMPTS=("$CUSTOM_PROMPT")
+    CASE_FILTER=all
+fi
 
 mkdir -p "$OUT/maintenance" "$OUT/candidate"
 printf '%s\n' "$OUT" > "$ROOT/results/treebeard-jspace-b70/latest-run.txt"
@@ -196,7 +203,7 @@ for i in "${!CASE_IDS[@]}"; do
         -m "$MODEL" -ngl "$NGL" -ncmoe 0 --no-op-offload "$kv_offload_arg" \
         -c 128 -b "$BATCH" -ub "$UBATCH" -t 15 \
         -p "${PROMPTS[$i]}" \
-        --token-ids 13 \
+        --token-ids "$TOKEN_IDS" \
         --probe-vector "joy=$VECTOR" \
         --probe-strengths=0 \
         --verified-model-sha256 "$MODEL_SHA" \

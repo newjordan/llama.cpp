@@ -34,9 +34,15 @@ struct extractor_args {
     std::string verified_manifest_sha256;
     std::string pooling = "last";
     std::vector<int32_t> layers;
+    std::vector<llama_token> routing_verbalizers;
     std::vector<char *> common_argv;
     bool self_test = false;
 };
+
+constexpr const char * ROUTING_PROMPT_PREFIX =
+    "You are an emotion router. Choose exactly one label: sadness, surprise, joy, "
+    "disgust, fear, anger, neutral.\nText:\n";
+constexpr const char * ROUTING_PROMPT_SUFFIX = "\nLabel:";
 
 static std::string trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
@@ -91,6 +97,40 @@ static std::vector<int32_t> parse_layers(const std::string & value) {
     return result;
 }
 
+static std::vector<llama_token> parse_token_ids(const std::string & value) {
+    std::vector<llama_token> result;
+    std::set<llama_token> seen;
+    size_t begin = 0;
+    while (begin <= value.size()) {
+        const size_t end = value.find(',', begin);
+        const std::string item = trim(value.substr(
+                begin, end == std::string::npos ? std::string::npos : end - begin));
+        if (item.empty()) {
+            throw std::invalid_argument("--routing-verbalizers contains an empty item");
+        }
+        errno = 0;
+        char * parse_end = nullptr;
+        const long parsed = std::strtol(item.c_str(), &parse_end, 10);
+        if (errno == ERANGE || parse_end == item.c_str() || *parse_end != '\0' ||
+                parsed < 0 || parsed > std::numeric_limits<llama_token>::max()) {
+            throw std::invalid_argument("--routing-verbalizers contains an invalid token: " + item);
+        }
+        const auto token = static_cast<llama_token>(parsed);
+        if (!seen.insert(token).second) {
+            throw std::invalid_argument("--routing-verbalizers contains a duplicate token: " + item);
+        }
+        result.push_back(token);
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (result.empty()) {
+        throw std::invalid_argument("--routing-verbalizers must contain at least one token");
+    }
+    return result;
+}
+
 static extractor_args preprocess_args(int argc, char ** argv) {
     extractor_args result;
     result.common_argv.push_back(argv[0]);
@@ -98,6 +138,7 @@ static extractor_args preprocess_args(int argc, char ** argv) {
     constexpr const char * out_prefix = "--out-prefix=";
     constexpr const char * layers_prefix = "--layers=";
     constexpr const char * pooling_prefix = "--pooling=";
+    constexpr const char * verbalizers_prefix = "--routing-verbalizers=";
     constexpr const char * model_sha_prefix = "--verified-model-sha256=";
     constexpr const char * manifest_sha_prefix = "--verified-manifest-sha256=";
 
@@ -128,6 +169,12 @@ static extractor_args preprocess_args(int argc, char ** argv) {
             result.pooling = require_value(i, "--pooling");
         } else if (arg.compare(0, std::strlen(pooling_prefix), pooling_prefix) == 0) {
             result.pooling = arg.substr(std::strlen(pooling_prefix));
+        } else if (arg == "--routing-verbalizers") {
+            result.routing_verbalizers = parse_token_ids(
+                    require_value(i, "--routing-verbalizers"));
+        } else if (arg.compare(0, std::strlen(verbalizers_prefix), verbalizers_prefix) == 0) {
+            result.routing_verbalizers = parse_token_ids(
+                    arg.substr(std::strlen(verbalizers_prefix)));
         } else if (arg == "--verified-model-sha256") {
             result.verified_model_sha256 = parse_sha256(
                     require_value(i, "--verified-model-sha256"), "--verified-model-sha256");
@@ -157,6 +204,7 @@ static void print_usage(int, char ** argv) {
     std::printf("  --out-prefix PATH                 write PATH.json and PATH.f32 atomically\\n");
     std::printf("  --layers 2,3,...                  ordered zero-based l_out layers to retain\\n");
     std::printf("  --pooling last|last-mean          token summaries per retained layer\\n");
+    std::printf("  --routing-verbalizers ID,...      emit fixed-prompt label-token logits instead\\n");
     std::printf("  --verified-model-sha256 SHA       runner-verified exact model identity\\n");
     std::printf("  --verified-manifest-sha256 SHA    runner-verified frozen dataset identity\\n");
     std::printf("  --self-test                       model-independent parser smoke test\\n\\n");
@@ -245,6 +293,7 @@ static json read_manifest(const std::string & path) {
     if ((schema != "treebeard.jspace.g1.dataset.v1" &&
             schema != "treebeard.jspace.g1.dataset.v2" &&
             schema != "treebeard.jspace.g1.dataset.v3" &&
+            schema != "treebeard.jspace.g1.dataset.v4" &&
             schema != "treebeard.jspace.g1.controls.v1" &&
             schema != "treebeard.jspace.g1.controls.v2") ||
             !document.contains("rows") || !document["rows"].is_array() || document["rows"].empty()) {
@@ -282,6 +331,10 @@ static int run_self_test() {
     if (!rejected_duplicate || parse_sha256(std::string(64, 'a'), "digest").size() != 64) {
         throw std::runtime_error("argument validation self-test failed");
     }
+    if (parse_token_ids("49166, 15420,20002") !=
+            std::vector<llama_token>({ 49166, 15420, 20002 })) {
+        throw std::runtime_error("routing verbalizer parser self-test failed");
+    }
     std::cout << json({
         { "schema", "treebeard.jspace.g1.extractor-self-test.v1" },
         { "ok", true },
@@ -291,18 +344,30 @@ static int run_self_test() {
 
 static int run_extractor(common_params & params, const extractor_args & args) {
     json manifest = read_manifest(args.manifest_path);
+    const bool routing = !args.routing_verbalizers.empty();
+    if (routing && manifest.value("schema", "") != "treebeard.jspace.g1.dataset.v4") {
+        throw std::invalid_argument("routing extraction requires a frozen v4 manifest");
+    }
+    if (routing && args.routing_verbalizers.size() != 7) {
+        throw std::invalid_argument("routing extraction requires exactly seven ordered verbalizers");
+    }
+    if (routing && !args.layers.empty()) {
+        throw std::invalid_argument("--layers and --routing-verbalizers are mutually exclusive");
+    }
     activation_capture capture;
     capture.include_mean = args.pooling == "last-mean";
-    for (size_t i = 0; i < args.layers.size(); ++i) {
-        capture.tensor_indices.emplace("l_out-" + std::to_string(args.layers[i]), i);
+    if (!routing) {
+        for (size_t i = 0; i < args.layers.size(); ++i) {
+            capture.tensor_indices.emplace("l_out-" + std::to_string(args.layers[i]), i);
+        }
+        params.cb_eval = capture_activations;
+        params.cb_eval_user_data = &capture;
     }
-    params.cb_eval = capture_activations;
-    params.cb_eval_user_data = &capture;
     auto llama_init = common_init_from_params(params);
     llama_model * model = llama_init->model();
     llama_context * ctx = llama_init->context();
     if (model == nullptr || ctx == nullptr || llama_model_has_encoder(model)) {
-        throw std::runtime_error("J-Space sensor extraction requires a decoder-only model and context");
+        throw std::runtime_error("J-Space extraction requires a decoder-only model and context");
     }
     for (int32_t layer : args.layers) {
         if (layer < 0 || layer >= llama_model_n_layer(model)) {
@@ -311,6 +376,26 @@ static int run_extractor(common_params & params, const extractor_args & args) {
     }
     if (llama_model_n_embd(model) <= 0) {
         throw std::runtime_error("model reports an invalid embedding dimension");
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    for (llama_token token : args.routing_verbalizers) {
+        if (token < 0 || token >= n_vocab) {
+            throw std::invalid_argument(
+                    "routing verbalizer is outside the model vocabulary: " + std::to_string(token));
+        }
+    }
+    if (routing) {
+        static constexpr const char * expected_pieces[] = {
+            " sadness", " surprise", " joy", " disgust", " fear", " anger", " neutral",
+        };
+        for (size_t i = 0; i < args.routing_verbalizers.size(); ++i) {
+            const std::string piece = common_token_to_piece(vocab, args.routing_verbalizers[i], true);
+            if (piece != expected_pieces[i]) {
+                throw std::invalid_argument(
+                        "routing verbalizer order or tokenization does not match the frozen axes");
+            }
+        }
     }
     const uint32_t one_decode_limit = std::min(llama_n_batch(ctx), llama_n_ubatch(ctx));
     if (one_decode_limit == 0) {
@@ -336,7 +421,6 @@ static int run_extractor(common_params & params, const extractor_args & args) {
     size_t min_tokens = std::numeric_limits<size_t>::max();
     size_t max_tokens = 0;
     uint64_t total_tokens = 0;
-    const llama_vocab * vocab = llama_model_get_vocab(model);
     const bool add_special = llama_vocab_get_add_bos(vocab);
     llama_memory_t memory = llama_get_memory(ctx);
     if (memory == nullptr) {
@@ -347,14 +431,18 @@ static int run_extractor(common_params & params, const extractor_args & args) {
     for (size_t row_index = 0; row_index < rows.size(); ++row_index) {
         const auto & row = rows[row_index];
         const std::string text = row["text"].get<std::string>();
-        const auto tokens = common_tokenize(ctx, text, add_special, false);
+        const std::string prompt = routing ?
+            std::string(ROUTING_PROMPT_PREFIX) + text + ROUTING_PROMPT_SUFFIX : text;
+        const auto tokens = common_tokenize(ctx, prompt, add_special, false);
         if (tokens.empty() || tokens.size() > llama_n_ctx(ctx) || tokens.size() > one_decode_limit) {
             throw std::runtime_error(
                     "sample " + row["sample_id"].get<std::string>() + " has " +
                     std::to_string(tokens.size()) + " tokens; the one-decode limit is " +
                     std::to_string(one_decode_limit));
         }
-        capture.reset(args.layers.size());
+        if (!routing) {
+            capture.reset(args.layers.size());
+        }
         llama_synchronize(ctx);
         llama_memory_clear(memory, true);
         const int32_t rc = llama_decode(
@@ -366,16 +454,34 @@ static int run_extractor(common_params & params, const extractor_args & args) {
                     " with code " + std::to_string(rc));
         }
         llama_synchronize(ctx);
-        if (!capture.error.empty()) {
-            throw std::runtime_error(capture.error);
-        }
-        if (capture.dimension != llama_model_n_embd(model) ||
-                !std::all_of(capture.captured.begin(), capture.captured.end(), [](bool value) { return value; })) {
-            throw std::runtime_error("one or more requested activation layers were not captured");
-        }
-        for (const auto & layer_values : capture.values) {
-            raw.write(reinterpret_cast<const char *>(layer_values.data()),
-                    static_cast<std::streamsize>(layer_values.size() * sizeof(float)));
+        if (routing) {
+            const float * logits = llama_get_logits_ith(ctx, -1);
+            if (logits == nullptr) {
+                throw std::runtime_error("last-position routing logits are unavailable");
+            }
+            std::vector<float> scores;
+            scores.reserve(args.routing_verbalizers.size());
+            for (llama_token token : args.routing_verbalizers) {
+                const float score = logits[token];
+                if (!std::isfinite(score)) {
+                    throw std::runtime_error("routing verbalizer produced a non-finite logit");
+                }
+                scores.push_back(score);
+            }
+            raw.write(reinterpret_cast<const char *>(scores.data()),
+                    static_cast<std::streamsize>(scores.size() * sizeof(float)));
+        } else {
+            if (!capture.error.empty()) {
+                throw std::runtime_error(capture.error);
+            }
+            if (capture.dimension != llama_model_n_embd(model) ||
+                    !std::all_of(capture.captured.begin(), capture.captured.end(), [](bool value) { return value; })) {
+                throw std::runtime_error("one or more requested activation layers were not captured");
+            }
+            for (const auto & layer_values : capture.values) {
+                raw.write(reinterpret_cast<const char *>(layer_values.data()),
+                        static_cast<std::streamsize>(layer_values.size() * sizeof(float)));
+            }
         }
         if (!raw) {
             throw std::runtime_error("failed while writing activation output");
@@ -405,15 +511,65 @@ static int run_extractor(common_params & params, const extractor_args & args) {
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
     const uint64_t pooling_width = capture.include_mean ? 2 : 1;
-    const uint64_t raw_bytes = static_cast<uint64_t>(rows.size()) * args.layers.size() * pooling_width *
-            static_cast<uint64_t>(llama_model_n_embd(model)) * sizeof(float);
+    const uint64_t row_values = routing ? args.routing_verbalizers.size() :
+        args.layers.size() * pooling_width * static_cast<uint64_t>(llama_model_n_embd(model));
+    const uint64_t raw_bytes = static_cast<uint64_t>(rows.size()) * row_values * sizeof(float);
     if (std::filesystem::file_size(raw_tmp) != raw_bytes) {
-        throw std::runtime_error("activation output size does not match its declared shape");
+        throw std::runtime_error("raw output size does not match its declared shape");
+    }
+    json capture_metadata;
+    json raw_shape;
+    std::string raw_order;
+    if (routing) {
+        json verbalizers = json::array();
+        for (llama_token token : args.routing_verbalizers) {
+            verbalizers.push_back({
+                { "id", token },
+                { "piece", common_token_to_piece(vocab, token, true) },
+            });
+        }
+        capture_metadata = {
+            { "mode", "instruction_probed_verbalizer_logits" },
+            { "prompt_prefix", ROUTING_PROMPT_PREFIX },
+            { "prompt_suffix", ROUTING_PROMPT_SUFFIX },
+            { "verbalizers", std::move(verbalizers) },
+            { "position", "last routing prompt token" },
+            { "distribution", "raw pre-sampler vocabulary logits" },
+            { "chat_template", false },
+            { "parse_special", false },
+            { "add_bos_from_model", add_special },
+            { "memory_reset", "llama_memory_clear(data=true) before every sample" },
+            { "one_decode_per_sample", true },
+        };
+        raw_shape = json::array({ rows.size(), args.routing_verbalizers.size() });
+        raw_order = "C: sample, verbalizer";
+    } else {
+        capture_metadata = {
+            { "tensor_pattern", "l_out-{zero_based_layer}" },
+            { "layers", args.layers },
+            { "layer_types", "Qwen3.6 default: full attention iff (layer+1)%4==0; otherwise DeltaNet" },
+            { "position", capture.include_mean ? "last token, token mean" : "last token" },
+            { "pooling", capture.include_mean ?
+                json::array({ "last", "mean" }) : json::array({ "last" }) },
+            { "chat_template", false },
+            { "parse_special", false },
+            { "add_bos_from_model", add_special },
+            { "memory_reset", "llama_memory_clear(data=true) before every sample" },
+            { "one_decode_per_sample", true },
+        };
+        raw_shape = capture.include_mean ?
+            json::array({ rows.size(), args.layers.size(), 2, llama_model_n_embd(model) }) :
+            json::array({ rows.size(), args.layers.size(), llama_model_n_embd(model) });
+        raw_order = capture.include_mean ?
+            "C: sample, layer, pooling(last,mean), embedding" :
+            "C: sample, layer, embedding";
     }
     json metadata = {
-        { "schema", "treebeard.jspace.g1.activations.v1" },
-        { "status", capture.include_mean ?
-            "exact_runtime_last_mean_token_residuals" : "exact_runtime_last_token_residuals" },
+        { "schema", routing ?
+            "treebeard.jspace.g1.routing-logits.v1" : "treebeard.jspace.g1.activations.v1" },
+        { "status", routing ? "exact_runtime_routing_verbalizer_logits" :
+            (capture.include_mean ?
+                "exact_runtime_last_mean_token_residuals" : "exact_runtime_last_token_residuals") },
         { "model", {
             { "description", description },
             { "decoder_only", true },
@@ -426,28 +582,12 @@ static int run_extractor(common_params & params, const extractor_args & args) {
             { "runner_verified_sha256", args.verified_manifest_sha256 },
             { "schema", manifest["schema"] },
         } },
-        { "capture", {
-            { "tensor_pattern", "l_out-{zero_based_layer}" },
-            { "layers", args.layers },
-            { "layer_types", "Qwen3.6 default: full attention iff (layer+1)%4==0; otherwise DeltaNet" },
-            { "position", capture.include_mean ? "last token, token mean" : "last token" },
-            { "pooling", capture.include_mean ?
-                json::array({ "last", "mean" }) : json::array({ "last" }) },
-            { "chat_template", false },
-            { "parse_special", false },
-            { "add_bos_from_model", add_special },
-            { "memory_reset", "llama_memory_clear(data=true) before every sample" },
-            { "one_decode_per_sample", true },
-        } },
+        { "capture", std::move(capture_metadata) },
         { "raw", {
             { "path", raw_path.filename().string() },
             { "dtype", "little_endian_float32" },
-            { "shape", capture.include_mean ?
-                json::array({ rows.size(), args.layers.size(), 2, llama_model_n_embd(model) }) :
-                json::array({ rows.size(), args.layers.size(), llama_model_n_embd(model) }) },
-            { "order", capture.include_mean ?
-                "C: sample, layer, pooling(last,mean), embedding" :
-                "C: sample, layer, embedding" },
+            { "shape", std::move(raw_shape) },
+            { "order", raw_order },
             { "bytes", raw_bytes },
         } },
         { "token_counts", {
@@ -469,14 +609,15 @@ static int run_extractor(common_params & params, const extractor_args & args) {
     }
     std::filesystem::rename(raw_tmp, raw_path);
     std::filesystem::rename(meta_tmp, meta_path);
-    std::cout << json({
+    json result = {
         { "status", "pass" },
         { "metadata", meta_path.string() },
-        { "activations", raw_path.string() },
+        { routing ? "routing_logits" : "activations", raw_path.string() },
         { "rows", rows.size() },
         { "tokens", total_tokens },
         { "bytes", raw_bytes },
-    }).dump() << '\n';
+    };
+    std::cout << result.dump() << '\n';
     return 0;
 }
 
@@ -490,11 +631,14 @@ int main(int argc, char ** argv) {
         if (args.self_test) {
             return run_self_test();
         }
-        if (args.manifest_path.empty() || args.out_prefix.empty() || args.layers.empty() ||
+        const bool has_residual_layers = !args.layers.empty();
+        const bool has_routing_verbalizers = !args.routing_verbalizers.empty();
+        if (args.manifest_path.empty() || args.out_prefix.empty() ||
+                has_residual_layers == has_routing_verbalizers ||
                 args.verified_model_sha256.empty() || args.verified_manifest_sha256.empty()) {
             print_usage(argc, argv);
             throw std::invalid_argument(
-                    "manifest, output prefix, layers, model SHA, and manifest SHA are required");
+                    "manifest, output prefix, exactly one capture mode, model SHA, and manifest SHA are required");
         }
 
         common_params params;
