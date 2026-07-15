@@ -30,6 +30,13 @@ ARRIVAL_GAP_MS=${TREEBEARD_WAVEFRONT_ARRIVAL_GAP_MS:-0}
 BATCH_SHAPE_PROF=${TREEBEARD_WAVEFRONT_BATCH_SHAPE_PROF:-0}
 REUSE_PROBE=${TREEBEARD_WAVEFRONT_REUSE_PROBE:-0}
 REUSE_N_PREDICT=${TREEBEARD_WAVEFRONT_REUSE_N_PREDICT:-64}
+REUSE_SEQUENTIAL=${TREEBEARD_WAVEFRONT_REUSE_SEQUENTIAL:-0}
+MOE_REUSE_PROFILE=${TREEBEARD_WAVEFRONT_MOE_REUSE_PROFILE:-$REUSE_PROBE}
+NO_SPEC=${TREEBEARD_WAVEFRONT_NO_SPEC:-0}
+STATE_IO_FUSION=${TREEBEARD_WAVEFRONT_STATE_IO_FUSION:-0}
+STATE_IO_DEBUG=${TREEBEARD_WAVEFRONT_STATE_IO_DEBUG:-0}
+STATE_IO_MODE=${TREEBEARD_WAVEFRONT_STATE_IO_MODE:-all}
+ADMISSION_HOLD_MS=${TREEBEARD_WAVEFRONT_ADMISSION_HOLD_MS:-0}
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-single-wavefront-b70/$RUN_ID"
 CANDIDATE_PID=
@@ -166,8 +173,26 @@ fi
 if [[ "$BATCH_SHAPE_PROF" == 1 ]]; then
     mode_env+=(TREEBEARD_BATCH_SHAPE_PROF=1)
 fi
-if [[ "$REUSE_PROBE" == 1 ]]; then
+if [[ "$MOE_REUSE_PROFILE" == 1 ]]; then
     mode_env+=(GGML_SYCL_MOE_REUSE_PROFILE=1)
+fi
+if [[ "$STATE_IO_FUSION" == 1 ]]; then
+    mode_env+=(GGML_SYCL_ENABLE_STATE_IO_FUSION=1 GGML_SYCL_STATE_IO_MODE="$STATE_IO_MODE")
+fi
+if [[ "$STATE_IO_DEBUG" == 1 ]]; then
+    mode_env+=(GGML_SYCL_STATE_IO_DEBUG=1)
+fi
+if (( ADMISSION_HOLD_MS > 0 )); then
+    mode_env+=(TREEBEARD_SERVER_ADMISSION_HOLD_MS="$ADMISSION_HOLD_MS")
+fi
+
+spec_args=()
+if [[ "$NO_SPEC" != 1 ]]; then
+    spec_args=(
+        --spec-type ngram-simple --spec-draft-n-max 48
+        --spec-ngram-simple-size-n "$NGRAM_N"
+        --spec-ngram-simple-size-m 48 --spec-ngram-simple-min-hits 1
+    )
 fi
 
 env \
@@ -181,9 +206,7 @@ env \
     -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 \
     -b 8192 -ub 1024 -t 15 \
     --host 127.0.0.1 --port "$PORT" --jinja --metrics \
-    --spec-type ngram-simple --spec-draft-n-max 48 \
-    --spec-ngram-simple-size-n "$NGRAM_N" \
-    --spec-ngram-simple-size-m 48 --spec-ngram-simple-min-hits 1 \
+    "${spec_args[@]}" \
     -a "treebeard-single-wavefront-b70-ngram${NGRAM_N}" \
     > "$OUT/candidate/server.log" 2>&1 &
 CANDIDATE_PID=$!
@@ -221,8 +244,13 @@ if [[ "$STRICT_PARITY" != 1 ]]; then
 fi
 
 if [[ "$REUSE_PROBE" == 1 ]]; then
+    reuse_mode_args=()
+    if [[ "$REUSE_SEQUENTIAL" == 1 ]]; then
+        reuse_mode_args+=(--sequential)
+    fi
     python3 "$REUSE_HARNESS" \
         --port "$PORT" --n-predict "$REUSE_N_PREDICT" --timeout 1800 \
+        "${reuse_mode_args[@]}" \
         --out "$OUT/moe-reuse-probe.json" \
         2>&1 | tee "$OUT/moe-reuse-probe-console.log"
 else

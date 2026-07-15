@@ -106,6 +106,8 @@ def main() -> int:
     parser.add_argument("--n-predict", type=int, default=64)
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--sequential", action="store_true",
+                        help="run the 12 deterministic prompts one at a time as a serial parity anchor")
     args = parser.parse_args()
     if args.n_predict <= 0:
         raise SystemExit("--n-predict must be positive")
@@ -114,17 +116,23 @@ def main() -> int:
     for slot in range(len(PROMPTS)):
         erase_slot(base_url, slot, args.timeout)
 
-    barrier = threading.Barrier(len(PROMPTS))
-
-    def one(item: tuple[int, str]) -> dict[str, Any]:
-        slot, prompt = item
-        barrier.wait()
-        return complete(base_url, slot, prompt, args.n_predict, args.timeout)
-
     started_at = now()
     started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(PROMPTS)) as executor:
-        requests = list(executor.map(one, enumerate(PROMPTS)))
+    if args.sequential:
+        requests = [
+            complete(base_url, slot, prompt, args.n_predict, args.timeout)
+            for slot, prompt in enumerate(PROMPTS)
+        ]
+    else:
+        barrier = threading.Barrier(len(PROMPTS))
+
+        def one(item: tuple[int, str]) -> dict[str, Any]:
+            slot, prompt = item
+            barrier.wait()
+            return complete(base_url, slot, prompt, args.n_predict, args.timeout)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(PROMPTS)) as executor:
+            requests = list(executor.map(one, enumerate(PROMPTS)))
     wall_s = time.perf_counter() - started
 
     for slot in range(len(PROMPTS)):
@@ -133,6 +141,7 @@ def main() -> int:
     result = {
         "schema_version": 1,
         "kind": "treebeard-moe-reuse-probe",
+        "execution": "sequential" if args.sequential else "concurrent",
         "started_at": started_at,
         "finished_at": now(),
         "agents": len(PROMPTS),

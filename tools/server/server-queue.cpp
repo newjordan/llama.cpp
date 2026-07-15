@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -181,6 +183,10 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     }
 
     constexpr int64_t max_wait_ms = 1000;
+    static const int64_t admission_hold_ms = []() {
+        const char * env = std::getenv("TREEBEARD_SERVER_ADMISSION_HOLD_MS");
+        return env != nullptr ? std::max<int64_t>(0, std::atoll(env)) : 0;
+    }();
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0 ||
@@ -266,6 +272,14 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     return (!queue_tasks.empty() || !running);
                 });
                 if (res) {
+                    // Diagnostic-only fixed-admission gate. It lets all HTTP
+                    // workers enqueue before the next drain so A/B runs
+                    // compare the same batched graph instead of timing-shaped
+                    // request subsets.
+                    lock.unlock();
+                    if (admission_hold_ms > 0) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(admission_hold_ms));
+                    }
                     break; // new task arrived or terminate
                 }
                 // otherwise, loop again to check sleeping condition

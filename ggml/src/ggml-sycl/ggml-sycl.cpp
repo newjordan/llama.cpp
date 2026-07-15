@@ -5827,6 +5827,152 @@ static void ggml_sycl_trace_moe_dual_swiglu(
     }
 }
 
+static bool ggml_sycl_state_io_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_STATE_IO_FUSION");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_state_io_op_enabled(ggml_op op) {
+    if (!ggml_sycl_state_io_enabled()) {
+        return false;
+    }
+    static const std::string mode = []() {
+        const char * env = getenv("GGML_SYCL_STATE_IO_MODE");
+        return env != nullptr ? std::string(env) : std::string("all");
+    }();
+    if (mode == "all") {
+        return true;
+    }
+    return (mode == "ssm" && op == GGML_OP_SSM_CONV) ||
+           (mode == "gdn" && op == GGML_OP_GATED_DELTA_NET);
+}
+
+static ggml_tensor * ggml_sycl_view_base(ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static const ggml_tensor * ggml_sycl_view_base(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static ggml_tensor * ggml_sycl_find_state_copy(
+        ggml_cgraph * cgraph, ggml_tensor * producer, int * count_out = nullptr) {
+    ggml_tensor * found = nullptr;
+    int count = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_CPY && node->src[0] != nullptr &&
+            ggml_sycl_view_base(node->src[0]) == producer) {
+            found = node;
+            ++count;
+        }
+    }
+    if (count_out != nullptr) {
+        *count_out = count;
+    }
+    return count == 1 ? found : nullptr;
+}
+
+static bool ggml_sycl_reserve_state_io_src(
+        ggml_tensor * node, int index, ggml_tensor * value) {
+    GGML_ASSERT(index >= 0 && index < GGML_MAX_SRC);
+    if (node->src[index] != nullptr && node->src[index] != value) {
+        return false;
+    }
+    node->src[index] = value;
+    return true;
+}
+
+// Annotate the exact AR recurrent-state pattern before allocation. The spare
+// sources are allocator liveness edges; the ordinary backend implementations
+// continue to consume only their declared sources when the opt-in path is not
+// runtime-safe for a particular recurrent copy map.
+static void ggml_sycl_annotate_state_io(ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (ggml_sycl_state_io_op_enabled(GGML_OP_SSM_CONV) &&
+            node->op == GGML_OP_SSM_CONV && node->src[0] != nullptr &&
+            node->src[0]->op == GGML_OP_CONCAT && node->src[1] != nullptr &&
+            node->ne[1] == 1) {
+            ggml_tensor * concat = node->src[0];
+            ggml_tensor * gather = concat->src[0] != nullptr
+                ? ggml_sycl_view_base(concat->src[0]) : nullptr;
+            ggml_tensor * token = concat->src[1];
+            int copy_count = 0;
+            ggml_tensor * copy = ggml_sycl_find_state_copy(cgraph, concat, &copy_count);
+            if (gather == nullptr || gather->op != GGML_OP_GET_ROWS ||
+                gather->src[0] == nullptr || gather->src[1] == nullptr ||
+                token == nullptr || copy == nullptr || copy_count != 1) {
+                continue;
+            }
+            ggml_tensor * state_cache = gather->src[0];
+            ggml_tensor * state_ids   = gather->src[1];
+            ggml_tensor * state_dst   = copy->src[1];
+            const int64_t d_conv = node->src[1]->ne[0];
+            const int64_t d_inner = node->src[1]->ne[1];
+            const int64_t state_size = (d_conv - 1) * d_inner;
+            if (state_cache->type != GGML_TYPE_F32 || state_ids->type != GGML_TYPE_I32 ||
+                token->type != GGML_TYPE_F32 || state_dst == nullptr ||
+                state_dst->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
+                d_conv < 2 || d_conv > 16 || state_cache->ne[0] != state_size ||
+                state_dst->ne[0] != state_size || state_dst->ne[1] != node->ne[2] ||
+                token->ne[0] != 1 || token->ne[1] != d_inner || token->ne[2] != node->ne[2] ||
+                ggml_sycl_view_base(state_cache) != ggml_sycl_view_base(state_dst)) {
+                continue;
+            }
+            if (!ggml_sycl_reserve_state_io_src(node, 2, state_cache) ||
+                !ggml_sycl_reserve_state_io_src(node, 3, state_ids) ||
+                !ggml_sycl_reserve_state_io_src(node, 4, token) ||
+                !ggml_sycl_reserve_state_io_src(node, 5, state_dst) ||
+                !ggml_sycl_reserve_state_io_src(node, 6, gather)) {
+                continue;
+            }
+        }
+
+        if (ggml_sycl_state_io_op_enabled(GGML_OP_GATED_DELTA_NET) &&
+            node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr &&
+            node->src[2]->ne[2] == 1 && ggml_get_op_params_i32(node, 0) == 1) {
+            ggml_tensor * gather = node->src[5] != nullptr
+                ? ggml_sycl_view_base(node->src[5]) : nullptr;
+            int copy_count = 0;
+            ggml_tensor * copy = ggml_sycl_find_state_copy(cgraph, node, &copy_count);
+            if (gather == nullptr || gather->op != GGML_OP_GET_ROWS ||
+                gather->src[0] == nullptr || gather->src[1] == nullptr ||
+                copy == nullptr || copy_count != 1) {
+                continue;
+            }
+            ggml_tensor * state_cache = gather->src[0];
+            ggml_tensor * state_ids   = gather->src[1];
+            ggml_tensor * state_dst   = copy->src[1];
+            const int64_t state_size =
+                node->src[2]->ne[0] * node->src[2]->ne[0] * node->src[2]->ne[1];
+            if (state_cache->type != GGML_TYPE_F32 || state_ids->type != GGML_TYPE_I32 ||
+                state_dst == nullptr || state_dst->type != GGML_TYPE_F32 ||
+                state_cache->ne[0] != state_size || state_dst->ne[0] != state_size ||
+                state_dst->ne[1] != node->src[2]->ne[3] ||
+                ggml_sycl_view_base(state_cache) != ggml_sycl_view_base(state_dst)) {
+                continue;
+            }
+            if (!ggml_sycl_reserve_state_io_src(node, 6, state_cache) ||
+                !ggml_sycl_reserve_state_io_src(node, 7, state_ids) ||
+                !ggml_sycl_reserve_state_io_src(node, 8, state_dst) ||
+                !ggml_sycl_reserve_state_io_src(node, 9, gather)) {
+                continue;
+            }
+        }
+    }
+}
+
 // Extend the routing-weight live range before graph allocation. The production
 // batched MoE graph expands all expert views before its ordered ADD chain. When
 // that complete tail is present, a non-compute dependency on the final ADD
@@ -5835,6 +5981,10 @@ static void ggml_sycl_trace_moe_dual_swiglu(
 // metadata. The runtime overlap check and tiny snapshot remain the safety net.
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
     GGML_UNUSED(backend);
+
+    if (ggml_sycl_state_io_enabled()) {
+        ggml_sycl_annotate_state_io(cgraph);
+    }
 
     const bool pipeline_enabled = ggml_sycl_moe_pipeline_enabled();
     const bool disable_down =
@@ -6390,6 +6540,7 @@ enum ggml_sycl_fusion_profile_kind {
     GGML_SYCL_FUSION_PROFILE_MOE_DOWN_REDUCE,
     GGML_SYCL_FUSION_PROFILE_TOPK_MOE,
     GGML_SYCL_FUSION_PROFILE_DELTANET_GLUE,
+    GGML_SYCL_FUSION_PROFILE_STATE_IO,
     GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD,
     GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL,
     GGML_SYCL_FUSION_PROFILE_COUNT,
@@ -6580,6 +6731,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         long n;
     };
     static std::vector<named_profile_stat> mul_mat_stats;
+    static std::vector<named_profile_stat> state_op_stats;
     static int    geval = 0;
     auto now_us = []() {
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -6625,6 +6777,26 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         return normalize_profile_name(node_name.c_str());
     };
+    auto state_op_profile_name = [&](const ggml_tensor * node) {
+        auto tensor_name = [&](const ggml_tensor * tensor) {
+            if (tensor == nullptr) {
+                return std::string("none");
+            }
+            const std::string raw_name = ggml_get_name(tensor);
+            if (!raw_name.empty() && raw_name != "unnamed" &&
+                raw_name.rfind("node_", 0) != 0) {
+                return normalize_profile_name(raw_name.c_str());
+            }
+            char signature[128];
+            snprintf(signature, sizeof(signature),
+                     "%s[%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "]",
+                     ggml_type_name(tensor->type), tensor->ne[0], tensor->ne[1],
+                     tensor->ne[2], tensor->ne[3]);
+            return std::string(signature);
+        };
+        return std::string(ggml_op_name(node->op)) + ":" + tensor_name(node) +
+               "<-" + tensor_name(node->src[0]) + "," + tensor_name(node->src[1]);
+    };
     auto add_named_profile_stat = [](std::vector<named_profile_stat> & stats,
                                      std::string name, double us) {
         const auto it = std::find_if(stats.begin(), stats.end(), [&](const named_profile_stat & stat) {
@@ -6638,12 +6810,170 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
     };
 
+    static const bool state_io_debug = []() {
+        const char * env = getenv("GGML_SYCL_STATE_IO_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static std::atomic<bool> state_io_dumped { false };
+    if (state_io_debug && !state_io_dumped.load(std::memory_order_relaxed)) {
+        bool full_width = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr &&
+                node->src[2]->ne[3] == 12) {
+                full_width = true;
+                break;
+            }
+        }
+        if (full_width && !state_io_dumped.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr, "[treebeard-state-io] event=graph-dump nodes=%d\n", cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node->op != GGML_OP_GET_ROWS && node->op != GGML_OP_CPY &&
+                    node->op != GGML_OP_CONCAT && node->op != GGML_OP_SSM_CONV &&
+                    node->op != GGML_OP_GATED_DELTA_NET) {
+                    continue;
+                }
+                fprintf(stderr,
+                        "[treebeard-state-io] index=%d op=%s name=%s ptr=%p data=%p"
+                        " view_src=%p uses=%d",
+                        i, ggml_op_name(node->op), ggml_get_name(node), (const void *) node,
+                        node->data, (void *) node->view_src,
+                        ggml_node_get_use_count(cgraph, i));
+                for (int src = 0; src < 6 && node->src[src] != nullptr; ++src) {
+                    fprintf(stderr, " src%d=%p/%s/%s", src, (void *) node->src[src],
+                            ggml_op_name(node->src[src]->op), ggml_get_name(node->src[src]));
+                }
+                fputc('\n', stderr);
+            }
+        }
+    }
+
+    struct state_io_plan_entry {
+        ggml_tensor * marker;
+        ggml_tensor * gather;
+        int64_t n_rs;
+    };
+    std::vector<state_io_plan_entry> state_io_plan;
+    std::vector<ggml_tensor *> state_io_direct;
+    std::vector<ggml_tensor *> state_io_elide;
+    if (ggml_sycl_state_io_enabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * marker = cgraph->nodes[i];
+            const bool annotated_ssm = marker->op == GGML_OP_SSM_CONV &&
+                marker->src[2] != nullptr && marker->src[3] != nullptr &&
+                marker->src[4] != nullptr && marker->src[5] != nullptr &&
+                marker->src[6] != nullptr;
+            const bool annotated_gdn = marker->op == GGML_OP_GATED_DELTA_NET &&
+                marker->src[6] != nullptr && marker->src[7] != nullptr &&
+                marker->src[8] != nullptr && marker->src[9] != nullptr;
+            if (!annotated_ssm && !annotated_gdn) {
+                continue;
+            }
+
+            ggml_tensor * producer = annotated_ssm ? marker->src[0] : marker;
+            ggml_tensor * gather = annotated_ssm
+                ? ggml_sycl_view_base(marker->src[0]->src[0])
+                : ggml_sycl_view_base(marker->src[5]);
+            ggml_tensor * copy = ggml_sycl_find_state_copy(cgraph, producer);
+            if (gather == nullptr || gather->op != GGML_OP_GET_ROWS || copy == nullptr) {
+                continue;
+            }
+            ggml_tensor * state_ids = annotated_ssm ? marker->src[3] : marker->src[7];
+            const ggml_tensor * ids_all = ggml_sycl_view_base(state_ids);
+            const int64_t n_rs = ids_all != nullptr ? ggml_nelements(ids_all) : 0;
+            const int64_t n_seqs = annotated_ssm ? marker->ne[2] : marker->src[2]->ne[3];
+            if (n_rs < n_seqs) {
+                continue;
+            }
+
+            state_io_plan.push_back({ marker, gather, n_rs });
+            state_io_direct.push_back(marker);
+            state_io_elide.push_back(copy);
+            if (annotated_ssm) {
+                state_io_elide.push_back(marker->src[0]);
+            }
+        }
+        if (state_io_debug && !state_io_direct.empty()) {
+            static std::atomic<int> plan_traces { 0 };
+            const int trace = plan_traces.fetch_add(1, std::memory_order_relaxed);
+            if (trace < 8) {
+                fprintf(stderr,
+                        "[treebeard-state-io] event=runtime-plan direct=%zu conflict-gathers=%zu elide=%zu\n",
+                        state_io_direct.size(), state_io_plan.size(), state_io_elide.size());
+            }
+        }
+    }
+
+    const auto state_io_contains = [](const std::vector<ggml_tensor *> & tensors,
+                                      const ggml_tensor * node) {
+        return std::find(tensors.begin(), tensors.end(), node) != tensors.end();
+    };
+    const auto state_io_plan_for_gather = [&](const ggml_tensor * gather) {
+        return std::find_if(state_io_plan.begin(), state_io_plan.end(),
+                            [&](const state_io_plan_entry & entry) {
+                                return entry.gather == gather;
+                            });
+    };
+    const auto state_io_plan_for_marker = [&](const ggml_tensor * marker) {
+        return std::find_if(state_io_plan.begin(), state_io_plan.end(),
+                            [&](const state_io_plan_entry & entry) {
+                                return entry.marker == marker;
+                            });
+    };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        const auto gather_plan = state_io_plan_for_gather(node);
+        if (gather_plan != state_io_plan.end()) {
+            const double tf0 = prof ? now_us() : 0.0;
+            ggml_tensor * marker = gather_plan->marker;
+            if (marker->op == GGML_OP_SSM_CONV) {
+                ggml_sycl_state_io_gather_conflicts(
+                    *sycl_ctx, marker->src[2], marker->src[3], marker->src[6],
+                    marker->src[5], gather_plan->n_rs);
+            } else {
+                GGML_ASSERT(marker->op == GGML_OP_GATED_DELTA_NET);
+                ggml_sycl_state_io_gather_conflicts(
+                    *sycl_ctx, marker->src[6], marker->src[7], marker->src[9],
+                    marker->src[8], gather_plan->n_rs);
+            }
+            if (prof) {
+                sycl_ctx->stream()->wait();
+                fusion_us[GGML_SYCL_FUSION_PROFILE_STATE_IO] += now_us() - tf0;
+                fusion_n[GGML_SYCL_FUSION_PROFILE_STATE_IO]++;
+            }
+            continue;
+        }
+        if (state_io_contains(state_io_elide, node)) {
+            continue;
+        }
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (state_io_contains(state_io_direct, node)) {
+            const double tf0 = prof ? now_us() : 0.0;
+            const auto direct_plan = state_io_plan_for_marker(node);
+            GGML_ASSERT(direct_plan != state_io_plan.end());
+            if (node->op == GGML_OP_SSM_CONV) {
+                ggml_sycl_ssm_conv_state_io(
+                    *sycl_ctx, node, node->src[2], node->src[3], node->src[6],
+                    node->src[4], node->src[5], direct_plan->n_rs);
+            } else {
+                GGML_ASSERT(node->op == GGML_OP_GATED_DELTA_NET);
+                ggml_sycl_gated_delta_net_state_io(
+                    *sycl_ctx, node, node->src[6], node->src[7], node->src[9],
+                    node->src[8], direct_plan->n_rs);
+            }
+            if (prof) {
+                sycl_ctx->stream()->wait();
+                fusion_us[GGML_SYCL_FUSION_PROFILE_STATE_IO] += now_us() - tf0;
+                fusion_n[GGML_SYCL_FUSION_PROFILE_STATE_IO]++;
+            }
             continue;
         }
 
@@ -6682,6 +7012,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (node->op == GGML_OP_MUL_MAT) {
                 add_named_profile_stat(mul_mat_stats, mul_mat_profile_name(node), dt);
             }
+            if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_CPY ||
+                node->op == GGML_OP_CONCAT || node->op == GGML_OP_GATED_DELTA_NET) {
+                add_named_profile_stat(state_op_stats, state_op_profile_name(node), dt);
+            }
         }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -6703,6 +7037,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             "FUSED_MOE_DOWN",
             "FUSED_TOPK_MOE",
             "FUSED_DN_GLUE",
+            "FUSED_STATE_IO",
             "FUSED_RMS_ADD",
             "FUSED_RMS",
         };
@@ -6743,6 +7078,30 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     r.n, r.us / r.n, (double) r.n / 50.0);
         }
         mul_mat_stats.clear();
+
+        auto state_rows = state_op_stats;
+        std::sort(state_rows.begin(), state_rows.end(),
+                  [](const named_profile_stat & a, const named_profile_stat & b) {
+                      return a.us > b.us;
+                  });
+        double state_total_us = 0.0;
+        for (const auto & row : state_rows) {
+            state_total_us += row.us;
+        }
+        fprintf(stderr,
+                "[siq-prof-state] after %d graph evals window-total=%.1f ms families=%zu\n",
+                geval, state_total_us / 1000.0, state_rows.size());
+        const size_t state_limit = std::min<size_t>(state_rows.size(), 32);
+        for (size_t row_index = 0; row_index < state_limit; ++row_index) {
+            const auto & r = state_rows[row_index];
+            fprintf(stderr,
+                    "  %-86s %9.1f ms  %6.1f%%-state"
+                    "  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
+                    r.name.c_str(), r.us / 1000.0,
+                    state_total_us > 0.0 ? 100.0 * r.us / state_total_us : 0.0,
+                    r.n, r.us / r.n, (double) r.n / 50.0);
+        }
+        state_op_stats.clear();
     }
 }
 
