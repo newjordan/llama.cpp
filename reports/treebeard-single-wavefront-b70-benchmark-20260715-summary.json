@@ -1,0 +1,82 @@
+{
+  "candidate_decision": "reject",
+  "candidate_server_sha256": "393397fb42f418f4b360b908d2d639343e262e0cf5c5ac4a4aa58acfb694481c",
+  "fusion_isolation": {
+    "code_edit": {
+      "width_1_gain_pct": -5.0938632264638235,
+      "width_1_parity_rate": 1.0,
+      "width_24_gain_pct": 48.95207087121417,
+      "width_24_parity_rate": 1.0
+    },
+    "free_prose": {
+      "width_1_gain_pct": -3.846691057236551,
+      "width_1_parity_rate": 0.0,
+      "width_24_gain_pct": 51.01021904091294,
+      "width_24_parity_rate": 0.0
+    },
+    "result_sha256": "86c2e79117f9656e62f716f90bbbf88b2602d18bbdef95203a1ea0a03700e348",
+    "samples_sha256": "397a99bd6b73cdd57d606869ed9e0b00c8c3cf16d24bd63d52846adc9d908ac4"
+  },
+  "model_sha256": "25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506",
+  "n12_confirmation": {
+    "candidate_parity_failures": 63,
+    "candidate_samples": 63,
+    "control_parity_failures": 0,
+    "control_samples": 18,
+    "result_sha256": "4f4ad967c695c14cb475682d41985ac0d7f0030688492736622b26dd8b8e4b37",
+    "samples_sha256": "89fdc8d5d7c46ea05f19a7cb54f3e09b5ef3a9ea6040b3be83bcf705ddbb0d09"
+  },
+  "n4_primary": {
+    "candidate_parity_failures": 275,
+    "candidate_samples": 350,
+    "control_parity_failures": 0,
+    "control_samples": 100,
+    "samples_sha256": "983d9105581ed597342ec6dd33efade03fdd0fba420bc225987807799dffec3f",
+    "structured_copy": [
+      {
+        "acceptance": 0.671,
+        "best_width": 24,
+        "candidate_tps": 109.690,
+        "control_tps": 80.650,
+        "depth": 512,
+        "paired_gain_pct": 36.007,
+        "parity_rate": 0.0
+      },
+      {
+        "acceptance": 0.871,
+        "best_width": 24,
+        "candidate_tps": 146.716,
+        "control_tps": 65.224,
+        "depth": 32768,
+        "paired_gain_pct": 124.941,
+        "parity_rate": 0.0
+      },
+      {
+        "acceptance": 0.829,
+        "best_width": 24,
+        "candidate_tps": 83.870,
+        "control_tps": 42.444,
+        "depth": 131072,
+        "paired_gain_pct": 97.601,
+        "parity_rate": 0.0
+      },
+      {
+        "acceptance": 0.973,
+        "best_width": 8,
+        "candidate_tps": 55.057,
+        "control_tps": 29.581,
+        "depth": 256000,
+        "paired_gain_pct": 86.125,
+        "parity_rate": 0.0
+      }
+    ]
+  },
+  "production_restore": {
+    "active": true,
+    "build": "b9627-3fcf1c626",
+    "live_families": 0,
+    "occupied_slots": 0,
+    "restarts": 0,
+    "server_sha256": "211d4115d455ed506c3e23c9cc45312ca2062cf8ea426b11b3273735d0775bff"
+  }
+}

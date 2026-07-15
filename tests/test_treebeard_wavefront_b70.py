@@ -1,0 +1,82 @@
+import argparse
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+
+
+SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "treebeard-wavefront-b70.py"
+SPEC = importlib.util.spec_from_file_location("treebeard_wavefront_b70", SCRIPT_PATH)
+assert SPEC is not None and SPEC.loader is not None
+bench = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = bench
+SPEC.loader.exec_module(bench)
+
+
+class ParsingTests(unittest.TestCase):
+    def test_integer_lists_are_unique(self) -> None:
+        self.assertEqual(bench.parse_int_list("0,1,4", require_zero=True), [0, 1, 4])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            bench.parse_int_list("0,1,1", require_zero=True)
+
+    def test_control_is_required(self) -> None:
+        with self.assertRaises(argparse.ArgumentTypeError):
+            bench.parse_int_list("1,2,4", require_zero=True)
+
+
+class PromptTests(unittest.TestCase):
+    def test_prompt_is_exact_depth(self) -> None:
+        prompt = bench.build_prompt(list(range(20)), [90, 91], 12)
+        self.assertEqual(len(prompt), 12)
+        self.assertEqual(prompt[-2:], [90, 91])
+
+
+class TelemetryTests(unittest.TestCase):
+    def test_round_caps_and_alignment(self) -> None:
+        bench.validate_rounds(4, [4, 2], [3, 2])
+        with self.assertRaises(RuntimeError):
+            bench.validate_rounds(4, [5], [5])
+        with self.assertRaises(RuntimeError):
+            bench.validate_rounds(4, [4], [])
+
+    def test_matched_midpoint_summary(self) -> None:
+        samples = [
+            {
+                "width": 0,
+                "repeat": 0,
+                "control_phase": "before",
+                "predicted_tps": 10.0,
+                "wall_tps": 9.0,
+                "draft_n": 0,
+                "draft_n_accepted": 0,
+                "greedy_parity": True,
+            },
+            {
+                "width": 4,
+                "repeat": 0,
+                "control_phase": None,
+                "predicted_tps": 12.0,
+                "wall_tps": 11.0,
+                "draft_n": 8,
+                "draft_n_accepted": 6,
+                "greedy_parity": True,
+            },
+            {
+                "width": 0,
+                "repeat": 0,
+                "control_phase": "after",
+                "predicted_tps": 10.0,
+                "wall_tps": 9.0,
+                "draft_n": 0,
+                "draft_n_accepted": 0,
+                "greedy_parity": True,
+            },
+        ]
+        row = bench.summarize_matched(samples, [0, 4])[1]
+        self.assertAlmostEqual(row["paired_server_gain_pct"]["mean"], 20.0)
+        self.assertEqual(row["acceptance"], 0.75)
+        self.assertEqual(row["proposal_coverage"], 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

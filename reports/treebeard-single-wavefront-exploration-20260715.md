@@ -1,5 +1,20 @@
 # Treebeard Single-Answer Wavefront Exploration - 2026-07-15
 
+## B70 gate closure
+
+The production-scale gate is now complete and rejects the current n-gram
+speculative path. Wide target verification produced large B70 throughput gains,
+including +124.94% at 32K and +86.13% at 256K on structured continuation, but
+the batched verifier changed the exact greedy token stream. The default-strength
+n=12 confirmation diverged in all 63 speculative samples while all 18 controls
+reproduced exactly. RC4 was restored and remains healthy.
+
+Full evidence and interpretation:
+
+```text
+reports/treebeard-single-wavefront-b70-benchmark-20260715.md
+```
+
 ## Outcome
 
 The local evidence supports a concrete single-agent architecture:
@@ -23,14 +38,15 @@ adaptive A/B/A comparison retained 11/11 final validator passes while reducing
 branch work by 45.0% and multipass-core mean wall by 20.46% relative to fixed
 eight-wide fanout.
 
-The speed path is functionally proven but not yet measured on the B70 target.
-A CPU-only 0.8B gate returned exact greedy token parity in all 54 samples. On a
-high-coverage structured-copy case, verified lookahead increased throughput
-from 26.10 tok/s at width 0 to 53.85 tok/s at width 48. Cases that generated no
-drafts remained approximately flat. These CPU numbers prove the controller and
-verification shape, not a production speed claim.
+The speed path is now measured on the B70 target. Wide verification substantially
+improved the hardware shape, but the current verifier failed the exact-output
+gate. The earlier CPU-only 0.8B result returned exact greedy token parity in all
+54 samples; B70 did not. That difference is the key finding, not a production
+speed claim.
 
-RC4 production remained active throughout. It was not restarted or modified.
+RC4 was interrupted only inside the guarded benchmark workflow and restored
+after every run. Its binary identity, build, inference, restart count, slots,
+and StateTree state all passed the final restoration checks.
 
 ## Branch and build identity
 
@@ -41,8 +57,6 @@ RC4 production remained active throughout. It was not restarted or modified.
 - Candidate `llama-server` SHA-256:
   `393397fb42f418f4b360b908d2d639343e262e0cf5c5ac4a4aa58acfb694481c`
 - RC4 remained `active`, with `NRestarts=0`, after all live gates.
-
-No commit or push was made.
 
 ## What the existing information was saying
 
@@ -260,22 +274,23 @@ letting eight long-lived agents later negotiate a merged answer.
 
 When the n-gram source covered the output, wide verification more than doubled
 CPU throughput. When it did not cover, the speculative system had no material
-effect. The B70 experiment should therefore stratify by proposal coverage and
-not report one blended number.
+effect. The B70 result adds a stronger constraint: every candidate produced a
+proposal, but proposal coverage and acceptance did not guarantee agreement
+with serial greedy decode. Coverage is necessary for speed; exact transition
+parity is necessary for correctness.
 
 ### The next B70 question is narrow
 
-The remaining speed question is not whether verified lookahead can work. It is:
+The width curve is now measured. The remaining question is:
 
 ```text
-For B70 RC4 at real context depths, what width maximizes accepted target tokens
-per target verification wall on workloads where a draftless proposal exists?
+How can B70 retain efficient multi-column target evaluation while anchoring
+every committed transition to the serial width-zero top-1 decision?
 ```
 
-That requires an isolated B70 candidate server with n-gram speculation enabled.
-RC4 currently owns nearly all device memory, so running that gate requires a
-controlled production interruption and exact restore. This branch did not infer
-permission to interrupt the deployed service.
+The current verifier cannot answer that safely. The next implementation must
+detect batched-versus-serial disagreement before commit, then prove shallow
+exact parity before another long-context maintenance run.
 
 ## Parked paths
 
@@ -285,15 +300,13 @@ permission to interrupt the deployed service.
 - An unconditional 12-way semantic fanout remains rejected.
 - The batch-1 expert epilogue remains profile-gated. No fresh RC4 critical-path
   profile was available without disturbing production, so no kernel was added.
-- Jacobi/tree-attention work remains unnecessary until the B70 verifier curve
-  is measured and proposal coverage, rather than verification cost, is proven
-  to be the limit.
+- Jacobi/tree-attention work remains unnecessary until a serial anchor makes
+  wide B70 verification exact-output safe.
 
 ## Verification performed
 
 - Candidate `llama-server` release build completed with Intel oneAPI/SYCL.
-- Python harness tests: 19 passed.
-- Width-sweep tests: 3 passed.
+- Python benchmark/controller tests: 27 passed.
 - `git diff --check`: passed.
 - CPU width gate: 54/54 exact greedy parity.
 - Per-round cap and telemetry alignment: passed for all 54 samples.
@@ -302,20 +315,23 @@ permission to interrupt the deployed service.
 - Transactional StateTree smoke: 5/5 final passes and zero leaked families.
 - Transactional StateTree core: 11/11 final passes across 30 fork/commit
   transactions and zero leaked families.
-- RC4 post-gate health: active, zero restarts, `/health` OK.
+- B70 primary gate: 450 complete measured waves across shallow, 32K, 128K,
+  and the completed 256K structured matrix.
+- B70 confirmation and fusion isolation: 97 additional measured waves.
+- RC4 post-gate health: active, zero restarts, exact executable hash, real
+  inference passed, zero occupied slots, and zero live families.
 
 ## Next controlled gate
 
-With an approved production maintenance window:
+The planned B70 width sweep is complete and rejects the current candidate. The
+next gate should happen at shallow context before another production
+maintenance run:
 
-1. Stop RC4 through the existing guarded deployment workflow.
-2. Launch this candidate from the exact RC4 base with `ngram-simple` configured
-   to 48 and the rejected kernel paths still disabled.
-3. Sweep request caps 0/1/2/4/8/12/24/48 at shallow, 32K, 128K, and 256K depth.
-4. Run low-coverage prose, mixed code/edit, and high-coverage structured-copy
-   cases separately.
-5. Require exact greedy token parity, no hardware faults, and a same-binary A/B/A
-   gain of at least 3% on an identified workload before adding an online width
-   chooser.
-6. Restore and verify the exact RC4 service whether the candidate passes or
-   fails.
+1. Compare batched-verifier and serial width-zero top-1 decisions before every
+   speculative commit.
+2. Localize the first logit divergence by operator and batch width, beginning
+   with the accepted MoE fusions while retaining a generic-backend control.
+3. Fall back to the serial transition whenever the anchor disagrees.
+4. Require exact parity at shallow context before repeating any 32K or 256K
+   measurement.
+5. Only then remeasure throughput and the twelve-agent regression guard.
