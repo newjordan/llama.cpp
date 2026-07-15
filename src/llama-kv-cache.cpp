@@ -417,10 +417,14 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    const char * LLAMA_KV_TREE_RAGGED = getenv("LLAMA_KV_TREE_RAGGED");
+    tree_ragged = LLAMA_KV_TREE_RAGGED ? atoi(LLAMA_KV_TREE_RAGGED) : 1;
+
     // The indexed FATTN ABI used by the ragged StateTree path is currently a
     // SYCL capability. Keep the automatic path fail-closed on every other
     // backend and on cache formats that would need a different kernel.
-    tree_ragged_capable = unified && !v_trans && type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16 && !layers.empty();
+    tree_ragged_capable = tree_ragged > 0 && unified && !v_trans &&
+        type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16 && !layers.empty();
     for (const auto & layer : layers) {
         if (!tree_ragged_capable || !layer.k || !layer.k->buffer || !layer.v || !layer.v->buffer) {
             tree_ragged_capable = false;
@@ -437,7 +441,11 @@ llama_kv_cache::llama_kv_cache(
         }
     }
     if (tree_ragged_capable) {
-        LLAMA_LOG_INFO("%s: Treebeard sequence-ragged indexed attention available\n", __func__);
+        LLAMA_LOG_INFO("%s: LLAMA_KV_TREE_RAGGED = %d; sequence-ragged indexed attention available\n",
+                __func__, tree_ragged);
+    } else if (LLAMA_KV_TREE_RAGGED && tree_ragged <= 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_KV_TREE_RAGGED = %d; sequence-ragged attention disabled\n",
+                __func__, tree_ragged);
     }
 
     {

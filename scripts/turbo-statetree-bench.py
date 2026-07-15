@@ -49,6 +49,8 @@ NON_WORKLOAD_CONFIG_KEYS = frozenset({
     "modes",
     "statetree_lease_ms",
     "statetree_max_state_bytes",
+    "tree_ragged",
+    "kv_page_probe",
 })
 MANDATORY_COMPARISON_METRICS = (
     "fork_server_ms",
@@ -338,6 +340,14 @@ def launch_server(args: argparse.Namespace, log_path: Path) -> subprocess.Popen[
 
     env = os.environ.copy()
     env["GGML_SYCL_ENABLE_FUSION"] = "1"
+    if args.tree_ragged is None:
+        env.pop("LLAMA_KV_TREE_RAGGED", None)
+    else:
+        env["LLAMA_KV_TREE_RAGGED"] = "1" if args.tree_ragged else "0"
+    if args.kv_page_probe:
+        env["LLAMA_KV_PAGE_PROBE"] = "1"
+    else:
+        env.pop("LLAMA_KV_PAGE_PROBE", None)
     log_file = log_path.open("w", encoding="utf-8")
     proc = subprocess.Popen(launch_command, stdout=log_file, stderr=subprocess.STDOUT, env=env)
     proc._turbo_log_file = log_file  # type: ignore[attr-defined]
@@ -1467,6 +1477,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
             "ggml_sycl_enable_fusion": "1",
             "statetree_lease_ms": args.statetree_lease_ms,
             "statetree_max_state_bytes": args.statetree_max_state_bytes,
+            "tree_ragged": args.tree_ragged,
+            "kv_page_probe": args.kv_page_probe,
             "model_identity": file_identity(args.model),
             "cmake_cache": cmake_cache_identity(args.bin),
             "attach": args.attach,
@@ -1548,6 +1560,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--statetree-lease-ms", type=non_negative_int, default=0)
     run.add_argument("--statetree-max-state-bytes", type=non_negative_int, default=0)
     run.add_argument("--source-oneapi", action=argparse.BooleanOptionalAction, default=True)
+    run.add_argument("--tree-ragged", action=argparse.BooleanOptionalAction, default=None)
+    run.add_argument("--kv-page-probe", action=argparse.BooleanOptionalAction, default=False)
     run.add_argument("--attach", action="store_true")
     run.add_argument("--server-pid", type=positive_int)
     run.add_argument("--allow-destructive-attach", action="store_true")

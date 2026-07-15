@@ -180,6 +180,20 @@ drm-resident-vram0:\t80 KiB
 
 
 class RequestTests(unittest.TestCase):
+    def test_launch_records_ragged_control_and_probe_environment(self) -> None:
+        parser = bench.build_parser()
+        args = parser.parse_args(["run", "--label", "env-test", "--no-tree-ragged", "--kv-page-probe"])
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(bench, "port_open", return_value=False), \
+                mock.patch.object(bench.subprocess, "Popen") as popen:
+            process = mock.Mock()
+            popen.return_value = process
+            bench.launch_server(args, Path(directory) / "server.log")
+            environment = popen.call_args.kwargs["env"]
+
+        self.assertEqual(environment["LLAMA_KV_TREE_RAGGED"], "0")
+        self.assertEqual(environment["LLAMA_KV_PAGE_PROBE"], "1")
+
     def test_required_metrics_reject_missing_nonfinite_and_boolean_values(self) -> None:
         for value in (None, True, -1, float("nan"), float("inf")):
             with self.subTest(value=value):

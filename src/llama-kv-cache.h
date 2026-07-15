@@ -301,6 +301,9 @@ private:
     // env: LLAMA_KV_INDEXED_FATTN
     int indexed_fattn = 0;
 
+    // env: LLAMA_KV_TREE_RAGGED (0=disable, 1=automatic; default 1)
+    int tree_ragged = 1;
+
     // True only when the unified f16 KV allocation lives on the SYCL device
     // that implements indexed flash-attention. This is a capability gate, not
     // a runtime tuning knob.

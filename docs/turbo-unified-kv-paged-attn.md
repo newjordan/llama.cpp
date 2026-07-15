@@ -266,6 +266,12 @@ Current Turbo branch state:
   on f16 and dense smoke cases.
 - The row index is physical-row based, not a page table. It is a stepping stone
   toward page-aware FATTN, not the final design.
+- Treebeard shared-prefix families automatically use a sequence-ragged indexed
+  row map when it shortens the physical attention range. Set
+  `LLAMA_KV_TREE_RAGGED=0` for a same-binary disable control; `1` (the default)
+  keeps automatic capability and geometry gating. `LLAMA_KV_PAGE_PROBE=1`
+  reports `tree_ragged`, logical stream count, union rows, and the avoided
+  dense `n_kv` for activation evidence.
 
 ## Implementation Milestones
 
