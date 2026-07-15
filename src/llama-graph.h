@@ -123,6 +123,20 @@ public:
     const int64_t n_embd = 0;
 };
 
+class llm_graph_input_cvec : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_cvec(const llama_adapter_cvec * cvec) : cvec(cvec) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * scales = nullptr; // F32 [1, n_tokens]
+
+private:
+    const llama_adapter_cvec * cvec;
+    std::vector<float> values;
+};
+
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
@@ -601,6 +615,7 @@ struct llm_graph_params {
     ggml_backend_t backend_cpu;
 
     const llama_adapter_cvec     * cvec;
+    bool cvec_seq_mode = false;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
@@ -690,6 +705,7 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
+            cvec_seq_mode == other.cvec_seq_mode &&
             loras == other.loras &&
             cross == other.cross;
     }
@@ -844,6 +860,8 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    mutable ggml_tensor * cvec_token_scales = nullptr;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(

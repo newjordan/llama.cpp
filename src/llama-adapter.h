@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+struct llama_ubatch;
+
 // TODO: pimpl
 
 //
@@ -17,7 +19,11 @@
 struct llama_adapter_cvec {
     ggml_tensor * tensor_for(int il) const;
 
-    ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;
+    ggml_tensor * apply_to(
+            ggml_context * ctx,
+            ggml_tensor * cur,
+                     int   il,
+           ggml_tensor * token_scales = nullptr) const;
 
     bool apply(
             const llama_model & model,
@@ -27,11 +33,28 @@ struct llama_adapter_cvec {
             int32_t il_start,
             int32_t il_end);
 
+    bool is_active() const;
+    bool is_seq_mode() const;
+
+    bool seq_set(llama_seq_id seq_id, float scale);
+    void seq_rm(llama_seq_id seq_id);
+    void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    void seq_keep(llama_seq_id seq_id);
+
+    float seq_get(llama_seq_id seq_id) const;
+    bool validate_ubatch(const llama_ubatch & ubatch) const;
+    void fill_ubatch_scales(const llama_ubatch & ubatch, float * dst) const;
+
 private:
     bool init(const llama_model & model);
 
     int32_t layer_start = -1;
     int32_t layer_end   = -1;
+
+    // Legacy vectors apply context-wide. The first sequence scale switches to
+    // fail-closed request-scoped mode, where unspecified sequences use zero.
+    bool seq_mode = false;
+    std::unordered_map<llama_seq_id, float> seq_scales;
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;

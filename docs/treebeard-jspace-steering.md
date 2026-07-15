@@ -14,7 +14,7 @@ without loading any Qwen3.5 lens, token IDs, layer choices, thresholds, or
 baselines. The target artifact is exactly
 `Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf`.
 
-The first two G0 slices now fail closed on probe-vector identity and require
+The three G0 slices now fail closed on probe-vector identity and require
 exact disabled-path behavior. Every diagnostic
 `--probe-vector` requires a runner-attested full model SHA-256, and its GGUF
 metadata must match the supported Phase-0 schema, exact base-model digest,
@@ -24,8 +24,11 @@ accepted identity is emitted in the result. The B70 gate now also proves
 bit-identical full-vocabulary logits, greedy tokens, and serialized sequence
 state across no-API replay, no-artifact graph rebuild, and explicit
 enable-then-disable. That work exposed and fenced a non-reproducible oneDNN FP32
-MoE-router GEMM while keeping routing on device. This is not a full G0 pass:
-per-sequence reset/cancel/fork/commit/reuse isolation remains open.
+MoE-router GEMM while keeping routing on device. Request-scoped actuator scales
+are now isolated by `llama_seq_id` and covered by exact mixed-batch comparisons
+plus reset, cancel, fork, commit, slot reuse, and StateTree snapshot/materialize
+tests. This completes the G0 actuator identity and lifecycle fence; semantic
+sensor validity and feedback safety remain separate later gates.
 
 ## Control architecture
 
@@ -126,9 +129,9 @@ u_h(t) = u_h(t-1) + x_t - x_(t-h).
 ```
 
 The current probe is an offline final-suffix extractor; that streaming observer
-has not landed. When it does, Phase 1 must keep its state per `llama_seq_id`.
-It must fork, commit, cancel, reset, and snapshot with Treebeard's KV/GDN state.
-It must never be shared by a whole context.
+has not landed. Its future state must use the now-tested per-`llama_seq_id`
+lifecycle path so that it forks, commits, cancels, resets, and snapshots with
+Treebeard's KV/GDN state. It must never be shared by a whole context.
 
 ## Falsification, not folklore
 
@@ -150,7 +153,7 @@ finding is “multiscale pooling helps,” not “Fibonacci helps.”
 
 ## Advancement sequence
 
-1. Finish G0 request-scoped lifecycle isolation.
+1. G0 request-scoped actuator lifecycle isolation: complete.
 2. Fit and freeze held-out, anchor-free semantic sensors `C[l]`.
 3. Compare the Fibonacci bank to all matched pooling controls.
 4. Identify the exact-runtime response `G(x)` for candidate actuators `D[l]`.

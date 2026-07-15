@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <clocale>
@@ -40,6 +41,7 @@ struct probe_args {
     std::vector<char *>       common_argv;
     std::string               verified_model_sha256;
     size_t                    disabled_invariance_tokens = 0;
+    size_t                    sequence_lifecycle_tokens = 0;
     bool                      include_residual_vector = false;
     size_t                    fibonacci_pool_max_tokens = 0;
     bool                      self_test = false;
@@ -312,6 +314,19 @@ static size_t parse_disabled_invariance_tokens(const std::string & value) {
     return static_cast<size_t>(parsed);
 }
 
+static size_t parse_sequence_lifecycle_tokens(const std::string & value) {
+    const std::string item = trim(value);
+    errno = 0;
+    char * parse_end = nullptr;
+    const unsigned long long parsed = std::strtoull(item.c_str(), &parse_end, 10);
+    if (item.empty() || errno == ERANGE || parse_end == item.c_str() || *parse_end != '\0' ||
+            parsed == 0 || parsed > 16) {
+        throw std::invalid_argument(
+                "--verify-sequence-lifecycle must be an integer from 1 through 16");
+    }
+    return static_cast<size_t>(parsed);
+}
+
 static probe_args::named_vector parse_named_vector(const std::string & value) {
     const size_t separator = value.find('=');
     if (separator == std::string::npos) {
@@ -354,6 +369,7 @@ static probe_args preprocess_args(int argc, char ** argv) {
     constexpr const char * fibonacci_prefix = "--fibonacci-pool-max=";
     constexpr const char * model_sha_prefix = "--verified-model-sha256=";
     constexpr const char * disabled_invariance_prefix = "--verify-disabled-invariance=";
+    constexpr const char * sequence_lifecycle_prefix = "--verify-sequence-lifecycle=";
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
@@ -376,6 +392,18 @@ static probe_args preprocess_args(int argc, char ** argv) {
         if (arg.compare(0, std::strlen(disabled_invariance_prefix), disabled_invariance_prefix) == 0) {
             result.disabled_invariance_tokens = parse_disabled_invariance_tokens(
                     arg.substr(std::strlen(disabled_invariance_prefix)));
+            continue;
+        }
+        if (arg == "--verify-sequence-lifecycle") {
+            if (++i >= argc) {
+                throw std::invalid_argument("--verify-sequence-lifecycle requires a token count");
+            }
+            result.sequence_lifecycle_tokens = parse_sequence_lifecycle_tokens(argv[i]);
+            continue;
+        }
+        if (arg.compare(0, std::strlen(sequence_lifecycle_prefix), sequence_lifecycle_prefix) == 0) {
+            result.sequence_lifecycle_tokens = parse_sequence_lifecycle_tokens(
+                    arg.substr(std::strlen(sequence_lifecycle_prefix)));
             continue;
         }
         if (arg == "--verified-model-sha256") {
@@ -575,6 +603,8 @@ static void print_usage(int, char ** argv) {
     std::printf("                           pool residual columns over 1,2,3,5,... token horizons\n");
     std::printf("  --verify-disabled-invariance N\n");
     std::printf("                           require exact disabled-path parity for N greedy tokens\n");
+    std::printf("  --verify-sequence-lifecycle N\n");
+    std::printf("                           require exact two-sequence isolation for N greedy tokens\n");
     std::printf("  --self-test            run the model-independent deterministic smoke test\n\n");
 }
 
@@ -602,6 +632,9 @@ static int run_self_test() {
     }
     if (parse_disabled_invariance_tokens("32") != 32) {
         throw std::runtime_error("disabled-invariance token parser self-test failed");
+    }
+    if (parse_sequence_lifecycle_tokens("16") != 16) {
+        throw std::runtime_error("sequence-lifecycle token parser self-test failed");
     }
     bool rejected_bad_pool_max = false;
     try {
@@ -947,14 +980,14 @@ static std::vector<float> decode_one_token_logits(
     return std::vector<float>(logits, logits + n_vocab);
 }
 
-static std::vector<uint8_t> capture_sequence_state(llama_context * ctx) {
+static std::vector<uint8_t> capture_sequence_state(llama_context * ctx, llama_seq_id seq_id = 0) {
     llama_synchronize(ctx);
-    const size_t size = llama_state_seq_get_size(ctx, 0);
+    const size_t size = llama_state_seq_get_size(ctx, seq_id);
     if (size == 0) {
         throw std::runtime_error("disabled-invariance sequence state is empty");
     }
     std::vector<uint8_t> data(size);
-    const size_t written = llama_state_seq_get_data(ctx, data.data(), data.size(), 0);
+    const size_t written = llama_state_seq_get_data(ctx, data.data(), data.size(), seq_id);
     if (written != data.size()) {
         throw std::runtime_error("disabled-invariance sequence state serialization failed");
     }
@@ -966,6 +999,93 @@ struct disabled_invariance_trace {
     std::vector<llama_token>        sampled_tokens;
     std::vector<uint8_t>            sequence_state;
 };
+
+static std::array<std::vector<float>, 2> decode_sequence_pair(
+        llama_context * ctx,
+        llama_token     token_0,
+        llama_token     token_1,
+        llama_pos       pos) {
+    llama_batch batch = llama_batch_init(2, 0, 1);
+    batch.n_tokens = 2;
+    batch.token[0] = token_0;
+    batch.token[1] = token_1;
+    batch.pos[0] = pos;
+    batch.pos[1] = pos;
+    batch.n_seq_id[0] = 1;
+    batch.n_seq_id[1] = 1;
+    batch.seq_id[0][0] = 0;
+    batch.seq_id[1][0] = 1;
+    batch.logits[0] = true;
+    batch.logits[1] = true;
+
+    const int32_t rc = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    if (rc != 0) {
+        throw std::runtime_error("sequence-lifecycle paired decode failed with code " + std::to_string(rc));
+    }
+    llama_synchronize(ctx);
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    std::array<std::vector<float>, 2> result;
+    for (int32_t i = 0; i < 2; ++i) {
+        const float * logits = llama_get_logits_ith(ctx, i);
+        if (logits == nullptr) {
+            throw std::runtime_error("sequence-lifecycle paired logits are unavailable");
+        }
+        result[i].assign(logits, logits + n_vocab);
+    }
+    return result;
+}
+
+static std::array<disabled_invariance_trace, 2> run_sequence_pair_trace(
+        llama_context *                  ctx,
+        const std::vector<llama_token> & prompt_tokens,
+        size_t                           token_count,
+        float                            scale_0,
+        float                            scale_1) {
+    if (llama_adapter_cvec_seq_set(ctx, 0, scale_0) != 0 ||
+            llama_adapter_cvec_seq_set(ctx, 1, scale_1) != 0) {
+        throw std::runtime_error("failed to set request-scoped control-vector scales");
+    }
+
+    llama_synchronize(ctx);
+    llama_memory_t memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        throw std::runtime_error("sequence-lifecycle context has no model memory");
+    }
+    llama_memory_clear(memory, true);
+
+    std::array<std::vector<float>, 2> logits;
+    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+        logits = decode_sequence_pair(ctx, prompt_tokens[i], prompt_tokens[i], static_cast<llama_pos>(i));
+    }
+
+    std::array<disabled_invariance_trace, 2> result;
+    for (auto & trace : result) {
+        trace.logits.reserve(token_count);
+        trace.sampled_tokens.reserve(token_count);
+    }
+
+    for (size_t step = 0; step < token_count; ++step) {
+        std::array<llama_token, 2> sampled;
+        for (size_t seq = 0; seq < result.size(); ++seq) {
+            sampled[seq] = greedy_top_1(logits[seq]);
+            result[seq].logits.push_back(std::move(logits[seq]));
+            result[seq].sampled_tokens.push_back(sampled[seq]);
+        }
+        if (step + 1 < token_count) {
+            logits = decode_sequence_pair(
+                    ctx,
+                    sampled[0],
+                    sampled[1],
+                    static_cast<llama_pos>(prompt_tokens.size() + step));
+        }
+    }
+
+    result[0].sequence_state = capture_sequence_state(ctx, 0);
+    result[1].sequence_state = capture_sequence_state(ctx, 1);
+    return result;
+}
 
 static disabled_invariance_trace finish_disabled_invariance_trace(
         llama_context *            ctx,
@@ -1037,6 +1157,97 @@ static void require_trace_identity(
     if (baseline.sequence_state != candidate.sequence_state) {
         throw std::runtime_error(std::string(label) + " changed serialized logical sequence state");
     }
+}
+
+static json verify_sequence_lifecycle(
+        llama_context *                  ctx,
+        const std::vector<llama_token> & prompt_tokens,
+        size_t                           token_count) {
+    const auto all_off = run_sequence_pair_trace(ctx, prompt_tokens, token_count, 0.0f, 0.0f);
+    const auto all_on  = run_sequence_pair_trace(ctx, prompt_tokens, token_count, 1.0f, 1.0f);
+    const auto mixed   = run_sequence_pair_trace(ctx, prompt_tokens, token_count, 1.0f, 0.0f);
+
+    require_trace_identity(all_on[0], mixed[0], "mixed active sequence");
+    require_trace_identity(all_off[1], mixed[1], "mixed protected sequence");
+
+    bool actuator_observed = false;
+    for (size_t step = 0; step < token_count && !actuator_observed; ++step) {
+        actuator_observed = !bit_identical(all_on[0].logits[step], all_off[0].logits[step]);
+    }
+    if (!actuator_observed) {
+        throw std::runtime_error("sequence-lifecycle vector produced no observable logit change");
+    }
+
+    if (!llama_adapter_cvec_seq_mode(ctx) ||
+            llama_adapter_cvec_seq_get(ctx, 0) != 1.0f ||
+            llama_adapter_cvec_seq_get(ctx, 1) != 0.0f) {
+        throw std::runtime_error("sequence-lifecycle mixed scale state is inconsistent");
+    }
+
+    // Snapshot the active head, then exercise the exact whole-sequence hooks
+    // used by server reset/cancel/fork/commit/slot-reuse paths.
+    const auto snapshot_state = capture_sequence_state(ctx, 0);
+    const float snapshot_scale = llama_adapter_cvec_seq_get(ctx, 0);
+
+    common_context_seq_rm(ctx, 1, -1, -1);
+    common_context_seq_cp(ctx, 0, 1, -1, -1);
+    if (llama_adapter_cvec_seq_get(ctx, 1) != snapshot_scale) {
+        throw std::runtime_error("sequence-lifecycle fork did not copy controller state");
+    }
+
+    common_context_seq_rm(ctx, 1, -1, -1);
+    if (llama_adapter_cvec_seq_get(ctx, 1) != 0.0f) {
+        throw std::runtime_error("sequence-lifecycle cancellation did not clear controller state");
+    }
+
+    if (llama_adapter_cvec_seq_set(ctx, 1, -0.5f) != 0) {
+        throw std::runtime_error("sequence-lifecycle slot-reuse setup failed");
+    }
+    common_context_seq_rm(ctx, 1, -1, -1);
+    if (llama_adapter_cvec_seq_get(ctx, 1) != 0.0f) {
+        throw std::runtime_error("sequence-lifecycle slot reuse retained controller state");
+    }
+
+    common_context_seq_rm(ctx, 0, -1, -1);
+    const size_t restored = llama_state_seq_set_data(
+            ctx, snapshot_state.data(), snapshot_state.size(), 0);
+    if (restored != snapshot_state.size() ||
+            llama_adapter_cvec_seq_set(ctx, 0, snapshot_scale) != 0 ||
+            capture_sequence_state(ctx, 0) != snapshot_state) {
+        throw std::runtime_error("sequence-lifecycle snapshot restore did not reproduce branch state");
+    }
+
+    if (llama_adapter_cvec_seq_set(ctx, 1, -1.0f) != 0) {
+        throw std::runtime_error("sequence-lifecycle commit setup failed");
+    }
+    llama_memory_seq_keep(llama_get_memory(ctx), 0);
+    llama_adapter_cvec_seq_keep(ctx, 0);
+    if (llama_adapter_cvec_seq_get(ctx, 0) != snapshot_scale ||
+            llama_adapter_cvec_seq_get(ctx, 1) != 0.0f) {
+        throw std::runtime_error("sequence-lifecycle commit retained losing controller state");
+    }
+
+    return {
+        { "status", "pass" },
+        { "mode", "per_token_scale_by_llama_seq_id" },
+        { "sequences", 2 },
+        { "steps", token_count },
+        { "same_shape_controls", { "all_off", "all_on", "mixed" } },
+        { "active_matches_all_on_bit_exact", true },
+        { "protected_matches_all_off_bit_exact", true },
+        { "serialized_state_matches_controls", true },
+        { "actuator_change_observed", true },
+        { "lifecycle", {
+            { "reset", "pass" },
+            { "cancel", "pass" },
+            { "fork", "pass" },
+            { "commit", "pass" },
+            { "slot_reuse", "pass" },
+            { "snapshot_restore", "pass" },
+        } },
+        { "logit_bytes_compared", 2 * token_count * all_on[0].logits[0].size() * sizeof(float) },
+        { "sequence_state_bytes_compared", mixed[0].sequence_state.size() + mixed[1].sequence_state.size() },
+    };
 }
 
 static evaluation_result evaluate_prompt(
@@ -1348,6 +1559,16 @@ static int run_probe(common_params & params, const probe_args & probe) {
         };
     }
 
+    json sequence_lifecycle;
+    if (probe.sequence_lifecycle_tokens > 0) {
+        const auto enabled = compose_control_vectors(
+                nullptr, loaded_vectors.front().data, 1.0f, cvec_full_size);
+        apply_control_vector(ctx, &enabled, layer_start, layer_end, cvec_full_size);
+        sequence_lifecycle = verify_sequence_lifecycle(
+                ctx, prompt_tokens, probe.sequence_lifecycle_tokens);
+        sequence_lifecycle["artifact"] = loaded_vectors.front().spec.path;
+    }
+
     char description[512] = {};
     llama_model_desc(model, description, sizeof(description));
 
@@ -1375,7 +1596,7 @@ static int run_probe(common_params & params, const probe_args & probe) {
         { "temperature", 1.0 },
         { "residual_tensor", residual_capture.tensor_name },
         { "state_reset", "llama_memory_clear(data=true) before every evaluation" },
-        { "warmup", probe.disabled_invariance_tokens > 0 ?
+        { "warmup", (probe.disabled_invariance_tokens > 0 || probe.sequence_lifecycle_tokens > 0) ?
                 "common empty run before invariant baseline" : "disabled" },
     };
     if (probe.fibonacci_pool_max_tokens > 0) {
@@ -1404,6 +1625,9 @@ static int run_probe(common_params & params, const probe_args & probe) {
     output["baseline"] = baseline.output;
     if (!disabled_invariance.is_null()) {
         output["disabled_invariance"] = std::move(disabled_invariance);
+    }
+    if (!sequence_lifecycle.is_null()) {
+        output["sequence_lifecycle"] = std::move(sequence_lifecycle);
     }
     output["sweeps"] = json::array();
 
@@ -1508,6 +1732,16 @@ int main(int argc, char ** argv) {
                         "--verify-disabled-invariance cannot be combined with base control vectors");
             }
         }
+        if (probe.sequence_lifecycle_tokens > 0) {
+            if (probe.probe_vectors.size() != 1) {
+                throw std::invalid_argument(
+                        "--verify-sequence-lifecycle requires exactly one --probe-vector");
+            }
+            if (!params.control_vectors.empty()) {
+                throw std::invalid_argument(
+                        "--verify-sequence-lifecycle cannot be combined with base control vectors");
+            }
+        }
         for (size_t i = 0; i < probe.probe_vectors.size(); ++i) {
             for (size_t j = i + 1; j < probe.probe_vectors.size(); ++j) {
                 if (probe.probe_vectors[i].name == probe.probe_vectors[j].name) {
@@ -1521,7 +1755,10 @@ int main(int argc, char ** argv) {
         }
 
         params.n_predict = 0;
-        params.warmup = probe.disabled_invariance_tokens > 0;
+        params.warmup = probe.disabled_invariance_tokens > 0 || probe.sequence_lifecycle_tokens > 0;
+        if (probe.sequence_lifecycle_tokens > 0) {
+            params.n_parallel = std::max(params.n_parallel, 2);
+        }
 
         llama_backend_init();
         backend_initialized = true;

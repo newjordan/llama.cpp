@@ -126,6 +126,13 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
+    bool adapter_cvec_seq_set(llama_seq_id seq_id, float scale);
+    void adapter_cvec_seq_rm(llama_seq_id seq_id);
+    void adapter_cvec_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    void adapter_cvec_seq_keep(llama_seq_id seq_id);
+    bool adapter_cvec_seq_mode() const;
+    float adapter_cvec_seq_get(llama_seq_id seq_id) const;
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation

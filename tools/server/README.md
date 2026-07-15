@@ -464,6 +464,17 @@ By default, this value is set to `0`, meaning no tokens are kept. Use `-1` to re
 
 `speculative.serial_anchor`: Before accepting a speculative block, independently evaluate its greedy target transitions serially through the first draft rejection. The server audits the batched result against that serial commit frontier, restores the checkpoint, and reconstructs the committed KV state serially even when the sampled tokens match; a matching token vector alone does not prove serial-equivalent state. Requires `temperature` 0 and does not support backend sampling. Default: `false`.
 
+`jspace_control_scale`: Request-scoped finite scale for the server's loaded
+control vector. The first request that supplies this field enters fail-closed
+sequence mode: any request that omits the field is unsteered (`0.0`), and the
+transition is accepted only while no slot is active or StateTree-reserved.
+Controller state follows whole-sequence reset, cancel, fork, commit, slot reuse,
+and StateTree snapshot/materialize operations. A cached prompt is discarded
+when its scale changes, and ordinary token-only prompt-cache reuse is disabled
+in sequence mode because it cannot identify steered KV/GDN state. Separate
+draft-context speculation is rejected for requests using this field. Default:
+omitted; after sequence mode begins, omission means `0.0`.
+
 `stream`: Allows receiving each predicted token in real-time instead of waiting for the completion to finish (uses a different response format). To enable this, set to `true`.
 
 `stop`: Specify a JSON array of stopping strings.

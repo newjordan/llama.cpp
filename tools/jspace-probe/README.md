@@ -59,6 +59,17 @@ serialized logical sequence state. A mismatch terminates the run and reports
 the first affected step plus logit mismatch magnitude; only a complete pass is
 written as `disabled_invariance.status = "pass"`.
 
+`--verify-sequence-lifecycle N` is the G0 request-isolation gate. It accepts
+one identity-bound probe vector, no base control vectors, and 1 through 16
+greedy tokens, and requires at least two logical sequences. It evaluates
+same-shape all-off, all-on, and mixed-scale batches. In the mixed batch, the
+active sequence must bit-match its all-on logits, tokens, and serialized state,
+while the protected sequence must bit-match its all-off equivalents. It then
+exercises reset, cancel, fork, commit, slot reuse, and snapshot restore of the
+sequence-scoped controller scale. Any cross-sequence contamination or lifecycle
+state mismatch fails the command; a complete pass is written as
+`sequence_lifecycle.status = "pass"`.
+
 The B70 acceptance harness is `scripts/treebeard-jspace-b70-guarded.sh`. It
 hashes the model and candidate runtime, tests five fixed prompt strata (including
 a prompt that crosses the configured batch boundary), checks the kernel journal,
@@ -126,6 +137,8 @@ The fail-closed artifact admission check is recorded in
 [`reports/treebeard-jspace-g0-identity-20260715.md`](../../reports/treebeard-jspace-g0-identity-20260715.md).
 The disabled-path fence and the B70 MoE-router determinism fix are recorded in
 [`reports/treebeard-jspace-g0-disabled-invariance-20260715.md`](../../reports/treebeard-jspace-g0-disabled-invariance-20260715.md).
+The request-scoped actuator lifecycle gate is recorded in
+[`reports/treebeard-jspace-g0-sequence-lifecycle-20260715.md`](../../reports/treebeard-jspace-g0-sequence-lifecycle-20260715.md).
 
 The baseline full-vocabulary logits stay in-process (about 1 MiB for Qwen3.6)
 and are not serialized. Each sweep run reports full-vocabulary

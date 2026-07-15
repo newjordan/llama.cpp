@@ -23,6 +23,10 @@ UBATCH=${TREEBEARD_JSPACE_UBATCH:-$BATCH}
 NO_KV_OFFLOAD=${TREEBEARD_JSPACE_NO_KV_OFFLOAD:-0}
 NGL=${TREEBEARD_JSPACE_NGL:-99}
 VERIFY_TOKENS=${TREEBEARD_JSPACE_VERIFY_TOKENS:-8}
+VERIFY_LIFECYCLE_TOKENS=${TREEBEARD_JSPACE_VERIFY_LIFECYCLE_TOKENS:-0}
+RUN_SERVER_LIFECYCLE=${TREEBEARD_JSPACE_RUN_SERVER_LIFECYCLE:-0}
+CANDIDATE_PORT=${TREEBEARD_JSPACE_SERVER_PORT:-18093}
+CANDIDATE_PID=
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-jspace-b70/$RUN_ID"
 CASE_IDS=(code neutral factual json long)
@@ -45,6 +49,11 @@ restore_service() {
     local ok=1
     trap - EXIT INT TERM HUP
     set +e
+    if [[ -n "$CANDIDATE_PID" ]]; then
+        kill "$CANDIDATE_PID" 2>/dev/null || true
+        wait "$CANDIDATE_PID" 2>/dev/null || true
+        CANDIDATE_PID=
+    fi
     systemctl --user start "$SERVICE" || ok=0
     for _ in {1..240}; do
         if curl -fsS --max-time 3 "http://127.0.0.1:$LIVE_PORT/health" \
@@ -114,12 +123,18 @@ before_pid=$(systemctl --user show "$SERVICE" -p MainPID --value)
 before_exe=$(readlink -f "/proc/$before_pid/exe")
 sha256sum "$before_exe" > "$OUT/maintenance/before-server.sha256"
 [[ $(awk '{print $1}' "$OUT/maintenance/before-server.sha256") == "$EXPECTED_SERVER_SHA" ]]
-sha256sum "$BUILD/bin/llama-jspace-probe" "$BUILD/bin/libggml-sycl.so" \
+sha256sum "$BUILD/bin/llama-jspace-probe" "$BUILD/bin/llama-server" \
+    "$BUILD/bin/libllama-server-impl.so" "$BUILD/bin/libggml-sycl.so" \
     > "$OUT/candidate/runtime.sha256"
 sha256sum "$MODEL" > "$OUT/candidate/model.sha256"
 [[ $(awk '{print $1}' "$OUT/candidate/model.sha256") == "$MODEL_SHA" ]]
 git -C "$WORKTREE" rev-parse HEAD > "$OUT/candidate/source-head.txt"
-git -C "$WORKTREE" diff -- ggml/src/ggml-sycl/ggml-sycl.cpp tools/jspace-probe scripts/treebeard-jspace-b70-guarded.sh \
+git -C "$WORKTREE" diff -- \
+    common/common.cpp include/llama.h src/llama-adapter.cpp src/llama-adapter.h \
+    src/llama-context.cpp src/llama-context.h src/llama-graph.cpp src/llama-graph.h \
+    ggml/src/ggml-sycl/ggml-sycl.cpp tools/jspace-probe tools/server/server-context.cpp \
+    tools/server/server-task.cpp tools/server/server-task.h \
+    scripts/treebeard-jspace-b70-guarded.sh scripts/treebeard-jspace-server-lifecycle.py \
     > "$OUT/candidate/source.patch"
 date --iso-8601=seconds > "$OUT/maintenance/start-date.txt"
 
@@ -162,6 +177,9 @@ invariance_args=()
 if [[ "$VERIFY_TOKENS" != 0 ]]; then
     invariance_args+=(--verify-disabled-invariance "$VERIFY_TOKENS")
 fi
+if [[ "$VERIFY_LIFECYCLE_TOKENS" != 0 ]]; then
+    invariance_args+=(--verify-sequence-lifecycle "$VERIFY_LIFECYCLE_TOKENS")
+fi
 
 for i in "${!CASE_IDS[@]}"; do
     case_id=${CASE_IDS[$i]}
@@ -201,6 +219,16 @@ for i in "${!CASE_IDS[@]}"; do
             .disabled_invariance.sequence_state_bit_identical == true
         ' "$OUT/jspace-disabled-$case_id.json" >/dev/null
     fi
+    if [[ "$VERIFY_LIFECYCLE_TOKENS" != 0 ]]; then
+        jq -e --argjson steps "$VERIFY_LIFECYCLE_TOKENS" '
+            .sequence_lifecycle.status == "pass" and
+            .sequence_lifecycle.steps == $steps and
+            .sequence_lifecycle.active_matches_all_on_bit_exact == true and
+            .sequence_lifecycle.protected_matches_all_off_bit_exact == true and
+            .sequence_lifecycle.serialized_state_matches_controls == true and
+            ([.sequence_lifecycle.lifecycle[]] | all(. == "pass"))
+        ' "$OUT/jspace-disabled-$case_id.json" >/dev/null
+    fi
 done
 
 if [[ "$VERIFY_TOKENS" == 0 ]]; then
@@ -217,8 +245,60 @@ else
         all_pass: all(.disabled_invariance.status == "pass"),
         total_logit_bytes_compared: (map(.disabled_invariance.logit_bytes_compared) | add),
         sequence_state_bytes_per_case: map(.disabled_invariance.sequence_state_bytes_compared),
+        sequence_lifecycle_all_pass: all(
+            (.sequence_lifecycle.status // "pass") == "pass"),
+        sequence_lifecycle_logit_bytes_compared: (
+            map(.sequence_lifecycle.logit_bytes_compared // 0) | add),
         prompt_token_counts: map(.probe.prompt_token_count)
     }' "$OUT"/jspace-disabled-*.json > "$OUT/jspace-disabled-summary.json"
+fi
+
+if [[ "$RUN_SERVER_LIFECYCLE" == 1 ]]; then
+    if ss -ltn "( sport = :$CANDIDATE_PORT )" | rg -q LISTEN; then
+        printf 'CANDIDATE_PORT_BUSY port=%s\n' "$CANDIDATE_PORT" >&2
+        exit 1
+    fi
+    env \
+        GGML_SYCL_ENABLE_FUSION="$ENABLE_FUSION" \
+        GGML_SYCL_DISABLE_GRAPH=1 \
+        GGML_SYCL_ENABLE_MOE_PIPELINE=0 \
+        GGML_SYCL_ENABLE_MOE_DOWN_GROUPED=0 \
+        "${mode_env[@]}" \
+        taskset -c 0-10,12-15 "$BUILD/bin/llama-server" \
+        -m "$MODEL" -ngl "$NGL" -ncmoe 0 --no-op-offload "$kv_offload_arg" \
+        -c 512 -np 4 -kvu -fa on -ctk f16 -ctv f16 \
+        -b "$BATCH" -ub "$UBATCH" -t 15 \
+        --host 127.0.0.1 --port "$CANDIDATE_PORT" --metrics --spec-type none \
+        --control-vector "$VECTOR" --control-vector-layer-range 39 39 \
+        --statetree-max-snapshot-bytes 536870912 \
+        -a treebeard-jspace-sequence-lifecycle-b70 \
+        > "$OUT/candidate/server.log" 2>&1 &
+    CANDIDATE_PID=$!
+    printf '%s\n' "$CANDIDATE_PID" > "$OUT/candidate/server.pid"
+    for _ in {1..300}; do
+        if curl -fsS --max-time 3 "http://127.0.0.1:$CANDIDATE_PORT/health" \
+            > "$OUT/candidate/server-health.json" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$CANDIDATE_PID" 2>/dev/null; then
+            tail -200 "$OUT/candidate/server.log" >&2 || true
+            exit 1
+        fi
+        sleep 1
+    done
+    curl -fsS --max-time 5 "http://127.0.0.1:$CANDIDATE_PORT/props" \
+        > "$OUT/candidate/server-props.json"
+    jq -e '.total_slots == 4 and .default_generation_settings.n_ctx == 512' \
+        "$OUT/candidate/server-props.json" >/dev/null
+    python3 "$WORKTREE/scripts/treebeard-jspace-server-lifecycle.py" \
+        --port "$CANDIDATE_PORT" --timeout 300 \
+        --out "$OUT/jspace-server-lifecycle.json" \
+        > "$OUT/candidate/server-lifecycle-console.log" 2>&1
+    jq -e '.status == "pass" and ([.checks[]] | all(. == "pass"))' \
+        "$OUT/jspace-server-lifecycle.json" >/dev/null
+    kill "$CANDIDATE_PID"
+    wait "$CANDIDATE_PID" || true
+    CANDIDATE_PID=
 fi
 
 journalctl -k --since "$(cat "$OUT/maintenance/start-date.txt")" --no-pager \

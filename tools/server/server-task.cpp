@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cmath>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -79,6 +81,7 @@ json task_params::to_json(bool only_metrics) const {
             {"speculative.types",         common_speculative_type_name_str(speculative.types)},
             {"speculative.n_max",         speculative_n_max},
             {"speculative.serial_anchor", speculative_serial_anchor},
+            {"jspace_control_scale",      jspace_control_scale ? json(*jspace_control_scale) : json(nullptr)},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -138,6 +141,7 @@ json task_params::to_json(bool only_metrics) const {
         {"speculative.types",         common_speculative_type_name_str(speculative.types)},
         {"speculative.n_max",         speculative_n_max},
         {"speculative.serial_anchor", speculative_serial_anchor},
+        {"jspace_control_scale",      jspace_control_scale ? json(*jspace_control_scale) : json(nullptr)},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -281,6 +285,13 @@ task_params server_task::params_from_json_cmpl(
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
     params.speculative_n_max = json_value(data,      "speculative.n_max",  defaults.speculative_n_max);
     params.speculative_serial_anchor = json_value(data, "speculative.serial_anchor", false);
+    if (data.contains("jspace_control_scale")) {
+        const float scale = json_value(data, "jspace_control_scale", 0.0f);
+        if (!std::isfinite(scale)) {
+            throw std::runtime_error("jspace_control_scale must be finite");
+        }
+        params.jspace_control_scale = scale;
+    }
     if (params.speculative_n_max < -1) {
         throw std::runtime_error("speculative.n_max must be -1 or non-negative");
     }

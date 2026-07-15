@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <optional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -101,6 +102,10 @@ struct task_params {
     // Per-request cap for speculative proposals. -1 uses the server default.
     int32_t speculative_n_max = -1;
     bool speculative_serial_anchor = false;
+
+    // Experimental request-scoped scale for the server's loaded control
+    // vector. Absence means protected scale zero once sequence mode is active.
+    std::optional<float> jspace_control_scale;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;

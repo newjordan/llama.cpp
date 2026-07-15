@@ -1266,7 +1266,44 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::adapter_cvec_seq_set(llama_seq_id seq_id, float scale) {
+    const bool was_seq_mode = cvec->is_seq_mode();
+    if (!cvec->seq_set(seq_id, scale)) {
+        return false;
+    }
+    if (!was_seq_mode) {
+        sched_need_reserve = true;
+    }
+    return true;
+}
+
+void llama_context::adapter_cvec_seq_rm(llama_seq_id seq_id) {
+    cvec->seq_rm(seq_id);
+}
+
+void llama_context::adapter_cvec_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    cvec->seq_cp(seq_id_src, seq_id_dst);
+}
+
+void llama_context::adapter_cvec_seq_keep(llama_seq_id seq_id) {
+    cvec->seq_keep(seq_id);
+}
+
+bool llama_context::adapter_cvec_seq_mode() const {
+    return cvec->is_seq_mode();
+}
+
+float llama_context::adapter_cvec_seq_get(llama_seq_id seq_id) const {
+    return cvec->seq_get(seq_id);
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (!cvec->validate_ubatch(ubatch)) {
+        LLAMA_LOG_ERROR("%s: a token belongs to sequences with conflicting control-vector scales\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2313,6 +2350,7 @@ llm_graph_params llama_context::graph_params(
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
+        /*.cvec_seq_mode =*/ cvec->is_seq_mode(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
@@ -3709,6 +3747,30 @@ int32_t llama_set_adapter_cvec(
     bool res = ctx->set_adapter_cvec(data, len, n_embd, il_start, il_end);
 
     return res ? 0 : -1;
+}
+
+int32_t llama_adapter_cvec_seq_set(llama_context * ctx, llama_seq_id seq_id, float scale) {
+    return ctx->adapter_cvec_seq_set(seq_id, scale) ? 0 : -1;
+}
+
+void llama_adapter_cvec_seq_rm(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->adapter_cvec_seq_rm(seq_id);
+}
+
+void llama_adapter_cvec_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    ctx->adapter_cvec_seq_cp(seq_id_src, seq_id_dst);
+}
+
+void llama_adapter_cvec_seq_keep(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->adapter_cvec_seq_keep(seq_id);
+}
+
+bool llama_adapter_cvec_seq_mode(const llama_context * ctx) {
+    return ctx->adapter_cvec_seq_mode();
+}
+
+float llama_adapter_cvec_seq_get(const llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->adapter_cvec_seq_get(seq_id);
 }
 
 //

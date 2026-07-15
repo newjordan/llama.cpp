@@ -3,9 +3,11 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-batch.h"
 
 #include <map>
 #include <cassert>
+#include <cmath>
 #include <sstream>
 #include <stdexcept>
 
@@ -19,10 +21,25 @@ ggml_tensor * llama_adapter_cvec::tensor_for(int il) const {
     return tensors[il];
 }
 
-ggml_tensor * llama_adapter_cvec::apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const {
+ggml_tensor * llama_adapter_cvec::apply_to(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+                 int   il,
+       ggml_tensor * token_scales) const {
     ggml_tensor * layer_dir = tensor_for(il);
     if (layer_dir != nullptr) {
-        cur = ggml_add(ctx, cur, layer_dir);
+        if (token_scales == nullptr) {
+            cur = ggml_add(ctx, cur, layer_dir);
+        } else {
+            GGML_ASSERT(token_scales->ne[0] == 1);
+            GGML_ASSERT(token_scales->ne[1] == cur->ne[1]);
+
+            // This K=1 matrix product is the outer product
+            // direction[:, layer] * scale[token].
+            ggml_tensor * layer_dir_2d = ggml_reshape_2d(ctx, layer_dir, 1, layer_dir->ne[0]);
+            ggml_tensor * scaled_dir = ggml_mul_mat(ctx, layer_dir_2d, token_scales);
+            cur = ggml_add(ctx, cur, scaled_dir);
+        }
     }
 
     return cur;
@@ -104,6 +121,8 @@ bool llama_adapter_cvec::apply(
         // disable the current control vector (but leave allocated for later)
         layer_start = -1;
         layer_end   = -1;
+        seq_mode = false;
+        seq_scales.clear();
         return true;
     }
 
@@ -120,6 +139,8 @@ bool llama_adapter_cvec::apply(
 
     layer_start = il_start;
     layer_end   = il_end;
+    seq_mode = false;
+    seq_scales.clear();
 
     for (size_t il = 1; il < hparams.n_layer(); il++) {
         assert(tensors[il] != nullptr);
@@ -131,6 +152,102 @@ bool llama_adapter_cvec::apply(
     }
 
     return true;
+}
+
+bool llama_adapter_cvec::is_active() const {
+    return layer_start >= 0 && layer_end >= layer_start;
+}
+
+bool llama_adapter_cvec::is_seq_mode() const {
+    return seq_mode;
+}
+
+bool llama_adapter_cvec::seq_set(llama_seq_id seq_id, float scale) {
+    if (!is_active() || seq_id < 0 || !std::isfinite(scale)) {
+        return false;
+    }
+
+    seq_mode = true;
+    if (scale == 0.0f) {
+        seq_scales.erase(seq_id);
+    } else {
+        seq_scales[seq_id] = scale;
+    }
+    return true;
+}
+
+void llama_adapter_cvec::seq_rm(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        seq_scales.clear();
+    } else {
+        seq_scales.erase(seq_id);
+    }
+}
+
+void llama_adapter_cvec::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    GGML_ASSERT(seq_id_src >= 0);
+    GGML_ASSERT(seq_id_dst >= 0);
+
+    const auto it = seq_scales.find(seq_id_src);
+    if (it == seq_scales.end()) {
+        seq_scales.erase(seq_id_dst);
+    } else {
+        seq_scales[seq_id_dst] = it->second;
+    }
+}
+
+void llama_adapter_cvec::seq_keep(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        seq_scales.clear();
+        return;
+    }
+
+    const auto it = seq_scales.find(seq_id);
+    if (it == seq_scales.end()) {
+        seq_scales.clear();
+        return;
+    }
+
+    const float scale = it->second;
+    seq_scales.clear();
+    seq_scales.emplace(seq_id, scale);
+}
+
+float llama_adapter_cvec::seq_get(llama_seq_id seq_id) const {
+    if (!seq_mode) {
+        return 1.0f;
+    }
+
+    const auto it = seq_scales.find(seq_id);
+    return it == seq_scales.end() ? 0.0f : it->second;
+}
+
+bool llama_adapter_cvec::validate_ubatch(const llama_ubatch & ubatch) const {
+    if (!seq_mode) {
+        return true;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] <= 0) {
+            return false;
+        }
+        const float scale = seq_get(ubatch.seq_id[i][0]);
+        for (int32_t s = 1; s < ubatch.n_seq_id[i]; ++s) {
+            if (seq_get(ubatch.seq_id[i][s]) != scale) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void llama_adapter_cvec::fill_ubatch_scales(const llama_ubatch & ubatch, float * dst) const {
+    GGML_ASSERT(seq_mode);
+    GGML_ASSERT(validate_ubatch(ubatch));
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        dst[i] = seq_get(ubatch.seq_id[i][0]);
+    }
 }
 
 // lora

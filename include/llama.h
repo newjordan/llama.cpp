@@ -699,6 +699,30 @@ extern "C" {
                          int32_t   il_start,
                          int32_t   il_end);
 
+    // Switch an active control vector to request-scoped mode and set one
+    // sequence scale. Unspecified sequences fail closed at scale zero.
+    LLAMA_API int32_t llama_adapter_cvec_seq_set(
+            struct llama_context * ctx,
+                  llama_seq_id     seq_id,
+                         float     scale);
+
+    // Pair these with whole-sequence memory lifecycle operations.
+    LLAMA_API void llama_adapter_cvec_seq_rm(
+            struct llama_context * ctx,
+                  llama_seq_id     seq_id);
+
+    LLAMA_API void llama_adapter_cvec_seq_cp(
+            struct llama_context * ctx,
+                  llama_seq_id     seq_id_src,
+                  llama_seq_id     seq_id_dst);
+
+    LLAMA_API void llama_adapter_cvec_seq_keep(
+            struct llama_context * ctx,
+                  llama_seq_id     seq_id);
+
+    LLAMA_API bool llama_adapter_cvec_seq_mode(const struct llama_context * ctx);
+    LLAMA_API float llama_adapter_cvec_seq_get(const struct llama_context * ctx, llama_seq_id seq_id);
+
     //
     // Memory
     //

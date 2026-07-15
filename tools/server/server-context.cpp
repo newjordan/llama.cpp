@@ -29,6 +29,7 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <cstring>
@@ -823,6 +824,9 @@ struct server_slot {
             {"lease_pinned", lease_pinned},
             {"lease_remaining_ms", lease_remaining_ms},
             {"lease_expired", !lease_pinned && lease_deadline_us >= 0 && lease_deadline_us <= now_us},
+            {"jspace_control_scale", llama_adapter_cvec_seq_mode(ctx_tgt)
+                ? json(llama_adapter_cvec_seq_get(ctx_tgt, id))
+                : json(nullptr)},
             {"n_prompt_checkpoints", prompt.checkpoints.size()},
             {"n_prompt_data_bytes", prompt_data_bytes},
             {"n_prompt_checkpoint_bytes", prompt_checkpoint_bytes},
@@ -1453,6 +1457,37 @@ private:
             bytes[i] = (unsigned char) (value >> (i * 8));
         }
         hash.update(bytes, sizeof(bytes));
+    }
+
+    static constexpr size_t snapshot_cvec_trailer_size = 12;
+
+    static void snapshot_append_cvec_scale(std::vector<uint8_t> & state, float scale) {
+        static constexpr unsigned char magic[8] = { 'J', 'S', 'P', 'C', 'V', 'E', 'C', '1' };
+        const size_t offset = state.size();
+        state.resize(offset + snapshot_cvec_trailer_size);
+        std::memcpy(state.data() + offset, magic, sizeof(magic));
+        std::memcpy(state.data() + offset + sizeof(magic), &scale, sizeof(scale));
+    }
+
+    static bool snapshot_get_cvec_scale(
+            const std::vector<uint8_t> & state,
+            size_t &                     base_state_size,
+            float &                      scale) {
+        static constexpr unsigned char magic[8] = { 'J', 'S', 'P', 'C', 'V', 'E', 'C', '1' };
+        base_state_size = state.size();
+        if (state.size() < snapshot_cvec_trailer_size) {
+            return false;
+        }
+        const size_t offset = state.size() - snapshot_cvec_trailer_size;
+        if (std::memcmp(state.data() + offset, magic, sizeof(magic)) != 0) {
+            return false;
+        }
+        std::memcpy(&scale, state.data() + offset + sizeof(magic), sizeof(scale));
+        if (!std::isfinite(scale)) {
+            throw std::runtime_error("StateTree snapshot has a non-finite J-Space scale");
+        }
+        base_state_size = offset;
+        return true;
     }
 
     static std::string snapshot_content_digest(
@@ -3288,6 +3323,7 @@ private:
 
         if (ret) {
             update_cache = update_cache && prompt_cache;
+            update_cache = update_cache && !llama_adapter_cvec_seq_mode(ctx_tgt);
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
@@ -3360,6 +3396,50 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (task.params.jspace_control_scale && ctx_dft) {
+            send_error(task,
+                    "Request-scoped J-Space is unavailable with a separate draft context",
+                    ERROR_TYPE_NOT_SUPPORTED);
+            return false;
+        }
+        if (task.params.jspace_control_scale && !llama_adapter_cvec_seq_mode(ctx_tgt)) {
+            for (const auto & candidate : slots) {
+                if (candidate.is_processing() || candidate.is_fork_reserved()) {
+                    send_error(task,
+                            "Cannot enter request-scoped J-Space mode while another slot is active or reserved",
+                            ERROR_TYPE_UNAVAILABLE);
+                    return false;
+                }
+            }
+            // Cached KV/recurrent state was computed under the legacy global
+            // vector and cannot be relabeled as request-scoped state.
+            for (auto & candidate : slots) {
+                if (!candidate.prompt.tokens.empty()) {
+                    candidate.prompt_clear(false);
+                }
+            }
+        }
+
+        if (task.params.jspace_control_scale || llama_adapter_cvec_seq_mode(ctx_tgt)) {
+            const float requested_scale = task.params.jspace_control_scale.value_or(0.0f);
+            const float current_scale = llama_adapter_cvec_seq_get(ctx_tgt, slot.id);
+            if (!slot.prompt.tokens.empty() && current_scale != requested_scale) {
+                if (slot.is_fork_reserved()) {
+                    send_error(task,
+                            "A reserved StateTree branch cannot change J-Space scale",
+                            ERROR_TYPE_INVALID_REQUEST);
+                    return false;
+                }
+                slot.prompt_clear(false);
+            }
+            if (llama_adapter_cvec_seq_set(ctx_tgt, slot.id, requested_scale) != 0) {
+                send_error(task,
+                        "jspace_control_scale requires an active server control vector",
+                        ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -4071,9 +4151,21 @@ private:
 
         const int64_t t_start = ggml_time_us();
         destination->prompt_clear(false);
+        size_t base_state_size = 0;
+        float cvec_scale = 0.0f;
+        bool has_cvec_scale = false;
+        try {
+            has_cvec_scale = snapshot_get_cvec_scale(state, base_state_size, cvec_scale);
+        } catch (const std::exception & e) {
+            send_error(task, std::string("Failed to parse StateTree snapshot controller state: ") + e.what(),
+                    ERROR_TYPE_SERVER);
+            destination->callback_on_deferred(destination->id);
+            return false;
+        }
         const size_t read = llama_state_seq_set_data_ext(
-                ctx_tgt, state.data(), state.size(), destination->id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (read != state.size()) {
+                ctx_tgt, state.data(), base_state_size, destination->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (read != base_state_size || (has_cvec_scale &&
+                llama_adapter_cvec_seq_set(ctx_tgt, destination->id, cvec_scale) != 0)) {
             destination->prompt_clear(false);
             send_error(task, "Failed to restore the complete StateTree snapshot", ERROR_TYPE_SERVER);
             destination->callback_on_deferred(destination->id);
@@ -4266,7 +4358,7 @@ private:
                         touch_family(slot->fork_source_id, slot->fork_id, true);
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && !llama_adapter_cvec_seq_mode(ctx_tgt)) {
                         for (auto & slot : slots) {
                             if (slot.is_available()) {
                                 SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
@@ -4289,7 +4381,11 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            const bool was_fork_reserved = slot.is_fork_reserved();
                             slot.release();
+                            if (llama_adapter_cvec_seq_mode(ctx_tgt) && !was_fork_reserved) {
+                                slot.prompt_clear(false);
+                            }
                             break;
                         }
                     }
@@ -5064,14 +5160,19 @@ private:
 
                     const size_t state_size = llama_state_seq_get_size_ext(
                             ctx_tgt, source->id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    const size_t cvec_trailer_bytes = llama_adapter_cvec_seq_mode(ctx_tgt)
+                        ? snapshot_cvec_trailer_size
+                        : 0;
                     if (state_size < sizeof(uint32_t) + sizeof(llama_seq_id) ||
-                            candidate->tokens.size() > (std::numeric_limits<size_t>::max() - state_size) /
+                            state_size > std::numeric_limits<size_t>::max() - cvec_trailer_bytes ||
+                            candidate->tokens.size() >
+                                (std::numeric_limits<size_t>::max() - state_size - cvec_trailer_bytes) /
                                 sizeof(llama_token)) {
                         send_error(task, "StateTree snapshot payload size is invalid", ERROR_TYPE_SERVER);
                         break;
                     }
-                    const size_t candidate_payload_bytes =
-                        state_size + candidate->tokens.size() * sizeof(llama_token);
+                    const size_t candidate_payload_bytes = state_size + cvec_trailer_bytes +
+                        candidate->tokens.size() * sizeof(llama_token);
                     if (candidate_payload_bytes > params_base.statetree_max_snapshot_bytes) {
                         snapshot_rejected_total++;
                         send_error(task, "StateTree snapshot exceeds the per-content byte ceiling",
@@ -5099,6 +5200,11 @@ private:
                     const llama_seq_id canonical_seq_id = 0;
                     std::memcpy(candidate->state.data() + sizeof(uint32_t),
                             &canonical_seq_id, sizeof(canonical_seq_id));
+                    if (llama_adapter_cvec_seq_mode(ctx_tgt)) {
+                        snapshot_append_cvec_scale(
+                                candidate->state,
+                                llama_adapter_cvec_seq_get(ctx_tgt, source->id));
+                    }
                     candidate->digest = snapshot_content_digest(candidate->tokens, candidate->state);
 
                     bool deduplicated = false;

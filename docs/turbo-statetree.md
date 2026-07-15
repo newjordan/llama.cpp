@@ -159,6 +159,13 @@ node, generation, and slot provenance, exact token/state/payload bytes, and a
 sequence plus its token vector and is independent of later continuation,
 re-fork, expiry, or erasure of the live source node.
 
+When request-scoped J-Space sequence mode is active, the serialized sequence
+state appends a versioned 12-byte `JSPCVEC1` plus finite-F32 scale trailer. The
+trailer is covered by the snapshot digest and byte budget. Materialization
+validates and strips it before llama state restore, then reinstalls the scale on
+the destination sequence. Legacy snapshots without a trailer remain valid and
+materialize unsteered.
+
 Sequence-specific llama state formerly embedded its physical sequence ID in
 the outer header and once per KV cell. Snapshot capture canonicalizes the outer
 header, and sequence serialization now emits a canonical inner ID because

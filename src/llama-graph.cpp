@@ -110,6 +110,22 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_cvec::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(cvec != nullptr);
+    GGML_ASSERT(scales != nullptr);
+    GGML_ASSERT(scales->ne[0] == 1);
+    GGML_ASSERT(scales->ne[1] == ubatch->n_tokens);
+
+    values.resize(ubatch->n_tokens);
+    cvec->fill_ubatch_scales(*ubatch, values.data());
+    ggml_backend_tensor_set(scales, values.data(), 0, values.size() * sizeof(float));
+}
+
+bool llm_graph_input_cvec::can_reuse(const llm_graph_params & params) {
+    return params.cvec_seq_mode && scales != nullptr &&
+        scales->ne[0] == 1 && scales->ne[1] == params.ubatch.n_tokens;
+}
+
 void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1121,7 +1137,21 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
 ggml_tensor * llm_graph_context::build_cvec(
          ggml_tensor * cur,
                  int   il) const {
-    return cvec->apply_to(ctx0, cur, il);
+    if (!cvec->is_seq_mode() || cvec->tensor_for(il) == nullptr) {
+        return cvec->apply_to(ctx0, cur, il);
+    }
+
+    if (cvec_token_scales == nullptr) {
+        cvec_token_scales = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_input(cvec_token_scales);
+        ggml_set_name(cvec_token_scales, "cvec_token_scales");
+
+        auto input = std::make_unique<llm_graph_input_cvec>(cvec);
+        input->scales = cvec_token_scales;
+        res->add_input(std::move(input));
+    }
+
+    return cvec->apply_to(ctx0, cur, il, cvec_token_scales);
 }
 
 ggml_tensor * llm_graph_context::build_lora_mm(
