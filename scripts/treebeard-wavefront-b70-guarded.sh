@@ -5,6 +5,7 @@ ROOT=/home/frosty40/turbo/treebeard-work
 WORKTREE=/home/frosty40/turbo/worktrees/treebeard-moe-down-reduce
 BUILD="$ROOT/build-treebeard-single-wavefront"
 HARNESS="$WORKTREE/scripts/treebeard-wavefront-b70.py"
+REUSE_HARNESS="$WORKTREE/scripts/treebeard-moe-reuse-probe.py"
 MODEL=/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
 SERVICE=turbo-statetree-rc4.service
 LIVE_PORT=8093
@@ -27,6 +28,8 @@ SERIAL_ANCHOR=${TREEBEARD_WAVEFRONT_SERIAL_ANCHOR:-1}
 STRICT_PARITY=${TREEBEARD_WAVEFRONT_STRICT_PARITY:-1}
 ARRIVAL_GAP_MS=${TREEBEARD_WAVEFRONT_ARRIVAL_GAP_MS:-0}
 BATCH_SHAPE_PROF=${TREEBEARD_WAVEFRONT_BATCH_SHAPE_PROF:-0}
+REUSE_PROBE=${TREEBEARD_WAVEFRONT_REUSE_PROBE:-0}
+REUSE_N_PREDICT=${TREEBEARD_WAVEFRONT_REUSE_N_PREDICT:-64}
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 OUT="$ROOT/results/treebeard-single-wavefront-b70/$RUN_ID"
 CANDIDATE_PID=
@@ -163,6 +166,9 @@ fi
 if [[ "$BATCH_SHAPE_PROF" == 1 ]]; then
     mode_env+=(TREEBEARD_BATCH_SHAPE_PROF=1)
 fi
+if [[ "$REUSE_PROBE" == 1 ]]; then
+    mode_env+=(GGML_SYCL_MOE_REUSE_PROFILE=1)
+fi
 
 env \
     GGML_SYCL_ENABLE_FUSION=1 \
@@ -214,15 +220,22 @@ if [[ "$STRICT_PARITY" != 1 ]]; then
     parity_arg=--no-strict-parity
 fi
 
-python3 "$HARNESS" \
-    --port "$PORT" --ctx 262144 --parallel 12 \
-    --depths "$DEPTHS" --widths "$WIDTHS" --concurrency-widths "$WIDTHS" \
-    --cases "$CASES" --repeats "$REPEATS" --concurrency-repeats "$CONCURRENCY_REPEATS" \
-    --n-predict "$N_PREDICT" --timeout 1800 \
-    --arrival-gap-ms "$ARRIVAL_GAP_MS" \
-    "$concurrency_arg" "$anchor_arg" "$parity_arg" --reuse-case-prefix \
-    --out "$OUT/wavefront-b70.json" \
-    2>&1 | tee "$OUT/wavefront-b70-console.log"
+if [[ "$REUSE_PROBE" == 1 ]]; then
+    python3 "$REUSE_HARNESS" \
+        --port "$PORT" --n-predict "$REUSE_N_PREDICT" --timeout 1800 \
+        --out "$OUT/moe-reuse-probe.json" \
+        2>&1 | tee "$OUT/moe-reuse-probe-console.log"
+else
+    python3 "$HARNESS" \
+        --port "$PORT" --ctx 262144 --parallel 12 \
+        --depths "$DEPTHS" --widths "$WIDTHS" --concurrency-widths "$WIDTHS" \
+        --cases "$CASES" --repeats "$REPEATS" --concurrency-repeats "$CONCURRENCY_REPEATS" \
+        --n-predict "$N_PREDICT" --timeout 1800 \
+        --arrival-gap-ms "$ARRIVAL_GAP_MS" \
+        "$concurrency_arg" "$anchor_arg" "$parity_arg" --reuse-case-prefix \
+        --out "$OUT/wavefront-b70.json" \
+        2>&1 | tee "$OUT/wavefront-b70-console.log"
+fi
 
 curl -fsS --max-time 5 "http://127.0.0.1:$PORT/slots" > "$OUT/candidate/slots-final.json"
 curl -fsS --max-time 5 "http://127.0.0.1:$PORT/states" > "$OUT/candidate/states-final.json"

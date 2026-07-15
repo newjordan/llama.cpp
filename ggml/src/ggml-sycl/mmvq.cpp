@@ -5,6 +5,10 @@
 #include "quants.hpp"
 #include "vecdotq.hpp"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_reorder(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                                   const int ncols, const int nrows, const sycl::nd_item<3> & nd_item) {
@@ -3056,6 +3060,31 @@ static void launch_mmid_group_pairs(
                                    n_active_l.get_multi_ptr<sycl::access::decorated::no>().get());
             });
     });
+
+    // Diagnostic-only occupancy sensor. The grouped kernel's speedup ceiling is set by the
+    // number of distinct experts in a routed batch, but that count normally stays on device.
+    // Opting in deliberately serializes this launch and copies one int so production-shaped
+    // routing can falsify expert-weight-reuse proposals before another kernel is built.
+    static const bool profile_reuse = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_REUSE_PROFILE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static std::atomic<int> profile_samples { 0 };
+    if (profile_reuse) {
+        const int sample = profile_samples.fetch_add(1, std::memory_order_relaxed);
+        if (sample >= 4096) {
+            return;
+        }
+        int32_t n_active = 0;
+        stream->memcpy(&n_active, scratch + 2 * n_as + 1, sizeof(n_active)).wait();
+        std::fprintf(stderr,
+                     "[treebeard-moe-reuse] sample=%d tokens=%d slots=%d routes=%d"
+                     " experts=%d active=%d duplicate_routes=%d ideal_weight_read_reduction=%.6f\n",
+                     sample, n_tokens, n_ids, n_tokens * n_ids, n_as, n_active,
+                     n_tokens * n_ids - n_active,
+                     n_tokens * n_ids > 0 ?
+                         1.0 - (double) n_active / (double) (n_tokens * n_ids) : 0.0);
+    }
 }
 
 template <typename reorder_vec_dot_q_sycl>
