@@ -197,8 +197,9 @@ The isolated Qwen3.5 0.8B CPU smoke compared widths 0, 4, and 8 for 64 greedy
 tokens. Width 4 executed 8 anchor checks and width 8 executed 6. All 14 anchors
 matched, both speculative outputs exactly matched width 0, and the candidates
 accepted 32/32 and 36/37 proposed tokens respectively. This validates the
-match path and telemetry on a proposal-bearing workload; the B70 shallow gate
-is still required to exercise the known divergent backend and its fallback.
+match path and telemetry on a proposal-bearing workload. The later B70 shallow
+gate exercised the fallback path and rejected a single block-head anchor as an
+exact commit proof.
 
 ## Implemented quality surface
 
@@ -319,22 +320,23 @@ proposal, but proposal coverage and acceptance did not guarantee agreement
 with serial greedy decode. Coverage is necessary for speed; exact transition
 parity is necessary for correctness.
 
-### The remaining B70 question is narrow
+### B70 answer: a block-head anchor is insufficient
 
-The width curve is measured and the serial block-head anchor is implemented.
-The remaining question is:
+The shallow B70 gate answered the block-head question:
 
 ```text
-Does the serial block-head anchor catch B70's observed batched divergence early
-enough to preserve exact shallow width-zero output while retaining useful wide
-verification?
+No. A matching first transition does not prove the later accepted columns.
 ```
 
-The implementation detects a first-transition disagreement before commit and
-falls back to the serial transition. A matching block-head anchor does not by
-itself prove that every later accepted column equals an independently serial
-decode, so exact shallow parity remains the release gate before another
-long-context maintenance run.
+The 81-wave gate recorded 18/18 exact controls but only 9/63 exact speculative
+candidates. Of 3,030 serial anchor checks, 3,027 matched and three correctly
+fell back. Structured copy and prose were 0/21 exact; code edit was exact only
+at widths 1, 2, and 4. Divergence positions were deterministic across repeats.
+The strict shallow gate therefore stopped the experiment before any new 32K,
+128K, 256K, or 12-agent measurement.
+
+Full results are in
+`reports/treebeard-serial-anchor-b70-benchmark-20260715.md`.
 
 ## Parked paths
 
@@ -356,6 +358,9 @@ long-context maintenance run.
 - Serial-anchor CPU proposal smoke: exact width-0 parity at widths 4 and 8,
   14/14 matching anchor checks, and 68/69 accepted proposals.
 - Serial-anchor non-greedy request rejection: HTTP 400 with the expected error.
+- Serial-anchor B70 shallow gate: 81 measured waves, 18/18 exact controls,
+  9/63 exact candidates, 3,027/3,030 matching anchors, and three exercised
+  fallbacks. The candidate was rejected before deep-context benchmarking.
 - CPU width gate: 54/54 exact greedy parity.
 - Per-round cap and telemetry alignment: passed for all 54 samples.
 - Invalid negative request cap: HTTP 400 with the expected error.
@@ -371,15 +376,14 @@ long-context maintenance run.
 
 ## Next controlled gate
 
-The serial anchor is implemented and its isolated CPU gate passes. The next
-gate should happen at shallow B70 context before another long-context
-maintenance run:
+The block-head anchor is implemented and rejected by its shallow B70 gate. The
+next candidate must be correctness-first:
 
-1. Confirm that the known divergent widths produce anchor fallbacks and exact
-   width-zero token parity.
-2. Localize any mismatch that survives a matching block-head anchor by operator
-   and batch column, beginning with the accepted MoE fusions while retaining a
-   generic-backend control.
+1. Prove every transition at the serial commit frontier, rather than checking
+   only the first transition of a wide block, or eliminate the backend
+   batch-shape sensitivity itself.
+2. Localize the deterministic later-column mismatches by operator and batch
+   column, retaining a generic-backend control.
 3. Require exact parity at shallow context before repeating any 32K or 256K
    measurement.
 4. Only then remeasure throughput and the twelve-agent regression guard.
