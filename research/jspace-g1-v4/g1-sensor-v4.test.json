@@ -1,0 +1,145 @@
+{
+  "schema": "treebeard.jspace.g1.test.v4",
+  "status": "fail",
+  "inputs": {
+    "manifest_sha256": "ffcf0ac11e343a9674984a2e497ed1a91cbb5fb3e4f3babbc7407d8f4c19165b",
+    "metadata_sha256": "3d95c7625fef642691e493f9b364d39b06b1c1c9d40c527e2ca6f08b72851295",
+    "raw_sha256": "9dbfed3f909491e4f6090feead6897d7b8d0f9216c01e9fd5fd4626aa9cf0486",
+    "artifact_sha256": "e1c4e9ab6050c35bbf254395044b5cd796685c68ac15fbdd9f8fd17d1662c23d"
+  },
+  "overall": {
+    "rows": 248,
+    "axes": [
+      "sadness",
+      "surprise",
+      "joy",
+      "disgust",
+      "fear",
+      "anger",
+      "neutral"
+    ],
+    "macro_auroc": 0.9171016483516483,
+    "axis_auroc": {
+      "sadness": 0.9365384615384615,
+      "surprise": 0.8813701923076923,
+      "joy": 0.9121394230769231,
+      "disgust": 0.9717548076923077,
+      "fear": 0.9438701923076923,
+      "anger": 0.9427884615384615,
+      "neutral": 0.83125
+    },
+    "macro_ece": 0.04631633459325646,
+    "top1_accuracy": 0.7540322580645161,
+    "neutral_fpr": 0.25,
+    "abstention_coverage": 0.7217741935483871,
+    "abstention_precision": 0.8547486033519553
+  },
+  "sources": {
+    "empatheticdialogues": {
+      "rows": 192,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.9393880208333333,
+      "axis_auroc": {
+        "sadness": 0.9607421875,
+        "surprise": 0.878515625,
+        "joy": 0.9240234375,
+        "disgust": 0.9904296875,
+        "fear": 0.9291015625,
+        "anger": 0.953515625
+      },
+      "macro_ece": 0.0553552062939612,
+      "top1_accuracy": 0.78125,
+      "neutral_fpr": null,
+      "abstention_coverage": 0.7708333333333334,
+      "abstention_precision": 0.8716216216216216
+    },
+    "dailydialog": {
+      "rows": 56,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger",
+        "neutral"
+      ],
+      "macro_auroc": 0.8883928571428571,
+      "axis_auroc": {
+        "sadness": 0.8567708333333334,
+        "surprise": 0.9088541666666666,
+        "joy": 0.8723958333333334,
+        "disgust": 0.9140625,
+        "fear": 0.9895833333333334,
+        "anger": 0.8958333333333334,
+        "neutral": 0.78125
+      },
+      "macro_ece": 0.08672591133576181,
+      "top1_accuracy": 0.6607142857142857,
+      "neutral_fpr": 0.25,
+      "abstention_coverage": 0.5535714285714286,
+      "abstention_precision": 0.7741935483870968
+    }
+  },
+  "empatheticdialogues_anchor_strata": {
+    "non_echo": {
+      "rows": 133,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.9257053675101609,
+      "axis_auroc": {
+        "sadness": 0.9615384615384616,
+        "surprise": 0.8254847645429363,
+        "joy": 0.9237958303378864,
+        "disgust": 0.9810710987996306,
+        "fear": 0.9315476190476191,
+        "anger": 0.9307944307944308
+      },
+      "macro_ece": 0.06352030553029804,
+      "top1_accuracy": 0.7368421052631579,
+      "neutral_fpr": null,
+      "abstention_coverage": 0.7293233082706767,
+      "abstention_precision": 0.845360824742268
+    },
+    "echo": {
+      "rows": 59,
+      "axes": [
+        "sadness",
+        "surprise",
+        "joy",
+        "disgust",
+        "fear",
+        "anger"
+      ],
+      "macro_auroc": 0.960374356654973,
+      "axis_auroc": {
+        "sadness": 0.9276729559748428,
+        "surprise": 0.9515050167224081,
+        "joy": 0.9591194968553459,
+        "disgust": 1.0,
+        "fear": 0.928030303030303,
+        "anger": 0.9959183673469387
+      },
+      "macro_ece": 0.08079241097822064,
+      "top1_accuracy": 0.8813559322033898,
+      "neutral_fpr": null,
+      "abstention_coverage": 0.864406779661017,
+      "abstention_precision": 0.9215686274509803
+    }
+  },
+  "label_shuffle_mean_macro_auroc": 0.49512988638965205,
+  "test_gate_pass": false
+}
