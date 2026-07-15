@@ -244,6 +244,7 @@ static json read_manifest(const std::string & path) {
     const std::string schema = document.value("schema", "");
     if ((schema != "treebeard.jspace.g1.dataset.v1" &&
             schema != "treebeard.jspace.g1.dataset.v2" &&
+            schema != "treebeard.jspace.g1.dataset.v3" &&
             schema != "treebeard.jspace.g1.controls.v1" &&
             schema != "treebeard.jspace.g1.controls.v2") ||
             !document.contains("rows") || !document["rows"].is_array() || document["rows"].empty()) {

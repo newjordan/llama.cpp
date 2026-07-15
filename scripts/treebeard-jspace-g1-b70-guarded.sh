@@ -125,6 +125,8 @@ git -C "$WORKTREE" rev-parse HEAD > "$OUT/candidate/source-head.txt"
 git -C "$WORKTREE" diff -- \
     scripts/treebeard-jspace-g1-manifest.py scripts/treebeard-jspace-g1-controls.py \
     scripts/treebeard-jspace-g1-v2-evaluate.py \
+    scripts/treebeard-jspace-g1-v3-meld-manifest.py \
+    scripts/treebeard-jspace-g1-v3-evaluate.py \
     scripts/treebeard-jspace-g1-b70-guarded.sh \
     tools/jspace-probe/CMakeLists.txt tools/jspace-probe/README.md \
     tools/jspace-probe/jspace-sensor-extract.cpp \
