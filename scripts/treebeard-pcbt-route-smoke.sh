@@ -247,6 +247,70 @@ PYEOF
     check "observe -> expired (timer sweep)" "expired" "$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')"
 fi
 
+# --- PCBT-11 matrices: stale generation, late result, byte pressure ---------
+if [[ "$NODE_ID" != "-1" ]]; then
+    # fresh committed singleton for the matrix transactions
+    curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+        -d '{"prompt":"pcbt matrix source:","n_predict":4,"temperature":0,"id_slot":0}' >/dev/null
+    MF=$(curl -s -X POST "http://127.0.0.1:$PORT/slots/0?action=fork" -H 'Content-Type: application/json' -d '{"destinations":[1]}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("fork_id",-1))')
+    curl -s -X POST "http://127.0.0.1:$PORT/slots/0?action=commit" -H 'Content-Type: application/json' -d "{\"fork_id\":$MF}" >/dev/null
+    MNODE=$(curl -s "http://127.0.0.1:$PORT/slots" | python3 -c 'import json,sys;rows=json.load(sys.stdin);print([r for r in rows if r.get("id")==0][0].get("node_id",-1))')
+
+    # byte-pressure: min candidate budget forces truncation flags
+    python3 - "$MNODE" <<PYEOF > /tmp/pcbt-create-bp.json
+import json,sys
+doc=json.load(open("$FIX/create-valid-minimal.json"))
+doc["request_id"]="smoke-tx-bp"
+doc["source"]={"node_id":int(sys.argv[1])}
+doc["budget"]["max_candidate_bytes"]=1024
+doc["branches"][0]["request"]["max_tokens"]=400
+doc["branches"][1]["request"]["max_tokens"]=400
+doc["budget"]["max_predicted_tokens"]=1000
+print(json.dumps(doc))
+PYEOF
+    check "create byte-pressure -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-bp.json)"
+    TXBP=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["transaction_id"])')
+    GENBP=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["generation"])')
+    python3 -c '
+import json
+v=json.load(open("/tmp/pcbt-smoke-body.json"))
+for b in v["branches"]:
+    print(b["node_id"])' | while read -r BN; do
+        curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+            -d "{\"prompt\":\"write a very long story:\",\"n_predict\":400,\"temperature\":0,\"node_id\":$BN,\"fork_id\":$GENBP,\"ignore_eos\":true}" >/dev/null
+    done
+    sleep 1
+    code "http://127.0.0.1:$PORT/transactions/$TXBP" >/dev/null
+    python3 -c '
+import json
+v=json.load(open("/tmp/pcbt-smoke-body.json"))
+trunc=[b["body_truncated"] for b in v["branches"]]
+assert any(trunc), trunc
+print("ok   candidate byte-pressure truncation flagged")'
+
+    # stale generation on commit
+    W=$(python3 -c '
+import json
+v=json.load(open("/tmp/pcbt-smoke-body.json"))
+c=[b for b in v["branches"] if b["phase"]=="completed"][0]
+print(c["node_id"], c["candidate_digest"])')
+    WN=${W%% *}; WD=${W##* }
+    printf '{"winner_node_id":%s,"expected_fork_id":%s,"candidate_digest":"%s","evidence":{"kind":"external","digest":"sha256:%s"}}' \
+        "$WN" "$((GENBP+999))" "$WD" "$(printf 'cd%.0s' {1..32})" > /tmp/pcbt-commit-stale.json
+    code -X POST "http://127.0.0.1:$PORT/transactions/$TXBP?action=commit" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-commit-stale.json >/dev/null
+    grep -q '"conflict"' /tmp/pcbt-smoke-body.json && echo "ok   stale generation -> conflict" || { echo "FAIL stale generation"; fail=1; }
+
+    # late result: abort, then decode a branch node -> attribution fenced
+    printf '{"expected_fork_id":%s,"reason":"late-result-matrix"}' "$GENBP" > /tmp/pcbt-abort-bp.json
+    check "abort byte-pressure tx -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions/$TXBP?action=abort" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-abort-bp.json)"
+    curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+        -d '{"prompt":"late tick","n_predict":4,"temperature":0}' >/dev/null
+    code "http://127.0.0.1:$PORT/transactions/$TXBP" >/dev/null
+    check "late result cannot mutate terminal" "aborted" "$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')"
+fi
+
 # --- PCBT-8: metrics ---------------------------------------------------------
 METRICS=$(curl -s "http://127.0.0.1:$PORT/metrics")
 for m in pcbt_created_total pcbt_committed_total pcbt_aborted_total pcbt_expired_total; do
