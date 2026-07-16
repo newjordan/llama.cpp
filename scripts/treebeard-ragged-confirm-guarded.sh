@@ -17,6 +17,9 @@ LIVE_PORT=8093
 BENCH_PORT=8098
 REPEATS="${TREEBEARD_CONFIRM_REPEATS:-3}"
 EDGE_PROBES="${TREEBEARD_EDGE_PROBES:-1}"
+SKIP_FRAG="${TREEBEARD_SKIP_FRAG:-0}"
+# 250k prefill is a long-context quadratic prefill (~15 min); 900s kills it.
+EDGE_TIMEOUT="${TREEBEARD_EDGE_TIMEOUT:-3600}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-confirm-comp-aba"
 OUT="$ROOT/results/treebeard-ragged-promo-b70/$RUN_ID"
 STARTED="$(date --iso-8601=seconds)"
@@ -150,23 +153,26 @@ FRAG_ARGS=(--layout fragmented --fragment-fill-tokens 8192 --persistent-fragment
     --prefix-tokens 32768 --branch-suffix-tokens 8 --branch-tokens 64
     --repeats "$REPEATS" --modes manual --seed 1709)
 
-#          label  ragged stio hoist
-run_arm    c0-a   0      0    0    "${FRAG_ARGS[@]}"
-run_arm    c1     1      0    0    "${FRAG_ARGS[@]}"
-run_arm    c2     1      1    0    "${FRAG_ARGS[@]}"
-run_arm    c3     1      1    1    "${FRAG_ARGS[@]}"
-run_arm    c0-b   0      0    0    "${FRAG_ARGS[@]}"
+if [[ "$SKIP_FRAG" != 1 ]]; then
+    #          label  ragged stio hoist
+    run_arm    c0-a   0      0    0    "${FRAG_ARGS[@]}"
+    run_arm    c1     1      0    0    "${FRAG_ARGS[@]}"
+    run_arm    c2     1      1    0    "${FRAG_ARGS[@]}"
+    run_arm    c3     1      1    1    "${FRAG_ARGS[@]}"
+    run_arm    c0-b   0      0    0    "${FRAG_ARGS[@]}"
 
-# Hoist activation evidence: present in c3, absent in c2.
-rg -q '\[treebeard-q8-hoist\] activated' "$OUT/run/c3.server.log"
-if rg -q '\[treebeard-q8-hoist\] activated' "$OUT/run/c2.server.log"; then
-    printf 'C2_UNEXPECTED_HOIST_ACTIVATION\n' >&2
-    exit 1
+    # Hoist activation evidence: present in c3, absent in c2.
+    rg -q '\[treebeard-q8-hoist\] activated' "$OUT/run/c3.server.log"
+    if rg -q '\[treebeard-q8-hoist\] activated' "$OUT/run/c2.server.log"; then
+        printf 'C2_UNEXPECTED_HOIST_ACTIVATION\n' >&2
+        exit 1
+    fi
 fi
 
 if [[ "$EDGE_PROBES" == 1 ]]; then
     EDGE_ARGS=(--layout dense --prefix-tokens 250000 --branch-suffix-tokens 8
-        --branch-tokens 64 --repeats 1 --modes manual --seed 1709)
+        --branch-tokens 64 --repeats 1 --modes manual --seed 1709
+        --request-timeout "$EDGE_TIMEOUT")
     run_arm edge-long-off 0 1 0 "${EDGE_ARGS[@]}"
     run_arm edge-long-on  1 1 0 "${EDGE_ARGS[@]}"
     # Commit-churn probe: family commit + loser reclamation + refork cycles.
@@ -175,6 +181,35 @@ if [[ "$EDGE_PROBES" == 1 ]]; then
         --branch-tokens 64 --repeats 2 --modes manual,commit --seed 1709
 fi
 
-"$PYTHON" "$EVALUATOR" "$OUT" | tee "$OUT/confirm-summary-console.log"
+if [[ "$SKIP_FRAG" != 1 ]]; then
+    "$PYTHON" "$EVALUATOR" "$OUT" | tee "$OUT/confirm-summary-console.log"
+else
+    "$PYTHON" - "$OUT" <<'PYEOF' | tee "$OUT/edge-summary-console.log"
+import json, sys
+from pathlib import Path
+out = Path(sys.argv[1])
+def hashes(label):
+    doc = json.loads((out / "run" / f"{label}.result.json").read_text())
+    usable = [s for s in doc["samples"] if s.get("branch_wave")]
+    return ([tuple(sorted(r["tokens_sha256"] for r in s["branch_wave"]["requests"]))
+             for s in usable], doc["summary"]["failed_samples"], len(doc["samples"]) - len(usable))
+off, off_fail, off_unusable = hashes("edge-long-off")
+on, on_fail, on_unusable = hashes("edge-long-on")
+churn, churn_fail, churn_unusable = hashes("edge-churn")
+summary = {
+    "kind": "treebeard-ragged-edge-summary",
+    "long_prefix_parity": bool(off and on and off == on),
+    "long_prefix_unusable": off_unusable + on_unusable,
+    "churn_samples_usable": len(churn),
+    "churn_hash_sets_identical": len(set(churn)) == 1 if churn else False,
+    "failed_samples": off_fail + on_fail + churn_fail,
+}
+summary["pass"] = (summary["long_prefix_parity"] and summary["long_prefix_unusable"] == 0
+                   and summary["churn_hash_sets_identical"] and summary["failed_samples"] == 0)
+(out / "edge-summary.json").write_text(json.dumps(summary, indent=2))
+print(json.dumps(summary, indent=2))
+sys.exit(0 if summary["pass"] else 1)
+PYEOF
+fi
 
 printf 'BENCH_COMPLETE out=%s\n' "$OUT"
