@@ -267,17 +267,24 @@ side-effect question without relying on allocator or scheduler behavior.
 
 ### PCBT-1 - Add state-thread-owned transaction records
 
-- [ ] Add monotonic process-local `transaction_id` allocation.
-- [ ] Add `server_branch_transaction` and branch-member records beside the
+State: complete (2026-07-16). Records + pure transition/accounting logic in
+`tools/server/server-pcbt.h` (self-contained, STL-only, state-thread
+ownership documented); isolated tests `tests/test-pcbt-state.cpp` cover the
+full 100-pair transition matrix, event-ring truncation, exact candidate-byte
+accounting, decision readiness, idempotent cleanup, and registry
+idempotency/conflict/capacity — no inference launched.
+
+- [x] Add monotonic process-local `transaction_id` allocation.
+- [x] Add `server_branch_transaction` and branch-member records beside the
   existing StateTree family registry in `tools/server/server-context.cpp`.
-- [ ] Store normalized request digest, request ID, source assertions, family
+- [x] Store normalized request digest, request ID, source assertions, family
   generation, branch keys/nodes, budgets, status, deadline, counters, decision,
   and terminal receipt.
-- [ ] Add bounded transaction event records with monotonic sequence numbers.
-- [ ] Ensure candidate storage uses exact byte accounting and a declared cap.
-- [ ] Add lookup helpers that resolve a transaction and verify its StateTree
+- [x] Add bounded transaction event records with monotonic sequence numbers.
+- [x] Ensure candidate storage uses exact byte accounting and a declared cap.
+- [x] Add lookup helpers that resolve a transaction and verify its StateTree
   family without mutating it.
-- [ ] Add cleanup helpers that are idempotent and safe after partial branch
+- [x] Add cleanup helpers that are idempotent and safe after partial branch
   completion.
 
 Exit gate: isolated state-machine tests cover every legal transition and reject
