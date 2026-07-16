@@ -23,8 +23,20 @@ OUT="$ROOT/results/treebeard-rc5-deploy/$(date +%Y%m%d-%H%M%S)-package-smoke"
 mkdir -p "$OUT"
 
 # Frozen-source assertion: runtime source must be byte-identical to the
-# promotion evidence build (later commits are reports/scripts only).
-if ! git -C "$WORKTREE" diff --quiet "$FROZEN_COMMIT" HEAD -- src ggml tools common include; then
+# promotion evidence build. When HEAD legitimately carries post-freeze
+# commits that were never built into these binaries, TREEBEARD_PIN_BY_HASH=1
+# replaces the diff check with the STRONGER binary-hash pins below (all
+# three hashes then become mandatory).
+if [[ "${TREEBEARD_PIN_BY_HASH:-0}" == 1 ]]; then
+    [[ -n "${TREEBEARD_SERVER_SHA:-}" && -n "${TREEBEARD_LIBLLAMA_SHA:-}" && -n "${TREEBEARD_IMPL_SHA:-}" ]] || {
+        printf 'PIN_BY_HASH_REQUIRES_ALL_THREE_HASHES\n' >&2
+        exit 1
+    }
+    sha256sum "$BUILD/bin/libllama-server-impl.so" | rg -q "^$TREEBEARD_IMPL_SHA " || {
+        printf 'IMPL_HASH_MISMATCH_VS_FREEZE_RECORD\n' >&2
+        exit 1
+    }
+elif ! git -C "$WORKTREE" diff --quiet "$FROZEN_COMMIT" HEAD -- src ggml tools common include; then
     printf 'RUNTIME_SOURCE_DIVERGED_FROM_FROZEN_COMMIT\n' >&2
     exit 1
 fi
