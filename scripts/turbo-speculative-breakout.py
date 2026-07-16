@@ -2006,6 +2006,7 @@ def run_breakout(
     branch_results: list[RequestResult] = []
     current_root_fork_id: int | None = None
     current_source_node: int = -1
+    pcbt_reservations: list[tuple[int, int]] = []
     for stage_end in stage_ends:
         stage_start = len(branch_results)
         stage_fork: dict[str, Any] | None = None
@@ -2102,6 +2103,7 @@ def run_breakout(
             )
             current_root_fork_id = None
             current_source_node = int(stage_commit["winner_node_id"])
+            pcbt_reservations.append((int(stage_commit["winner_slot"]), int(view["generation"])))
         elif preserve_prefix_root:
             winner_slot = (
                 branch_results[passing_indices[0]].id_slot
@@ -2939,6 +2941,13 @@ def main() -> int:
         if args.preserve_prefix_root and args.prefix_slot not in cleanup_slots:
             cleanup_slots.append(args.prefix_slot)
         if use_fork_backend:
+            for pcbt_slot, pcbt_gen in pcbt_reservations:
+                try:
+                    http_json("POST",
+                              f"http://127.0.0.1:{args.port}/slots/{pcbt_slot}?action=erase",
+                              {"fork_id": pcbt_gen}, timeout=args.request_timeout)
+                except Exception:  # noqa: BLE001
+                    pass
             cleanup_errors = cleanup_fork_reservations(
                 args.port,
                 cleanup_slots,
