@@ -974,6 +974,91 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    // Zero-copy StateTree fork of `source`'s evaluated prefix into the
+    // validated `destinations` (idle, unique, source excluded). On success
+    // every family member (source included) carries a fresh node id under
+    // one new fork generation. On failure `error` is set and nothing was
+    // mutated. Extracted from SERVER_TASK_TYPE_SLOT_FORK so PCBT create
+    // reuses the exact fork semantics (PCBT-3).
+    struct statetree_fork_family_result {
+        int64_t state_id       = -1;
+        int64_t fork_id        = -1;
+        int64_t parent_fork_id = -1;
+        int64_t parent_node_id = -1;
+    };
+
+    bool statetree_fork_family(server_slot * source,
+                               const std::vector<server_slot *> & destinations,
+                               statetree_fork_family_result & out,
+                               std::string & error) {
+        const int id_slot = source->id;
+
+        std::vector<server_tokens> prompt_copies;
+        try {
+            prompt_copies.reserve(destinations.size());
+            for (size_t i = 0; i < destinations.size(); ++i) {
+                prompt_copies.push_back(source->prompt.tokens.clone());
+            }
+        } catch (const std::exception & e) {
+            error = std::string("Failed to clone slot prompt: ") + e.what();
+            return false;
+        }
+
+        if (statetree_next_fork_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
+            error = "StateTree fork generation space is exhausted";
+            return false;
+        }
+        if (source->state_id < 0 &&
+                statetree_next_state_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
+            error = "StateTree logical state space is exhausted";
+            return false;
+        }
+        const size_t n_nodes = destinations.size() + 1;
+        const uint64_t node_limit = (uint64_t) std::numeric_limits<int64_t>::max();
+        if (statetree_next_node_id > node_limit ||
+                n_nodes - 1 > node_limit - statetree_next_node_id) {
+            error = "StateTree branch node space is exhausted";
+            return false;
+        }
+
+        out.parent_fork_id = source->fork_id;
+        out.parent_node_id = source->node_id;
+        out.state_id = source->state_id >= 0
+            ? source->state_id
+            : (int64_t) statetree_next_state_id++;
+        out.fork_id = (int64_t) statetree_next_fork_id++;
+
+        for (size_t i = 0; i < destinations.size(); ++i) {
+            server_slot * destination = destinations[i];
+
+            destination->prompt_clear(false);
+            common_context_seq_cp(ctx_tgt, id_slot, destination->id, -1, -1);
+
+            server_prompt prompt;
+            prompt.tokens = std::move(prompt_copies[i]);
+            destination->prompt = std::move(prompt);
+            destination->task_prev.reset();
+        }
+
+        source->prompt.checkpoints.clear();
+        std::vector<server_slot *> family_members = destinations;
+        family_members.push_back(source);
+        std::sort(family_members.begin(), family_members.end(), [](const auto * left, const auto * right) {
+            return left->id < right->id;
+        });
+        for (server_slot * member : family_members) {
+            member->fork_source_id = id_slot;
+            member->state_id = out.state_id;
+            member->node_id = (int64_t) statetree_next_node_id++;
+            member->parent_node_id = out.parent_node_id;
+            member->materialized_snapshot_id = -1;
+            member->materialized_content_digest.clear();
+            member->fork_id = out.fork_id;
+        }
+        touch_family(id_slot, out.fork_id, false);
+        return true;
+    }
+
     // Proof-carrying branch transactions: state-thread-owned registry and
     // the task handler (invariant 1; docs/treebeard-pcbt-contract-v1.md).
     pcbt_registry pcbt_txs;
@@ -4895,68 +4980,23 @@ private:
                     }
 
                     const int64_t t_start = ggml_time_us();
-                    std::vector<server_tokens> prompt_copies;
-                    try {
-                        prompt_copies.reserve(destinations.size());
-                        for (size_t i = 0; i < destinations.size(); ++i) {
-                            prompt_copies.push_back(source->prompt.tokens.clone());
+                    statetree_fork_family_result fork_res;
+                    {
+                        std::string fork_error;
+                        if (!statetree_fork_family(source, destinations, fork_res, fork_error)) {
+                            send_error(task, fork_error, ERROR_TYPE_SERVER);
+                            break;
                         }
-                    } catch (const std::exception & e) {
-                        send_error(task, std::string("Failed to clone slot prompt: ") + e.what(), ERROR_TYPE_SERVER);
-                        break;
                     }
-
-                    if (statetree_next_fork_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
-                        send_error(task, "StateTree fork generation space is exhausted", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    if (source->state_id < 0 &&
-                            statetree_next_state_id > (uint64_t) std::numeric_limits<int64_t>::max()) {
-                        send_error(task, "StateTree logical state space is exhausted", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    const size_t n_nodes = destinations.size() + 1;
-                    const uint64_t node_limit = (uint64_t) std::numeric_limits<int64_t>::max();
-                    if (statetree_next_node_id > node_limit ||
-                            n_nodes - 1 > node_limit - statetree_next_node_id) {
-                        send_error(task, "StateTree branch node space is exhausted", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    const int64_t parent_fork_id = source->fork_id;
-                    const int64_t parent_node_id = source->node_id;
-                    const int64_t state_id = source->state_id >= 0
-                        ? source->state_id
-                        : (int64_t) statetree_next_state_id++;
-                    const int64_t fork_id = (int64_t) statetree_next_fork_id++;
-
-                    for (size_t i = 0; i < destinations.size(); ++i) {
-                        server_slot * destination = destinations[i];
-
-                        destination->prompt_clear(false);
-                        common_context_seq_cp(ctx_tgt, id_slot, destination->id, -1, -1);
-
-                        server_prompt prompt;
-                        prompt.tokens = std::move(prompt_copies[i]);
-                        destination->prompt = std::move(prompt);
-                        destination->task_prev.reset();
-                    }
-
-                    source->prompt.checkpoints.clear();
+                    const int64_t parent_fork_id = fork_res.parent_fork_id;
+                    const int64_t parent_node_id = fork_res.parent_node_id;
+                    const int64_t state_id = fork_res.state_id;
+                    const int64_t fork_id = fork_res.fork_id;
                     std::vector<server_slot *> family_members = destinations;
                     family_members.push_back(source);
                     std::sort(family_members.begin(), family_members.end(), [](const auto * left, const auto * right) {
                         return left->id < right->id;
                     });
-                    for (server_slot * member : family_members) {
-                        member->fork_source_id = id_slot;
-                        member->state_id = state_id;
-                        member->node_id = (int64_t) statetree_next_node_id++;
-                        member->parent_node_id = parent_node_id;
-                        member->materialized_snapshot_id = -1;
-                        member->materialized_content_digest.clear();
-                        member->fork_id = fork_id;
-                    }
-                    touch_family(id_slot, fork_id, false);
 
                     std::vector<int> family_slots;
                     family_slots.reserve(family_members.size());
