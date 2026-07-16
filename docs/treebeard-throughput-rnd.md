@@ -288,7 +288,11 @@ gate. Evidence:
 
 ### T10 - Sequence-ragged StateTree KV attention plus state-I/O fusion
 
-State: gated and advanced as the turbo-statetree-0.1.0-rc.5 candidate.
+State: shipped. RC5 (de0834ca0) promoted 21:52; superseded same night by
+RC6 (d794fd15d, build b9695) at 23:39 after the B2 sweep exposed and fixed a
+fork-surface graph-build crash (`plan.n_kv * n_streams > kv_size` via the
+pre-permute stream-broadcast views; fix re-gated golden + fragmented with
+statistically identical numbers and exact parity).
 
 Hypothesis: on fragmented multi-branch StateTree shapes, attending only over
 each branch's actual KV (indexed FATTN) removes the dense-padded scan; and the
@@ -311,10 +315,10 @@ dense-shape win.
   (ragged + state-io) +70.92% versus the both-off midpoint; state-io
   incremental +7.56%. Evidence:
   `results/treebeard-ragged-promo-b70/20260715-195819-confirm-comp-aba`.
-- [x] Q8 ncols weight-hoist composition (C3): +1.12% p50 over the ship config
-  (its >= 1.0% p50 gate passes) but +0.18% mean; adoption deferred pending a
-  hoist-on dense golden arm because every golden-shape measurement ran
-  hoist=0. The hoist stays compiled default-off with strengthened evidence.
+- [x] Q8 ncols weight-hoist composition (C3): RESOLVED-PARKED. The RC5-build
+  arm read +1.12% p50 / +0.18% mean; the fixed-build re-gate read -0.69% p50
+  (`20260715-230300-confirm-comp-aba`) — the hair-pass was repeat noise.
+  Adoption closed; stays compiled default-off.
 - [ ] 250k long-prefix ragged-ON parity and commit-churn probes: OFF-arm
   completed clean (no assert trips at 250k); the ON-arm windows were
   externally stopped twice and are queued as follow-up. Dense serving is
