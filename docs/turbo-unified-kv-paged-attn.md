@@ -1,5 +1,7 @@
 # Turbo Experiment: Unified-KV Paged Attention for `-kvu`
 
+> Status: historical R&D experiment (not an optimization claim).
+
 ## Status
 
 This is an R&D experiment, not an optimization claim.

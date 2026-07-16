@@ -1,5 +1,9 @@
 # Turbo Experiment: Single-Answer Speculative Breakout
 
+> Status: historical / parked. Token-level speculation has three STOP verdicts;
+> do not reopen without new evidence. Evidence archived under
+> `reports/archive/20260708-serving-speculative/`.
+
 ## Status
 
 Prototype harness only. This is not server-side speculative decoding and it does

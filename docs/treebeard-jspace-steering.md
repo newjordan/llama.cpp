@@ -1,5 +1,8 @@
 # Treebeard J-Space steering
 
+> Status: historical / parked exploration (not an active lever). Evidence is
+> archived under `reports/archive/20260713-jspace-steering/`.
+
 ## Decision
 
 J-Space steering is a credible Treebeard foundation improvement, but the

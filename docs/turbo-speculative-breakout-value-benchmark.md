@@ -1,5 +1,8 @@
 # Turbo Speculative Breakout Product-Value Benchmark
 
+> Status: historical / parked (speculative-breakout line; see
+> `turbo-speculative-breakout.md`).
+
 ## Purpose
 
 The `objective-core` suite validates the harness. It does not measure product

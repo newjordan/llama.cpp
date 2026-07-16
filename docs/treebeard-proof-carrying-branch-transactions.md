@@ -1,5 +1,10 @@
 # Treebeard Proof-Carrying Branch Transactions
 
+> Currency note (2026-07-16): this remains the canonical ordered plan, but
+> PCBT-0..8 have since landed and shipped as a live surface in RC8. The
+> "no API implemented yet" status below is historical to the original
+> authoring. See `reports/treebeard-fresh-session-handoff-20260716-rc8.md`.
+
 ## Status
 
 Planned architecture. This document is the canonical ordered implementation

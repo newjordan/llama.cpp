@@ -1,5 +1,8 @@
 # Turbo StateTree Benchmark Gate
 
+> Status: historical (RC1-3 era gate). The current promotion gates are the
+> ragged golden/confirm guards; see `docs/treebeard-throughput-rnd.md`.
+
 Latest completed production-size gate:
 `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md` (passed 24/24 matched
 dense/fragmented checks; see its `GGML_SYCL_F16` build-audit note).

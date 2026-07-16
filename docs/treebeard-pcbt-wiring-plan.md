@@ -1,5 +1,8 @@
 # PCBT-2/3 server wiring plan (execute in one clean pass)
 
+> Status: implemented - PCBT-2/3 (and the PCBT-4..8 lifecycle) have landed and
+> shipped in RC8; retained as reference for the wiring approach.
+
 Prereqs in tree: `server-pcbt.h` (records/state machine, tested),
 `server-pcbt-parse.h` (parse/validate/digests, fixture+golden tested).
 Mirror the StateTree surface exactly.
