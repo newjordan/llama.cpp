@@ -104,7 +104,7 @@ The accepted build is frozen at
 ## Boundary and Next Lever
 
 Superseded for serving-thread behavior by
-`reports/turbo-statetree-async-io-b70-acceptance-20260710.md`, which moves all
+`reports/archive/20260710-statetree-durability/turbo-statetree-async-io-b70-acceptance-20260710.md`, which moves all
 durable file I/O to an ordered worker while preserving this content contract.
 
 This accepts durable immutable content, not a persistent DAG. Lineage IDs,

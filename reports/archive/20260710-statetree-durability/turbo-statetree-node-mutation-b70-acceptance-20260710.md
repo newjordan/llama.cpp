@@ -156,7 +156,7 @@ signature was observed.
 The next bounded routing lever described here has now been completed and
 accepted. Node-addressed re-fork removes the last physical-slot rediscovery
 from a committed logical transaction. See
-`reports/turbo-statetree-node-refork-b70-acceptance-20260710.md`. The larger
+`reports/archive/20260710-statetree-durability/turbo-statetree-node-refork-b70-acceptance-20260710.md`. The larger
 architecture decision remains whether the graph needs frozen content
 snapshots, merge nodes, or a durable namespace before it can be called a
 persistent DAG.

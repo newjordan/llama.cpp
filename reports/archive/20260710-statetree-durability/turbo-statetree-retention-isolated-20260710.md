@@ -139,7 +139,7 @@ retention-pressure/retention-candidate-dirty-pressure.result.json
 ```
 
 The compact machine-readable summary is
-`reports/turbo-statetree-retention-isolated-20260710-summary.json`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-isolated-20260710-summary.json`.
 
 ## Remaining Acceptance Work
 

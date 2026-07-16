@@ -10,8 +10,8 @@ This is not an accepted benchmark baseline and has not been deployed. The
 accepted first transaction slice and its matched B70 evidence are unchanged.
 The full isolated dense/fragmented, pressure, expiry, race, and churn gate and
 the matched 35B/B70 gate pass; see
-`reports/turbo-statetree-retention-isolated-20260710.md` and
-`reports/turbo-statetree-retention-b70-acceptance-20260710.md`. The later
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-isolated-20260710.md` and
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-b70-acceptance-20260710.md`. The later
 logical-state slice is outside this implementation's acceptance boundary.
 
 ## Implemented Contract

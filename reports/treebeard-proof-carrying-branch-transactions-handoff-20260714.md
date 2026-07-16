@@ -96,7 +96,7 @@ automatic restoration, and a hardware-fault scan.
 
 - `docs/turbo-statetree.md`
 - `docs/turbo-statetree-benchmark.md`
-- `reports/turbo-statetree-next-leg-handoff-20260710.md`
+- `reports/archive/20260710-statetree-durability/turbo-statetree-next-leg-handoff-20260710.md`
 
 Important accepted mechanics:
 

@@ -6,12 +6,12 @@ A process-scoped logical lineage handle and bounded transition journal are
 implemented in the uncommitted `turbo-combined` working tree. The later B70
 dense, fragmented, exact-pressure, lookup, and journal gates passed, accepting
 this slice as an R&D baseline. See
-`reports/turbo-statetree-node-identity-b70-acceptance-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-node-identity-b70-acceptance-20260710.md`.
 
 This is still not a production rollout.
 
 Bounded retention underneath this work is separately accepted in
-`reports/turbo-statetree-retention-b70-acceptance-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-b70-acceptance-20260710.md`.
 
 ## Contract
 

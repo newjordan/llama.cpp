@@ -238,7 +238,7 @@ restore/kernel-journal-all-maintenance.log
 ```
 
 The compact repository artifact is
-`reports/turbo-statetree-b70-benchmark-20260709-summary.json`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709-summary.json`.
 
 ## Acceptance And Next Leg
 

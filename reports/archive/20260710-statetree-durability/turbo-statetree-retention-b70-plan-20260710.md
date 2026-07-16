@@ -5,7 +5,7 @@
 Executed by explicit user request on 2026-07-10. Both matched transaction
 windows and the production-scale pressure gate passed. Production `:8093` was
 left inactive for continued R&D rather than automatically restored. Results
-are in `reports/turbo-statetree-retention-b70-acceptance-20260710.md`.
+are in `reports/archive/20260710-statetree-durability/turbo-statetree-retention-b70-acceptance-20260710.md`.
 
 The material below is preserved as the pre-execution safety and acceptance
 plan.

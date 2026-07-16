@@ -1,7 +1,7 @@
 # Turbo R&D Handoff - 2026-07-09
 
 For the next StateTree architecture leg, start with
-`reports/turbo-statetree-next-leg-handoff-20260710.md`. This note remains the
+`reports/archive/20260710-statetree-durability/turbo-statetree-next-leg-handoff-20260710.md`. This note remains the
 historical handoff for the accepted first transaction slice.
 
 ## Read This First
@@ -11,7 +11,7 @@ prior chat. Start with these files:
 
 1. `AGENTS.md`
 2. `TURBO_RND.md`
-3. `reports/turbo-statetree-b70-benchmark-20260709.md`
+3. `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md`
 4. `docs/turbo-statetree.md`
 5. `reports/archive/20260708-serving-speculative/turbo-slot-fork-20260709.md`
 6. This handoff
@@ -163,8 +163,8 @@ state. This is still a physical-slot contract, not a durable logical DAG.
 Relevant evidence:
 
 - `docs/turbo-statetree.md`
-- `reports/turbo-statetree-commit-20260709.md`
-- `reports/turbo-statetree-b70-benchmark-20260709.md`
+- `reports/archive/20260710-statetree-durability/turbo-statetree-commit-20260709.md`
+- `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md`
 
 ### Measurement Harnesses
 
@@ -362,7 +362,7 @@ non-overlapping files or separate worktrees.
 ```text
 Work in /home/frosty40/turbo/turbo-combined on branch turbo-combined.
 Read AGENTS.md, TURBO_RND.md, reports/archive/20260708-serving-speculative/turbo-rnd-handoff-20260709.md,
-and reports/turbo-statetree-b70-benchmark-20260709.md. Treat StateTree
+and reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md. Treat StateTree
 implementation 9a37cb8fd and benchmark checkpoint 35a439d2c as the accepted
 R&D baseline. Do not touch production :8093 until the next gate is implemented
 and reviewed. First design a bounded lease/byte-budget leg around the measured

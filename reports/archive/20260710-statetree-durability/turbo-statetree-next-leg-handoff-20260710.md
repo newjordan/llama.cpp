@@ -6,27 +6,27 @@ This handoff has now been executed in the uncommitted working tree. Bounded
 leases, exact global live prompt-state budgeting, generation-fenced retained
 slot access, telemetry, benchmark hardening, and focused/full development
 verification are implemented. Continue from
-`reports/turbo-statetree-retention-implementation-20260710.md`; preserve the
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-implementation-20260710.md`; preserve the
 material below as the design and acceptance checklist that drove the work.
 
 The bounded-retention slice is now an accepted R&D baseline. The full isolated
 matrix, matched B70 matrix, and production-scale pressure gate pass. See
-`reports/turbo-statetree-retention-isolated-20260710.md` and
-`reports/turbo-statetree-retention-b70-acceptance-20260710.md`. A later logical
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-isolated-20260710.md` and
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-b70-acceptance-20260710.md`. A later logical
 `state_id` and transaction-journal slice and the subsequent immutable
 branch-node slice are also accepted R&D baselines after their B70 gates. See
-`reports/turbo-statetree-node-identity-b70-acceptance-20260710.md`. The next
+`reports/archive/20260710-statetree-durability/turbo-statetree-node-identity-b70-acceptance-20260710.md`. The next
 node-addressed mutation slice is accepted as well: commit, renew, and erase can
 resolve an exact live node without a physical slot URL. See
-`reports/turbo-statetree-node-mutation-b70-acceptance-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-node-mutation-b70-acceptance-20260710.md`.
 Node-addressed re-fork is now accepted too, so a committed transaction can
 create its next structural generation without rediscovering a physical slot.
-See `reports/turbo-statetree-node-refork-b70-acceptance-20260710.md`.
+See `reports/archive/20260710-statetree-durability/turbo-statetree-node-refork-b70-acceptance-20260710.md`.
 The following immutable-content slice is implemented and B70-gated as well:
 node-addressed capture creates a separately budgeted SHA-256 content object,
 identical payloads deduplicate behind provenance handles, and materialization
 creates a fresh protected node without re-evaluating the prompt. See
-`reports/turbo-statetree-immutable-snapshot-b70-acceptance-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-immutable-snapshot-b70-acceptance-20260710.md`.
 
 Current operational state overrides the historical production section below:
 the user explicitly requested the 35B model be stopped for R&D. Unit
@@ -36,17 +36,17 @@ clear. Do not restart it without explicit approval.
 ## Start Here
 
 This was the pre-implementation fresh-session entry point. For current work,
-read `reports/turbo-statetree-retention-isolated-20260710.md` first, then
-`reports/turbo-statetree-retention-implementation-20260710.md`, then
+read `reports/archive/20260710-statetree-durability/turbo-statetree-retention-isolated-20260710.md` first, then
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-implementation-20260710.md`, then
 use the following order for accepted-baseline context:
 
 1. `AGENTS.md`
 2. `TURBO_RND.md`
-3. `reports/turbo-statetree-b70-benchmark-20260709.md`
+3. `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md`
 4. `docs/turbo-statetree.md`
 5. `docs/turbo-statetree-benchmark.md`
 6. This handoff
-7. `reports/turbo-statetree-node-identity-b70-acceptance-20260710.md`
+7. `reports/archive/20260710-statetree-durability/turbo-statetree-node-identity-b70-acceptance-20260710.md`
 
 Do not reconstruct the previous conversation. The first StateTree transaction
 slice is implemented, correctness-tested, production-size benchmarked, and
@@ -110,7 +110,7 @@ verification, exact disk accounting, and a pre-allocation cold-load ceiling.
 The final two-process B70 gate passed with exact continuation parity. Graph
 identity and provenance edges remain process-local, so this is not yet a
 persistent DAG. See
-`reports/turbo-statetree-durable-content-b70-acceptance-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-durable-content-b70-acceptance-20260710.md`.
 
 The subsequent asynchronous-I/O slice removes durable file work from the
 state thread. One ordered worker owns spill/load/erase, exact state-thread
@@ -118,7 +118,7 @@ reservations bound disk and aggregate transient payloads, canceled owners are
 discarded before slot mutation, and shutdown drains without partial objects.
 The B70 overlap gate kept `/states` below 0.6 ms during 165.829 ms spill I/O and
 completed an independent inference before the spill queue drained. See
-`reports/turbo-statetree-async-io-b70-acceptance-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-async-io-b70-acceptance-20260710.md`.
 
 ## Accepted B70 Result
 
@@ -156,8 +156,8 @@ Raw evidence:
 
 Durable summaries:
 
-- `reports/turbo-statetree-b70-benchmark-20260709.md`
-- `reports/turbo-statetree-b70-benchmark-20260709-summary.json`
+- `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md`
+- `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709-summary.json`
 
 ## Benchmark Audit Lesson
 
@@ -220,7 +220,7 @@ rollback capture, an automatic rollback timer, and explicit approval.
 
 Bounded StateTree retention now implements leases plus an authoritative byte
 budget. The exact decisions and verification evidence are recorded in
-`reports/turbo-statetree-retention-implementation-20260710.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-retention-implementation-20260710.md`.
 
 The goal is not merely an expiration timer. The server must make retained state
 bounded, observable, race-safe, and useful under pressure.
@@ -300,8 +300,8 @@ finish the remaining B70 gate rather than reimplementing this leg.
 ```text
 Work in /home/frosty40/turbo/turbo-combined on branch turbo-combined.
 Read AGENTS.md, TURBO_RND.md,
-reports/turbo-statetree-next-leg-handoff-20260710.md,
-reports/turbo-statetree-b70-benchmark-20260709.md,
+reports/archive/20260710-statetree-durability/turbo-statetree-next-leg-handoff-20260710.md,
+reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md,
 docs/turbo-statetree.md, and docs/turbo-statetree-benchmark.md.
 
 Treat benchmark checkpoint 6051ddf31, its private turbo_RND snapshot

@@ -2,7 +2,7 @@
 
 > Follow-up: the matched Qwen3.6-35B/B70 gate subsequently passed all 24
 > dense/fragmented regression checks with zero failures. See
-> `reports/turbo-statetree-b70-benchmark-20260709.md`. An initially mismatched
+> `reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md`. An initially mismatched
 > `GGML_SYCL_F16=OFF` parent run was discarded before acceptance.
 
 ## Status
@@ -181,7 +181,7 @@ Raw local artifacts:
 ```
 
 The compact durable data is in
-`reports/turbo-statetree-benchmark-20260709-summary.json`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-benchmark-20260709-summary.json`.
 
 ## Harness Validation
 
@@ -205,4 +205,4 @@ The required maintenance run is complete. It used the production model and
 fragmented parent/candidate lanes, Xe DRM memory telemetry, physical page-probe
 rows, a full-width 12-slot stress lane, and kernel-reset inspection. The
 matched gate passed; exact results and the build-confounder audit are in
-`reports/turbo-statetree-b70-benchmark-20260709.md`.
+`reports/archive/20260710-statetree-durability/turbo-statetree-b70-benchmark-20260709.md`.

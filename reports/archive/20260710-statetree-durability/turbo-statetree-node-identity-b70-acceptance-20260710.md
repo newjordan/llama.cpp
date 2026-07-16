@@ -160,6 +160,6 @@ was observed.
 The next architectural lever described here has now been completed and
 accepted. Node-addressed commit, renew, and erase resolve a live node without a
 physical slot URL. See
-`reports/turbo-statetree-node-mutation-b70-acceptance-20260710.md`. A later leg
+`reports/archive/20260710-statetree-durability/turbo-statetree-node-mutation-b70-acceptance-20260710.md`. A later leg
 must explicitly choose whether to materialize frozen content snapshots, merge
 nodes, or a durable cross-process namespace before claiming a persistent DAG.
