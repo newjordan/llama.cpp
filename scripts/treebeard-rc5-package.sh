@@ -15,7 +15,14 @@ MODEL=/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
 NAME=turbo-statetree-0.1.0-$RC
 RELEASE=/home/frosty40/turbo/turbo-combined/release/$NAME
 PREFIX=/opt/$NAME
-ALIAS=$NAME-Qwen3.6-35B-A3B-Q5-c262144-np12-ragged
+ALIAS=$NAME-Qwen3.6-35B-A3B-Q5-c262144-np12-${TREEBEARD_ALIAS_SUFFIX:-ragged}
+# Extra Environment= lines for the unit and smoke arms (space-separated
+# KEY=VAL list), e.g. TREEBEARD_PCBT_ENABLE=1 for rc.8+.
+read -r -a UNIT_EXTRA_ENV_ARR <<< "${TREEBEARD_UNIT_EXTRA_ENV:-}"
+UNIT_EXTRA_ENV_LINES=""
+for kv in "${UNIT_EXTRA_ENV_ARR[@]}"; do
+    UNIT_EXTRA_ENV_LINES+="Environment=$kv"$'\n'
+done
 UNIT="$HOME/.config/systemd/user/turbo-statetree-${RC/rc./rc}.service"
 BENCH_PORT=8098
 FROZEN_COMMIT="${TREEBEARD_FROZEN_COMMIT:-de0834ca0}"
@@ -107,7 +114,7 @@ Environment=GGML_SYCL_ENABLE_MOE_DOWN_GROUPED=0
 Environment=LLAMA_KV_TREE_RAGGED=1
 Environment=GGML_SYCL_ENABLE_STATE_IO_FUSION=1
 Environment=GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=$HOIST
-ExecStart=/usr/bin/bash -lc 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; export LD_LIBRARY_PATH=$RELEASE/root$PREFIX/lib:\$LD_LIBRARY_PATH; exec /usr/bin/taskset -c 0-10,12-15 $RELEASE/root$PREFIX/bin/llama-server -m $MODEL -ngl 99 -ncmoe 0 --no-op-offload -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 -b 8192 -ub 1024 -t 15 --host 0.0.0.0 --port 8093 --jinja --metrics -a $ALIAS'
+${UNIT_EXTRA_ENV_LINES}ExecStart=/usr/bin/bash -lc 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; export LD_LIBRARY_PATH=$RELEASE/root$PREFIX/lib:\$LD_LIBRARY_PATH; exec /usr/bin/taskset -c 0-10,12-15 $RELEASE/root$PREFIX/bin/llama-server -m $MODEL -ngl 99 -ncmoe 0 --no-op-offload -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 -b 8192 -ub 1024 -t 15 --host 0.0.0.0 --port 8093 --jinja --metrics -a $ALIAS'
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=180
@@ -160,6 +167,7 @@ env GGML_SYCL_ENABLE_FUSION=1 GGML_SYCL_DISABLE_GRAPH=1 \
     GGML_SYCL_ENABLE_MOE_PIPELINE=0 GGML_SYCL_ENABLE_MOE_DOWN_GROUPED=0 \
     LLAMA_KV_TREE_RAGGED=1 GGML_SYCL_ENABLE_STATE_IO_FUSION=1 \
     GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST="$HOIST" \
+    ${UNIT_EXTRA_ENV_ARR[@]+"${UNIT_EXTRA_ENV_ARR[@]}"} \
     LD_LIBRARY_PATH="$RELEASE/root$PREFIX/lib:${LD_LIBRARY_PATH:-}" \
     taskset -c 0-10,12-15 "$RELEASE/root$PREFIX/bin/llama-server" \
     -m "$MODEL" -ngl 99 -ncmoe 0 --no-op-offload \
@@ -177,6 +185,9 @@ jq -e --arg alias "$ALIAS" \
     '.model_alias == $alias and .total_slots == 12 and
      .default_generation_settings.n_ctx == 262144' "$OUT/smoke-props.json" >/dev/null
 jq -r '.build_info' "$OUT/smoke-props.json" > "$OUT/smoke-build-info.txt"
+if [[ " ${TREEBEARD_UNIT_EXTRA_ENV:-} " == *" TREEBEARD_PCBT_ENABLE=1 "* ]]; then
+    jq -e '.pcbt.enabled == true' "$OUT/smoke-props.json" >/dev/null
+fi
 curl -fsS --max-time 120 "http://127.0.0.1:$BENCH_PORT/completion" \
     -H 'Content-Type: application/json' \
     -d '{"prompt":"Deterministic smoke: 2+2=","n_predict":8,"temperature":0,"seed":42}' \
