@@ -39,6 +39,8 @@ BASE_ENV=(
 )
 CONTROL_ENV=(LLAMA_KV_TREE_RAGGED=0 GGML_SYCL_ENABLE_STATE_IO_FUSION=0)
 CANDIDATE_ENV=(LLAMA_KV_TREE_RAGGED=1 GGML_SYCL_ENABLE_STATE_IO_FUSION=1)
+STIO_ONLY_ENV=(LLAMA_KV_TREE_RAGGED=0 GGML_SYCL_ENABLE_STATE_IO_FUSION=1)
+STIO_DIAG="${TREEBEARD_STIO_DIAG:-1}"
 
 stop_candidate() {
     local label="${CURRENT_LABEL:-none}"
@@ -122,6 +124,8 @@ start_server() {
     local -a mode_env
     if [[ "$mode" == control ]]; then
         mode_env=("${CONTROL_ENV[@]}")
+    elif [[ "$mode" == stio-only ]]; then
+        mode_env=("${STIO_ONLY_ENV[@]}")
     else
         mode_env=("${CANDIDATE_ENV[@]}")
     fi
@@ -188,20 +192,26 @@ check_common_arm() {
     fi
 }
 
+# NOTE: llama-server suppresses INFO-level llama internals in this
+# configuration, so the `sequence-ragged indexed attention available` INFO
+# line NEVER appears in server logs (only W/E lines print — verified against
+# the accepted 20260715 screen artifacts and the 20260715-192041 attempt).
+# Capability/activation evidence for the ragged path lives in the fragmented
+# confirm run (kv-page-probe n_kv reduction + tps gates), not here. Here we
+# assert only the env contract via the W-level disable line.
 check_control_arm() {
     local label="$1"
     check_common_arm "$label"
     rg -q 'sequence-ragged attention disabled' "$OUT/$label/server.log"
-    if rg -q 'sequence-ragged indexed attention available' "$OUT/$label/server.log"; then
-        printf '%s_UNEXPECTED_RAGGED_AVAILABLE\n' "${label^^}" >&2
-        exit 1
-    fi
 }
 
 check_candidate_arm() {
     local label="$1"
     check_common_arm "$label"
-    rg -q 'sequence-ragged indexed attention available' "$OUT/$label/server.log"
+    if rg -q 'sequence-ragged attention disabled' "$OUT/$label/server.log"; then
+        printf '%s_UNEXPECTED_RAGGED_DISABLED\n' "${label^^}" >&2
+        exit 1
+    fi
 }
 
 # --- Preflight: live production identity ---
@@ -276,6 +286,16 @@ run_screen control-b
 check_control_arm control-b
 stop_candidate
 sleep 5
+
+# Attribution arm (diagnostic, not a gate arm): state-io fusion alone on the
+# dense shape, to separate its contribution from the ragged env.
+if [[ "$STIO_DIAG" == 1 ]]; then
+    start_server stio-only stio-only
+    run_screen stio-only
+    check_control_arm stio-only
+    stop_candidate
+    sleep 5
+fi
 
 # --- Activation diagnostic (not a perf arm): candidate env + state-io debug,
 # one short completion; assert the state-io runtime plan forms. ---
