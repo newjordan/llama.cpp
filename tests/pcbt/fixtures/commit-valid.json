@@ -1,0 +1,10 @@
+{
+  "winner_node_id": 23,
+  "expected_fork_id": 43,
+  "candidate_digest": "sha256:0f0e0d0c0b0a09080706050403020100ffeeddccbbaa99887766554433221100",
+  "evidence": {
+    "kind": "repo-test-v1",
+    "digest": "sha256:00112233445566778899aabbccddeeff0f0e0d0c0b0a0908070605040302010f",
+    "summary": {"passed": 47, "failed": 0}
+  }
+}

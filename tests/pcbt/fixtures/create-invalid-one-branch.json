@@ -1,0 +1,7 @@
+{
+  "request_id": "run-2",
+  "source": {"node_id": 19},
+  "branches": [{"key": "only", "request": {"prompt": "x", "max_tokens": 64}}],
+  "budget": {"max_slots": 2, "max_predicted_tokens": 128, "deadline_ms": 60000, "max_candidate_bytes": 65536},
+  "acceptance_contract": {"kind": "external", "name": "repo-test-v1"}
+}

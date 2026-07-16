@@ -1,0 +1,11 @@
+{
+  "request_id": "run-42.attempt-1",
+  "source": {"node_id": 19, "state_id": 7, "fork_id": 42},
+  "branches": [
+    {"key": "implementation-a", "request": {"prompt": "...", "max_tokens": 512, "seed": 101}},
+    {"key": "implementation-b", "request": {"prompt": "...", "max_tokens": 512, "seed": 202}},
+    {"key": "implementation-c", "request": {"prompt": "...", "max_tokens": 512, "seed": 303}}
+  ],
+  "budget": {"max_slots": 3, "max_predicted_tokens": 1536, "deadline_ms": 120000, "max_candidate_bytes": 1048576},
+  "acceptance_contract": {"kind": "external", "name": "repo-test-v1"}
+}

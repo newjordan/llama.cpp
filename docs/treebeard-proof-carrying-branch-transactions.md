@@ -244,19 +244,23 @@ and enqueue tasks; workers report completions through existing task results.
 
 ### PCBT-0 - Freeze the contract and threat model
 
-- [ ] Define JSON schemas for create, observe, events, commit, and abort.
-- [ ] Define canonical normalization and domain-separated SHA-256 digests for
+State: complete (2026-07-16). Contract: `docs/treebeard-pcbt-contract-v1.md`;
+fixtures: `tests/pcbt/fixtures/` (11 cases); reference canonicalization +
+golden digest lock: `scripts/treebeard-pcbt-contract-lint.py`.
+
+- [x] Define JSON schemas for create, observe, events, commit, and abort.
+- [x] Define canonical normalization and domain-separated SHA-256 digests for
   create requests, candidates, decisions, evidence, and receipts.
-- [ ] Specify status values, legal transitions, terminal error classes, HTTP
+- [x] Specify status values, legal transitions, terminal error classes, HTTP
   status mapping, and retry semantics.
-- [ ] Specify `request_id` scope and exact-body idempotency behavior.
-- [ ] Specify deadline behavior for queued, running, completed, and
+- [x] Specify `request_id` scope and exact-body idempotency behavior.
+- [x] Specify deadline behavior for queued, running, completed, and
   awaiting-decision branches.
-- [ ] State explicitly that external evidence is bound but not semantically
+- [x] State explicitly that external evidence is bound but not semantically
   trusted or executed by the server.
-- [ ] Define the deferred-effect boundary and prohibit tool execution in all
+- [x] Define the deferred-effect boundary and prohibit tool execution in all
   speculative branches.
-- [ ] Add schema fixtures before server implementation.
+- [x] Add schema fixtures before server implementation.
 
 Exit gate: contract review can answer every mutation, retry, expiry, and
 side-effect question without relying on allocator or scheduler behavior.
