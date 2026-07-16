@@ -37,7 +37,7 @@ This is an architecture and experiment-order report, not a new performance
 claim. It uses:
 
 - The accepted RC4 same-binary A/B/A result in
-  `reports/treebeard-moe-rnd-b70-evidence-20260714.md`.
+  `reports/archive/20260714-throughput-kernel-rnd/treebeard-moe-rnd-b70-evidence-20260714.md`.
 - The implementation ledger in `docs/treebeard-throughput-rnd.md`.
 - The historical StateTree and speculative-breakout reports.
 - The earlier B70 single-token fusion measurements in the local repository.

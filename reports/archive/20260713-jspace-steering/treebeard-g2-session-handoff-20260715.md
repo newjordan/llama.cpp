@@ -70,7 +70,7 @@ explicitly requests one.
 - `ggml/src/ggml-sycl/mmvq.cpp`;
 - `tests/test-backend-ops.cpp`;
 - `scripts/treebeard-q8-hoist-profile-b70-guarded.sh`;
-- `reports/treebeard-fresh-session-handoff-20260715.md`.
+- `reports/archive/20260715-ragged-promotion/treebeard-fresh-session-handoff-20260715.md`.
 
 ## Guardrails
 

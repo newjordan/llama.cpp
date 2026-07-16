@@ -12,7 +12,7 @@ reproduced exactly. RC4 was restored and remains healthy.
 Full evidence and interpretation:
 
 ```text
-reports/treebeard-single-wavefront-b70-benchmark-20260715.md
+reports/archive/20260714-throughput-kernel-rnd/treebeard-single-wavefront-b70-benchmark-20260715.md
 ```
 
 ## Outcome
@@ -336,7 +336,7 @@ The strict shallow gate therefore stopped the experiment before any new 32K,
 128K, 256K, or 12-agent measurement.
 
 Full results are in
-`reports/treebeard-serial-anchor-b70-benchmark-20260715.md`.
+`reports/archive/20260714-throughput-kernel-rnd/treebeard-serial-anchor-b70-benchmark-20260715.md`.
 
 ## Parked paths
 

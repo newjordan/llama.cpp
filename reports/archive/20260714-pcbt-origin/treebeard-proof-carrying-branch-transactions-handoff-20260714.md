@@ -71,7 +71,7 @@ The current Git worktree contains completed MoE R&D changes, including an
 accepted T2 + T3 path and an opt-in composite pipeline parked after a decisive
 regression. It is not a clean dedicated PCBT checkout. Preserve all existing
 files. Do not reset, discard, or fold the MoE changes into PCBT casually. The
-control evidence is in `reports/treebeard-moe-rnd-b70-evidence-20260714.md`.
+control evidence is in `reports/archive/20260714-throughput-kernel-rnd/treebeard-moe-rnd-b70-evidence-20260714.md`.
 
 Live service at handoff:
 

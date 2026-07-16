@@ -261,7 +261,7 @@ collapsed residual `MUL_MAT_ID` from 38.2 to 1.2 calls/eval and moved
 screen improved only from 36.7296 to 37.9101 tok/s (+3.21%). This misses the
 10% entry gate; a concurrency sweep is not warranted. Retain only the named
 profiling instrumentation. Evidence:
-`reports/treebeard-single-token-moe-down-fusion-20260715.md` and
+`reports/archive/20260714-throughput-kernel-rnd/treebeard-single-token-moe-down-fusion-20260715.md` and
 `results/treebeard-single-wavefront-b70/20260715-003634`.
 
 ### T9 - Linear-attention multi-projection fusion
@@ -284,7 +284,7 @@ the dispatch-cost bound, eliminating three submissions can reclaim only about
 relative to the irreducible weights. This misses the 10% implementation entry
 gate. Evidence:
 `results/treebeard-single-wavefront-b70/20260715-005316` and
-`reports/treebeard-linear-attention-projection-fusion-20260715.md`.
+`reports/archive/20260714-throughput-kernel-rnd/treebeard-linear-attention-projection-fusion-20260715.md`.
 
 ### T10 - Sequence-ragged StateTree KV attention plus state-I/O fusion
 
