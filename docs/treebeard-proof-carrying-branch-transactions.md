@@ -326,17 +326,32 @@ retry behavior against a server with inference disabled.
 
 ### PCBT-3 - Implement atomic create, reservation, and fork
 
-- [ ] Resolve the source by immutable `node_id` with optional state and
+State: complete (2026-07-16). The SLOT_FORK clone/COW-fork/identity core is
+extracted into `statetree_fork_family` (behavior-identical; SLOT_FORK keeps
+its prelude/tail) and PCBT create reuses it: source resolved by immutable
+node id with optional state/fork assertions, idle-destination auto-selection
+with all-or-nothing capacity rejection before any mutation, registry
+creation only after fork success (invariant 2), create event with exact
+assignments, and the 201-shape view. Gated by `TREEBEARD_PCBT_ENABLE=1`
+(default off — slot lifecycle lands with PCBT-4/7, so production must not
+expose create yet; /props reports enabled:false). Route-smoke matrix green:
+fork-backed create, exact idempotent retry (same transaction), request_id
+conflict, observe/events with create event, and insufficient-idle-slots 503
+with zero orphan reservations. Dense/fragmented KV-semantics equivalence
+rests on the mechanical extraction plus the existing guarded StateTree
+gates covering SLOT_FORK.
+
+- [x] Resolve the source by immutable `node_id` with optional state and
   generation assertions.
-- [ ] Require a committed singleton source for the first slice.
-- [ ] Validate branch count, unique keys, aggregate budgets, available slots,
+- [x] Require a committed singleton source for the first slice.
+- [x] Validate branch count, unique keys, aggregate budgets, available slots,
   source idleness, retention capacity, and deadline before mutation.
-- [ ] Select or validate every destination slot before changing any slot.
-- [ ] Reuse the existing StateTree fork implementation instead of duplicating
+- [x] Select or validate every destination slot before changing any slot.
+- [x] Reuse the existing StateTree fork implementation instead of duplicating
   sequence-copy or prompt-clone behavior.
-- [ ] Attach transaction and branch identity to every family member.
-- [ ] Roll back the complete reservation if any pre-dispatch step fails.
-- [ ] Emit one create event containing exact node and slot assignments.
+- [x] Attach transaction and branch identity to every family member.
+- [x] Roll back the complete reservation if any pre-dispatch step fails.
+- [x] Emit one create event containing exact node and slot assignments.
 
 Exit gate: dense and fragmented fixtures prove all-or-nothing creation, exact
 generation identity, zero orphan reservations, and unchanged fork/KV semantics.

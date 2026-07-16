@@ -10,7 +10,7 @@ MODEL="${TREEBEARD_PCBT_SMOKE_MODEL:-/home/frosty40/models/Qwen3.5-0.8B-draft/Qw
 FIX="$WORKTREE/tests/pcbt/fixtures"
 PORT="${TREEBEARD_PCBT_SMOKE_PORT:-8097}"
 
-"$BUILD/bin/llama-server" -m "$MODEL" -c 4096 -np 2 \
+TREEBEARD_PCBT_ENABLE=1 "$BUILD/bin/llama-server" -m "$MODEL" -c 4096 -np 4 -kvu \
     --host 127.0.0.1 --port "$PORT" --jinja -a pcbt-smoke \
     >/tmp/pcbt-route-smoke-server.log 2>&1 &
 PID=$!
@@ -33,10 +33,9 @@ check() {
 }
 code() { curl -s -o /tmp/pcbt-smoke-body.json -w '%{http_code}' "$@"; }
 
-# 1. valid create parses on both threads, hits the PCBT-3 capability boundary
-check "create valid -> capacity boundary" 503 \
+# 1. valid schema, unknown source node -> 404 (gate enabled on this server)
+check "create unknown source -> 404" 404 \
     "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @"$FIX/create-valid-minimal.json")"
-grep -q "not yet enabled" /tmp/pcbt-smoke-body.json && echo "ok   capacity message present"
 
 # 2. schema rejections map to 400
 for f in create-invalid-one-branch create-invalid-dup-keys create-invalid-float-budget \
@@ -57,6 +56,81 @@ check "abort bad body -> 400" 400 \
 check "bogus action -> 400" 400 \
     "$(code -X POST "http://127.0.0.1:$PORT/transactions/7?action=bogus" -H 'Content-Type: application/json' -d '{}')"
 check "non-numeric id -> 400" 400 "$(code "http://127.0.0.1:$PORT/transactions/abc")"
+
+# --- PCBT-3 create matrix (fork-backed, TREEBEARD_PCBT_ENABLE=1) ----------
+# Populate a prompt, mint node identity via fork, commit the root back to a
+# committed singleton, then use its node id as the PCBT source.
+curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+    -d '{"prompt":"pcbt smoke source:","n_predict":4,"temperature":0,"id_slot":0}' >/dev/null
+FORK=$(curl -s -X POST "http://127.0.0.1:$PORT/slots/0?action=fork" \
+    -H 'Content-Type: application/json' -d '{"destinations":[1]}')
+FORK_ID=$(echo "$FORK" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("fork_id",-1))')
+echo "minted fork_id=$FORK_ID"
+curl -s -X POST "http://127.0.0.1:$PORT/slots/0?action=commit" \
+    -H 'Content-Type: application/json' -d "{\"fork_id\":$FORK_ID}" >/dev/null
+NODE_ID=$(curl -s "http://127.0.0.1:$PORT/slots" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+row=[r for r in rows if r.get("id")==0][0]
+print(row.get("node_id",-1))')
+echo "source node_id=$NODE_ID"
+
+mkcreate() {
+    python3 - "$1" "$2" <<PYEOF
+import json,sys
+doc=json.load(open("$FIX/create-valid-minimal.json"))
+doc["request_id"]=sys.argv[1]
+doc["source"]={"node_id":int(sys.argv[2])}
+print(json.dumps(doc))
+PYEOF
+}
+
+if [[ "$NODE_ID" != "-1" ]]; then
+    mkcreate smoke-tx-1 "$NODE_ID" > /tmp/pcbt-create-1.json
+    check "create fork-backed -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-1.json)"
+    TX_ID=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("transaction_id",-1))')
+    GEN=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("generation",-1))')
+    echo "created transaction_id=$TX_ID generation=$GEN"
+    [[ "$TX_ID" != "-1" && "$GEN" != "-1" ]] || fail=1
+
+    check "create exact retry -> 200 same tx" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-1.json)"
+    TX_ID2=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("transaction_id",-2))')
+    check "retry returns same id" "$TX_ID" "$TX_ID2"
+
+    python3 - <<PYEOF > /tmp/pcbt-create-conflict.json
+import json
+doc=json.load(open("/tmp/pcbt-create-1.json"))
+doc["branches"][0]["request"]["max_tokens"]=99
+print(json.dumps(doc))
+PYEOF
+    code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-conflict.json >/dev/null
+    grep -q '"conflict"' /tmp/pcbt-smoke-body.json && echo "ok   request_id conflict class present" || { echo "FAIL conflict class"; fail=1; }
+
+    check "observe created -> 200" 200 "$(code "http://127.0.0.1:$PORT/transactions/$TX_ID")"
+    check "events created -> 200" 200 "$(code "http://127.0.0.1:$PORT/transactions/$TX_ID/events")"
+    grep -q '"create"' /tmp/pcbt-smoke-body.json && echo "ok   create event present" || { echo "FAIL create event"; fail=1; }
+
+    # capacity: family holds slots; a 4-branch create needs 3 more idle.
+    # The first create re-minted node ids, so re-discover slot 0's node.
+    NODE_ID=$(curl -s "http://127.0.0.1:$PORT/slots" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+row=[r for r in rows if r.get("id")==0][0]
+print(row.get("node_id",-1))')
+    mkcreate smoke-tx-cap "$NODE_ID" | python3 -c '
+import json,sys
+doc=json.load(sys.stdin)
+doc["branches"]=[{"key":f"b{i}","request":{"prompt":"x","max_tokens":8}} for i in range(4)]
+doc["budget"]["max_slots"]=4
+print(json.dumps(doc))' > /tmp/pcbt-create-cap.json
+    check "create beyond idle slots -> 503" 503 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-cap.json)"
+else
+    echo "WARN: no source node id available; create matrix skipped" >&2
+    fail=1
+fi
 
 if (( fail )); then
     echo "PCBT ROUTE SMOKE FAILED" >&2

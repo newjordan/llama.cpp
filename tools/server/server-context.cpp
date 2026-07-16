@@ -1063,6 +1063,27 @@ public:
     // the task handler (invariant 1; docs/treebeard-pcbt-contract-v1.md).
     pcbt_registry pcbt_txs;
 
+    json pcbt_transaction_view(const server_branch_transaction & tx) const {
+        json branches = json::array();
+        for (const auto & b : tx.branches) {
+            branches.push_back({
+                {"key", b.key}, {"node_id", b.node_id}, {"slot_id", b.slot_id},
+                {"phase", b.phase == pcbt_branch_phase::QUEUED ? "queued"
+                        : b.phase == pcbt_branch_phase::RUNNING ? "running"
+                        : b.phase == pcbt_branch_phase::COMPLETED ? "completed"
+                        : b.phase == pcbt_branch_phase::FAILED ? "failed" : "canceled"},
+            });
+        }
+        return json {
+            {"transaction_id", tx.id},
+            {"status", pcbt_status_name(tx.status)},
+            {"generation", tx.generation},
+            {"deadline_unix_ms", tx.deadline_unix_ms},
+            {"create_digest", tx.create_digest},
+            {"branches", std::move(branches)},
+        };
+    }
+
     std::unique_ptr<server_task_result_pcbt> handle_pcbt(const server_task & task) {
         auto res = std::make_unique<server_task_result_pcbt>();
         auto fail = [&](pcbt_error e, const char * cls, std::string msg) {
@@ -1081,19 +1102,109 @@ public:
                     break;
                 }
                 // Idempotency probe is read-only; registry mutation may only
-                // happen after a successful fork (invariant 2), which lands
-                // with PCBT-3. Until then the surface is capability-disabled.
+                // happen after a successful fork (invariant 2).
                 const auto it = pcbt_txs.by_request_id.find(req.request_id);
                 if (it != pcbt_txs.by_request_id.end()) {
-                    const auto & existing = pcbt_txs.by_id.at(it->second);
+                    auto & existing = pcbt_txs.by_id.at(it->second);
                     if (existing.create_digest != req.create_digest) {
                         fail(pcbt_error::CONFLICT, "conflict",
                              "request_id reused with a different body");
                         break;
                     }
+                    res->payload = pcbt_transaction_view(existing);
+                    break;
                 }
-                fail(pcbt_error::CAPACITY, "capacity",
-                     "pcbt: transactions not yet enabled (fork wiring pending)");
+                // Slot lifecycle (PCBT-4 scheduling, PCBT-7 expiry/abort) is
+                // not wired yet, so the create surface stays opt-in for test
+                // servers only.
+                static const bool pcbt_enabled = []() {
+                    const char * env = getenv("TREEBEARD_PCBT_ENABLE");
+                    return env != nullptr && atoi(env) != 0;
+                }();
+                if (!pcbt_enabled) {
+                    fail(pcbt_error::CAPACITY, "capacity",
+                         "pcbt: transactions not yet enabled (set TREEBEARD_PCBT_ENABLE=1 on test servers)");
+                    break;
+                }
+                if (!params_base.kv_unified || ctx_dft || spec ||
+                        !params_base.lora_adapters.empty()) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                         "pcbt requires a unified KV cache without speculative decoding or LoRA");
+                    break;
+                }
+                // Resolve the committed singleton source by immutable node id.
+                server_slot * source = nullptr;
+                for (server_slot & slot : slots) {
+                    if (slot.node_id >= 0 && slot.node_id == (int64_t) req.source_node_id) {
+                        source = &slot;
+                        break;
+                    }
+                }
+                if (source == nullptr) {
+                    fail(pcbt_error::NOT_FOUND, "not_found", "unknown source node");
+                    break;
+                }
+                if ((req.source_state_id >= 0 && source->state_id != (int64_t) req.source_state_id) ||
+                        (req.source_fork_id >= 0 && source->fork_id != (int64_t) req.source_fork_id)) {
+                    fail(pcbt_error::CONFLICT, "conflict", "stale source assertion");
+                    break;
+                }
+                if (source->is_processing() || source->prompt.tokens.empty() || !source->lora.empty()) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                         "source must be idle with a cached prompt");
+                    break;
+                }
+                // Branch 0 decodes on the source; branches 1..N-1 need idle
+                // destination slots. All-or-nothing: pick every destination
+                // before mutating anything.
+                std::vector<server_slot *> destinations;
+                for (server_slot & slot : slots) {
+                    if (destinations.size() + 1 >= req.branches.size()) {
+                        break;
+                    }
+                    if (slot.id != source->id && slot.is_available() &&
+                            slot.fork_id < 0 && !slot.is_processing()) {
+                        destinations.push_back(&slot);
+                    }
+                }
+                if (destinations.size() + 1 < req.branches.size()) {
+                    fail(pcbt_error::CAPACITY, "capacity",
+                         "insufficient idle slots for the declared branches");
+                    break;
+                }
+                statetree_fork_family_result fork_res;
+                std::string fork_error;
+                if (!statetree_fork_family(source, destinations, fork_res, fork_error)) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable", fork_error);
+                    break;
+                }
+                // Fork succeeded: registry mutation is now legal.
+                bool conflict = false;
+                auto * tx = pcbt_txs.create(req.request_id, req.create_digest, conflict);
+                GGML_ASSERT(tx != nullptr && !conflict);
+                tx->source_node_id  = req.source_node_id;
+                tx->source_state_id = req.source_state_id;
+                tx->source_fork_id  = req.source_fork_id;
+                tx->generation      = (int32_t) fork_res.fork_id;
+                tx->budget          = req.budget;
+                tx->accepted_unix_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                tx->deadline_unix_ms = tx->accepted_unix_ms + req.budget.deadline_ms;
+                tx->branches.reserve(req.branches.size());
+                for (size_t i = 0; i < req.branches.size(); ++i) {
+                    pcbt_branch b;
+                    b.key     = req.branches[i].first;
+                    server_slot * host = i == 0 ? source : destinations[i - 1];
+                    b.slot_id = host->id;
+                    b.node_id = (int32_t) host->node_id;
+                    tx->branches.push_back(std::move(b));
+                }
+                json assignments = json::object();
+                for (const auto & b : tx->branches) {
+                    assignments[b.key] = {{"node_id", b.node_id}, {"slot_id", b.slot_id}};
+                }
+                tx->push_event(tx->accepted_unix_ms, "create", assignments.dump());
+                res->payload = pcbt_transaction_view(*tx);
                 break;
             }
             case OP::OBSERVE:
@@ -1103,13 +1214,7 @@ public:
                     fail(pcbt_error::NOT_FOUND, "not_found", "unknown transaction");
                     break;
                 }
-                json view {
-                    {"transaction_id", tx->id},
-                    {"status", pcbt_status_name(tx->status)},
-                    {"generation", tx->generation},
-                    {"deadline_unix_ms", tx->deadline_unix_ms},
-                    {"create_digest", tx->create_digest},
-                };
+                json view = pcbt_transaction_view(*tx);
                 if (task.pcbt.op == OP::EVENTS) {
                     json events = json::array();
                     for (const auto & e : tx->events) {
