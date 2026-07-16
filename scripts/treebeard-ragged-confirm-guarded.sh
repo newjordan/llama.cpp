@@ -173,7 +173,15 @@ if [[ "$EDGE_PROBES" == 1 ]]; then
     EDGE_ARGS=(--layout dense --prefix-tokens 250000 --branch-suffix-tokens 8
         --branch-tokens 64 --repeats 1 --modes manual --seed 1709
         --request-timeout "$EDGE_TIMEOUT")
-    run_arm edge-long-off 0 1 0 "${EDGE_ARGS[@]}"
+    if [[ -n "${TREEBEARD_EDGE_OFF_RESULT:-}" ]]; then
+        # Reuse a completed off-arm from a prior window (deterministic
+        # correctness probe; cross-window hash comparison is valid).
+        cp "$TREEBEARD_EDGE_OFF_RESULT" "$OUT/run/edge-long-off.result.json"
+        printf 'edge-long-off reused from %s\n' "$TREEBEARD_EDGE_OFF_RESULT" \
+            > "$OUT/run/edge-long-off.provenance.txt"
+    else
+        run_arm edge-long-off 0 1 0 "${EDGE_ARGS[@]}"
+    fi
     run_arm edge-long-on  1 1 0 "${EDGE_ARGS[@]}"
     # Commit-churn probe: family commit + loser reclamation + refork cycles.
     run_arm edge-churn    1 1 0 --layout fragmented --fragment-fill-tokens 8192 \
