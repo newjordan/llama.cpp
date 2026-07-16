@@ -509,6 +509,22 @@ event truncation honestly.
 
 ### PCBT-9 - Add deferred effect-intent quarantine
 
+State: partially satisfied by construction; typed-intent slice deferred with
+a design note (2026-07-16). What already holds: the server has NO effect
+executor anywhere in the PCBT surface (branches are ordinary completions;
+outputs are quarantined bounded bytes that are never parsed or acted on),
+and only the committed receipt identifies the winner. What is deferred: a
+TYPED `effect_intents` field requires structured tool-call outputs, which
+means chat-mode branch requests and attribution plumbing beyond
+`generated_text` — design: branch requests in chat mode, attribution
+captures result tool_calls as bounded typed intents, intent digests join the
+candidate record (pcbt.candidate.v1 gains an `intent_digest` field in a v2
+domain), observe withholds intents for non-winners, the receipt carries the
+winner's intent set marked authorization-required, and adversarial tests
+prove loser/expired/aborted transactions release nothing. Implement when a
+consumer needs structured intents; a hollow empty-field version was
+deliberately not shipped.
+
 - [ ] Define a bounded, typed `effect_intents` candidate field for tool-call or
   external-action proposals.
 - [ ] Mark all branch intents speculative and non-executable.
