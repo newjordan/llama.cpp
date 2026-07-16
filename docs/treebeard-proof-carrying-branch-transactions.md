@@ -565,6 +565,20 @@ better accepted outputs, and continues from the committed head.
 
 ### PCBT-11 - Run the first acceptance matrix
 
+State: complete (2026-07-16). Unit tier: test-pcbt-state (full transition
+matrix) + test-pcbt-parse (fixtures + cross-language golden digest). CPU
+matrix tier (lifecycle smoke): schema/error mapping, idempotent create and
+commit retries, changed-body and changed-decision conflicts, stale
+generation, double decision, late-result terminal fencing, deadline expiry
+(timer sweep), slot-capacity 503 with zero orphans, candidate-byte-pressure
+truncation, abort semantics, zero effect execution (by construction).
+Production-shaped B70 gate (`results/treebeard-pcbt/20260716-102212-pcbt-gate`,
+35B, 6-branch families, 3 matched cycles, guarded with exact rc7
+restoration and empty fault scan): **orchestration −0.46% vs manual (gate
+<= +5%), branch decode delta +0.001% (gate >= −1%), no-replay continuation
+proven, created/committed metrics exact.** All first-slice performance
+bars met.
+
 - [ ] Unit-test canonical JSON, digests, state transitions, idempotency, and
   budgets.
 - [ ] Run server route and trust-boundary tests.
