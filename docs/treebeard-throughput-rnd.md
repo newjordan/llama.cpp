@@ -333,7 +333,10 @@ ragged win is fragmentation-specific; a column-reduction-ratio activation
 threshold is the follow-up lever. Evidence:
 `results/treebeard-nxy-optimizer/20260715-221845-branch-cost`.
 
-Activation-ratio heuristic (2fed29794, RC7 candidate, evidence-complete):
+Activation-ratio heuristic (2fed29794, SHIPPED in RC7 b9723-356cefa61 on
+2026-07-16 09:31 with fresh golden +19.6%/+16.9%/+4.0% and fragmented ship
++75.7% gates; deployment:
+`results/treebeard-rc5-deploy/20260716-093113-rc7-production`):
 `LLAMA_KV_TREE_RAGGED_MIN_REDUCTION` (default 10) keeps sub-threshold fork
 families on the dense scan; the compact-layout N=7 indexed penalty recovered
 from -11.5% to -3.7% (noise band) with fragmented workloads unaffected by
