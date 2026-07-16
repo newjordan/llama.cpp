@@ -109,3 +109,41 @@ Plan:
 - Dense/fragmented KV-semantics proof (exit gate) reuses the guarded
   turbo-statetree-bench fixtures unchanged — the helper refactor must not
   alter SLOT_FORK behavior, which those gates already cover.
+
+
+## PCBT-4 scoping (2026-07-16 ~03:10) — an architecture decision to make
+
+Discovered: ordinary completion requests ALREADY carry exact branch
+addressing — `id_slot`, `state_id`, `node_id`, `fork_id` are parsed and
+validated in the completion body (server-context.cpp:8049-8070) and the
+breakout harness schedules branch decodes this way today. Two viable
+PCBT-4 designs:
+
+A. **Server-scheduled (canonical doc's letter).** post_transactions
+   tokenizes + builds N `server_task`s at create parse time
+   (`params_from_json_cmpl` + injected node/fork/slot assertions, pattern
+   at server-context.cpp:8025-8070), carries them in pcbt_action, and
+   handle_pcbt enqueues them after fork success. OPEN RISK: those tasks
+   have no HTTP reader — the result-sink path for detached internal tasks
+   needs design (child_tasks/parallel-sampling keeps a parent reader;
+   PCBT would need a queue_results hook keyed by task ownership, plus
+   budget enforcement pre-enqueue and mid-generation).
+
+B. **Client-driven with server attribution (B3's proven pattern).**
+   Create only forks + registers (done in PCBT-3). Clients post ordinary
+   completions with `node_id`+`fork_id` assertions per branch — the
+   existing, battle-tested scheduling path. A small hook at completion
+   finalization attributes results to (fork_id, node_id)-matching
+   transaction branches: phase transitions, token/wall accounting, output
+   digest capture, and the AWAITING_DECISION transition all happen in the
+   hook. Budgets enforce at attribution (reject/cancel when aggregate
+   predicted-token budget is exceeded). Deviates from the doc's letter
+   ("convert each declared branch request into a completion task") but
+   keeps inference scheduling on existing paths and the server as a pure
+   transaction observer/enforcer.
+
+Recommendation: B for the first slice (materially less new inference
+plumbing; the breakout harness is the immediate consumer and already
+drives branches this way), with A revisited if server-side scheduling
+earns its complexity in PCBT-11's acceptance matrix. DECISION DEFERRED to
+the project owner — the canonical doc specifies A's wording.

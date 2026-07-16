@@ -64,6 +64,18 @@ Read these first:
 - **PCBT-1 complete**: `tools/server/server-pcbt.h` records + pure state
   machine; isolated tests cover the full transition matrix, event-ring
   bounds, byte accounting, idempotent cleanup, registry idempotency.
+- **PCBT-3 complete (03:00)**: atomic create through the extracted
+  `statetree_fork_family` helper (SLOT_FORK refactored behavior-identical);
+  source by immutable node id, idle-destination auto-selection,
+  all-or-nothing capacity, registry mutation only after fork success,
+  create events. Gated `TREEBEARD_PCBT_ENABLE=1` (default off until
+  PCBT-4/7 lifecycle). Full route smoke green incl. fork-backed
+  create/retry/conflict/observe/events/503-capacity
+  (`scripts/treebeard-pcbt-route-smoke.sh`, 0.8B CPU server).
+- **PCBT-4 scoped, decision pending**: completion requests already carry
+  node/fork assertions (the B3 pattern) — see the server-scheduled vs
+  client-driven-attribution decision in `docs/treebeard-pcbt-wiring-plan.md`;
+  recommendation is client-driven for slice 1, owner's call requested.
 - **PCBT-2 schema slice complete**: `tools/server/server-pcbt-parse.h` C++
   parser with contract error classes; `test-pcbt-parse` proves fixture and
   golden-digest parity with the Python reference (cross-language
