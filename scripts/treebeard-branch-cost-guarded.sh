@@ -119,6 +119,10 @@ done
 ! systemctl --user is-active --quiet "$SERVICE"
 printf 'SERVICE_STOPPED_GUARDED\n'
 
+set +u
+source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1
+set -u
+
 run_point() {
     local label="$1" ragged="$2" fanout="$3"
     local ragged_flag=--tree-ragged
