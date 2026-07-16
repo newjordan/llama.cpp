@@ -604,6 +604,16 @@ Performance gate for the first slice:
 
 ### PCBT-12 - Prove product value before promotion
 
+State: benchmark complete and PASSED (2026-07-16); human override log open
+for the owner. 30 real-artifact workflow tasks (authored per the value
+benchmark doc from this campaign's own traces, results, configs, and
+diffs), three arms on the guarded 35B B70 surface: single-pass 13/30
+(43.3%), manual breakout 27/30 (+46.7pp), PCBT 28/30 (+50.0pp) — 3.3x the
+>= 15 percentage-point bar, zero objective losses, mean score 53.6 -> 97.8,
+and 30 canonical evidence-bound receipts versus none for manual. Evidence:
+`results/treebeard-pcbt/20260716-122219-pcbt12/` (verdict.md); override
+log: `tests/pcbt/pcbt12-review-notes.md`.
+
 - [ ] Build at least 30 real workflow tasks with task-specific acceptance gates,
   following `docs/turbo-speculative-breakout-value-benchmark.md`.
 - [ ] Include repository repair, configuration generation, trace diagnosis,
