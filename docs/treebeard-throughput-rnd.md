@@ -319,11 +319,11 @@ dense-shape win.
   arm read +1.12% p50 / +0.18% mean; the fixed-build re-gate read -0.69% p50
   (`20260715-230300-confirm-comp-aba`) — the hair-pass was repeat noise.
   Adoption closed; stays compiled default-off.
-- [ ] 250k long-prefix ragged-ON parity and commit-churn probes: OFF-arm
-  completed clean (no assert trips at 250k); the ON-arm windows were
-  externally stopped twice and are queued as follow-up. Dense serving is
-  unaffected (the plan never forms there); fragmented gates cover 32k
-  prefixes exhaustively.
+- [x] 250k long-prefix parity and commit-churn probes: PASS on the fixed
+  build (`20260715-235105-confirm-comp-aba/edge-summary.json`). The ragged-ON
+  arm is byte-identical to the dense arm at 250k prefix x 6 streams — a
+  geometry the pre-fix code aborts on — and all commit-churn samples
+  (manual+commit x 2 repeats) are hash-identical with zero failures.
 
 Branch-cost curve (B2, fixed build d794fd15d): trunk per-stream decode at a
 32k shared prefix loses 51% at 3 concurrent branches (kill gate for
