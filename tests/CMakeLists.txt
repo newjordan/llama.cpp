@@ -241,6 +241,15 @@ target_include_directories(test-tree-ragged-kv PRIVATE ${PROJECT_SOURCE_DIR}/src
 llama_build_and_test(test-pcbt-state.cpp)
 target_include_directories(test-pcbt-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+llama_build_and_test(test-pcbt-parse.cpp ARGS ${PROJECT_SOURCE_DIR}/tests/pcbt/fixtures)
+target_include_directories(test-pcbt-parse PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/server
+    ${PROJECT_SOURCE_DIR}/vendor
+    ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256
+    ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+target_sources(test-pcbt-parse PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c)
+
 llama_build_and_test(
     test-sha256.cpp
     ${CMAKE_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
