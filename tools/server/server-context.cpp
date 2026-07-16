@@ -1519,8 +1519,57 @@ public:
                     fail(pcbt_error::NOT_FOUND, "not_found", "unknown transaction");
                     break;
                 }
-                fail(pcbt_error::UNPROCESSABLE, "unprocessable",
-                     "pcbt: abort lands with PCBT-7");
+                const auto body = json::parse(task.pcbt.body_json, nullptr, false);
+                pcbt_abort_request req;
+                const auto pr = pcbt_parse_abort(body, req);
+                if (!pr.ok()) {
+                    fail(pr.error, "invalid_request", pr.message);
+                    break;
+                }
+                if (tx->status == pcbt_status::ABORTED) {
+                    if (tx->terminal_reason == req.reason) {
+                        res->payload = pcbt_transaction_view(*tx);   // exact retry dedupes
+                        break;
+                    }
+                    fail(pcbt_error::CONFLICT, "conflict", "aborted with a different reason");
+                    break;
+                }
+                if (pcbt_status_terminal(tx->status) || tx->status == pcbt_status::COMMITTING) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                         std::string("transaction is ") + pcbt_status_name(tx->status));
+                    break;
+                }
+                if (req.expected_fork_id != tx->generation) {
+                    fail(pcbt_error::CONFLICT, "conflict", "stale generation assertion");
+                    break;
+                }
+                // Release the fork family. Active work is pinned (invariant:
+                // never clear a sequence under an active decode) — the caller
+                // retries once branches drain.
+                for (const auto & family : collect_statetree_families()) {
+                    if (family.fork_id != (int64_t) tx->generation) {
+                        continue;
+                    }
+                    if (family.active) {
+                        fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                             "fork family is still processing; retry after branches drain");
+                        break;
+                    }
+                    release_family(family, false);
+                    break;
+                }
+                if (!res->error_class.empty()) {
+                    break;
+                }
+                const uint64_t now_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                tx->transition(pcbt_status::ABORTING);
+                tx->cleanup_members();
+                tx->transition(pcbt_status::ABORTED);
+                tx->terminal_reason = req.reason;
+                tx->push_event(now_ms, "aborted",
+                        json({{"reason", req.reason}}).dump());
+                res->payload = pcbt_transaction_view(*tx);
                 break;
             }
             default:
@@ -2991,6 +3040,39 @@ private:
         for (const auto & family : collect_statetree_families()) {
             if (!family.active && family.lease_deadline_us >= 0 && family.lease_deadline_us <= now_us) {
                 release_family(family, true);
+            }
+        }
+
+        // PCBT deadline expiry (state-thread timer path). Families with
+        // active branches stay pinned and are retried on the next sweep.
+        if (!pcbt_txs.by_id.empty()) {
+            const uint64_t wall_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            for (auto & [tx_id, tx] : pcbt_txs.by_id) {
+                if (pcbt_status_terminal(tx.status) || tx.status == pcbt_status::COMMITTING ||
+                        wall_ms <= tx.deadline_unix_ms) {
+                    continue;
+                }
+                bool family_active = false;
+                for (const auto & family : collect_statetree_families()) {
+                    if (family.fork_id != (int64_t) tx.generation) {
+                        continue;
+                    }
+                    if (family.active) {
+                        family_active = true;
+                    } else {
+                        release_family(family, true);
+                    }
+                    break;
+                }
+                if (family_active) {
+                    continue;
+                }
+                tx.transition(pcbt_status::EXPIRING);
+                tx.cleanup_members();
+                tx.transition(pcbt_status::EXPIRED);
+                tx.terminal_reason = "deadline";
+                tx.push_event(wall_ms, "expired", "{}");
             }
         }
 

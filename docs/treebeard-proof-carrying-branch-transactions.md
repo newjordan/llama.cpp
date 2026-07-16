@@ -448,6 +448,21 @@ fully reclaimed, and exact/stale/conflicting commit matrices all pass.
 
 ### PCBT-7 - Implement abort, expiry, and disconnect semantics
 
+State: complete (2026-07-16): generation-fenced abort releases the fork
+family through the existing `release_family` path (active work pinned —
+busy families return 422 for client retry rather than blocking the state
+thread), dedupes exact retries, and conflicts on changed reasons; deadline
+expiry runs on the state-thread timer path (`maintain_retention` sweep,
+wall-clock deadlines, pinned-family retry on the next sweep) plus
+opportunistically at commit; observation is stateless so observer/event
+disconnects are side-effect-free by construction; late completions cannot
+mutate terminal transactions (terminal-tx and terminal-branch fences in
+attribution); candidate bytes reclaim via cleanup_members on every terminal
+path. Route smoke: abort + retry + aborted view + timer-sweep expiry green.
+Client-driven note: there are no queued branch tasks to cancel — branches
+are client-issued completions; scheduling-stop is enforced by attribution
+fencing.
+
 - [ ] Add explicit generation-fenced abort.
 - [ ] Add deadline expiry driven by the state-thread timer path.
 - [ ] Cancel queued branch tasks and fence results that arrive after a terminal

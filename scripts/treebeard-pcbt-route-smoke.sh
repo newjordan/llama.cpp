@@ -195,6 +195,58 @@ print(json.dumps(doc))' > /tmp/pcbt-commit-bad.json
     check "observe -> committed" "committed" "$STATUS"
 fi
 
+# --- PCBT-7: abort + deadline expiry ---------------------------------------
+if [[ "$NODE_ID" != "-1" && "$TX_ID" != "-1" ]]; then
+    # the committed winner is a committed singleton again; fork a new tx on it
+    WNODE=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-commit.json"))["winner_node_id"])')
+    # winner node id survives commit (zero-copy, node preserved)
+    mkcreate smoke-tx-abort "$WNODE" > /tmp/pcbt-create-abort.json
+    check "create for abort -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-abort.json)"
+    TX2=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("transaction_id",-1))')
+    GEN2=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("generation",-1))')
+    printf '{"expected_fork_id":%s,"reason":"smoke-abort"}' "$GEN2" > /tmp/pcbt-abort.json
+    check "abort -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions/$TX2?action=abort" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-abort.json)"
+    check "abort exact retry -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions/$TX2?action=abort" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-abort.json)"
+    code "http://127.0.0.1:$PORT/transactions/$TX2" >/dev/null
+    check "observe -> aborted" "aborted" "$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')"
+
+    # expiry: mint a fresh committed singleton (the abort released the prior
+    # family including its source prompt), then create with the minimum
+    # deadline, tick the loop, and observe the timer sweep expire it.
+    curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+        -d '{"prompt":"pcbt expiry source:","n_predict":4,"temperature":0,"id_slot":0}' >/dev/null
+    FORK2=$(curl -s -X POST "http://127.0.0.1:$PORT/slots/0?action=fork" \
+        -H 'Content-Type: application/json' -d '{"destinations":[1]}')
+    FORK2_ID=$(echo "$FORK2" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("fork_id",-1))')
+    curl -s -X POST "http://127.0.0.1:$PORT/slots/0?action=commit" \
+        -H 'Content-Type: application/json' -d "{\"fork_id\":$FORK2_ID}" >/dev/null
+    SNODE=$(curl -s "http://127.0.0.1:$PORT/slots" | python3 -c '
+import json,sys
+rows=json.load(sys.stdin)
+row=[r for r in rows if r.get("id")==0][0]
+print(row.get("node_id",-1))')
+    python3 - "$SNODE" <<PYEOF > /tmp/pcbt-create-exp.json
+import json,sys
+doc=json.load(open("$FIX/create-valid-minimal.json"))
+doc["request_id"]="smoke-tx-expire"
+doc["source"]={"node_id":int(sys.argv[1])}
+doc["budget"]["deadline_ms"]=1000
+print(json.dumps(doc))
+PYEOF
+    check "create short-deadline -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-create-exp.json)"
+    TX3=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("transaction_id",-1))')
+    sleep 2
+    curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+        -d '{"prompt":"tick","n_predict":2,"temperature":0}' >/dev/null
+    sleep 1
+    code "http://127.0.0.1:$PORT/transactions/$TX3" >/dev/null
+    check "observe -> expired (timer sweep)" "expired" "$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')"
+fi
+
 if (( fail )); then
     echo "PCBT ROUTE SMOKE FAILED" >&2
     exit 1
