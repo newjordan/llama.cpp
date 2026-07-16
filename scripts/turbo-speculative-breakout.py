@@ -700,6 +700,14 @@ def slot_node_id(port: int, slot_id: int, timeout: float = 30.0) -> int:
     return -1
 
 
+def slot_fork_identity(port: int, slot_id: int, timeout: float = 30.0) -> int:
+    rows = http_json("GET", f"http://127.0.0.1:{port}/slots", None, timeout=timeout)
+    for row in rows:
+        if row.get("id") == slot_id:
+            return int(row.get("fork_id", -1))
+    return -1
+
+
 def cleanup_fork_reservations(
     port: int,
     slots: list[int],
@@ -2018,9 +2026,14 @@ def run_breakout(
             if source_node < 0:
                 source_node = slot_node_id(args.port, args.prefix_slot, timeout=args.request_timeout)
             if source_node < 0:
-                # Mint node identity once: fork + commit the root in place.
+                # Mint node identity: fork + commit the root in place. A root
+                # that already carries a committed reservation must refork
+                # under its existing fork identity.
                 mint_dest = [item[2] for item in stage_prompts][:1]
-                minted = slot_fork(args.port, args.prefix_slot, mint_dest, timeout=args.request_timeout)
+                existing_fork = slot_fork_identity(args.port, args.prefix_slot, timeout=args.request_timeout)
+                minted = slot_fork(args.port, args.prefix_slot, mint_dest,
+                                   timeout=args.request_timeout,
+                                   fork_id=existing_fork if existing_fork >= 0 else None)
                 slot_commit(args.port, args.prefix_slot, int(minted["fork_id"]), timeout=args.request_timeout)
                 source_node = slot_node_id(args.port, args.prefix_slot, timeout=args.request_timeout)
             tx_branches = []
