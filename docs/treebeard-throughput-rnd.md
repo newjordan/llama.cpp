@@ -321,6 +321,14 @@ dense-shape win.
   unaffected (the plan never forms there); fragmented gates cover 32k
   prefixes exhaustively.
 
+Branch-cost curve (B2, fixed build d794fd15d): trunk per-stream decode at a
+32k shared prefix loses 51% at 3 concurrent branches (kill gate for
+free-channel framing; channels are idle-capacity-only). Ragged on COMPACT
+layouts costs 6-11% aggregate at fanout >= 7 versus the dense scan — the
+ragged win is fragmentation-specific; a column-reduction-ratio activation
+threshold is the follow-up lever. Evidence:
+`results/treebeard-nxy-optimizer/20260715-221845-branch-cost`.
+
 Token-level speculative width note: ragged-KV changes multi-sequence
 attention indexing, not wide-batch ubatch numerics, so it does not lift the
 three recorded serial-equivalence park verdicts on speculative verification.
