@@ -52,6 +52,28 @@ Read these first:
   pre-permute stream-broadcast views), fixed at `d794fd15d`, validated to
   250k×6 streams byte-exact, shipped as RC6.
 
+## Overnight loop progress (post-handoff, 00:30-01:40)
+
+- **Activation-ratio heuristic** (`2fed29794`, `LLAMA_KV_TREE_RAGGED_MIN_REDUCTION`,
+  default 10%): evidence-complete RC7 candidate — compact-layout N=7 penalty
+  recovered from -11.5% to -3.7% (noise band), fragmented untouched. Unit
+  case added. Promotion flip NOT taken (user's call).
+  Evidence: `results/treebeard-nxy-optimizer/20260716-002318-branch-cost`.
+- **PCBT-0 complete**: contract v1 frozen (`docs/treebeard-pcbt-contract-v1.md`),
+  11 fixtures + Python reference lint with committed golden digest.
+- **PCBT-1 complete**: `tools/server/server-pcbt.h` records + pure state
+  machine; isolated tests cover the full transition matrix, event-ring
+  bounds, byte accounting, idempotent cleanup, registry idempotency.
+- **PCBT-2 schema slice complete**: `tools/server/server-pcbt-parse.h` C++
+  parser with contract error classes; `test-pcbt-parse` proves fixture and
+  golden-digest parity with the Python reference (cross-language
+  canonicalization lock). REMAINING: task type + route handlers +
+  /props capability + inference-disabled route tests (PCBT-2), then
+  PCBT-3..8.
+- Branch-cost evaluator: cross-arm token parity downgraded to diagnostic
+  (intra-arm repeat flutter exists in dense-only arms — recorded backend
+  multi-stream nondeterminism).
+
 ## Open levers, in recommended order
 
 1. **Ragged activation-ratio heuristic** — B2 measured ragged costing 6–11%
