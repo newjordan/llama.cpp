@@ -64,6 +64,6 @@ it.
 
 This result did not satisfy all of G0 by itself. Disabled-path logits, sampled
 tokens, and logical state were accepted later in
-`reports/treebeard-jspace-g0-disabled-invariance-20260715.md`. Controller and
+`reports/archive/20260713-jspace-steering/treebeard-jspace-g0-disabled-invariance-20260715.md`. Controller and
 observer state must still prove isolation across reset, cancellation, fork,
 commit, slot reuse, and snapshot behavior.

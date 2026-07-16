@@ -9,7 +9,7 @@ eligible, no holdout output was generated, and no production rollout is
 authorized.
 
 The complete result is in
-`reports/treebeard-jspace-g2b-development-result-20260715.md`.
+`reports/archive/20260713-jspace-steering/treebeard-jspace-g2b-development-result-20260715.md`.
 
 The development selector is
 `/home/frosty40/turbo/treebeard-work/results/treebeard-jspace-g2/development-g2b/20260715-163546/g2-selected-policy.json`

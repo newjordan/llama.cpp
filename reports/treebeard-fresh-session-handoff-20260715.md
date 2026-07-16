@@ -14,9 +14,9 @@ default-off and deprioritized rather than removed.
 
 Read these first:
 
-1. `reports/treebeard-jspace-g1-v5-holdout-pass-20260715.md`
-2. `reports/treebeard-jspace-g1-v5-preregistration-20260715.md`
-3. `reports/treebeard-jspace-g1-v5-calibration-20260715.md`
+1. `reports/archive/20260713-jspace-steering/treebeard-jspace-g1-v5-holdout-pass-20260715.md`
+2. `reports/archive/20260713-jspace-steering/treebeard-jspace-g1-v5-preregistration-20260715.md`
+3. `reports/archive/20260713-jspace-steering/treebeard-jspace-g1-v5-calibration-20260715.md`
 4. `/home/frosty40/turbo/treebeard-work/results/treebeard-q8-hoist-profile-b70/20260715-133357/profile-decision.md`
 5. `reports/treebeard-ragged-state-io-composition-20260715.md`
 
@@ -235,7 +235,7 @@ Machine-readable result:
 
 Promotion report:
 
-`reports/treebeard-jspace-g1-v5-holdout-pass-20260715.md`
+`reports/archive/20260713-jspace-steering/treebeard-jspace-g1-v5-holdout-pass-20260715.md`
 
 ### Invalid pre-capture attempt
 

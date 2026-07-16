@@ -87,16 +87,16 @@ The evidence therefore supports a local anchor-logit actuator and a
 state-conditioned plant equation. A later frozen GoEmotions slice also found a
 held-out anchor-free semantic read signal at layer 18 (macro AUROC 0.8428, macro
 ECE 0.0445), recorded in
-[`reports/treebeard-jspace-g1-primary-sensor-20260715.md`](../reports/treebeard-jspace-g1-primary-sensor-20260715.md).
+[`reports/archive/20260713-jspace-steering/treebeard-jspace-g1-primary-sensor-20260715.md`](../reports/archive/20260713-jspace-steering/treebeard-jspace-g1-primary-sensor-20260715.md).
 That is a sensor result, not evidence of semantic steering. Its subsequent
 lexical-echo control scored 0.7558 against the frozen 0.80 floor, so G1 is
 parked as recorded in
-[`reports/treebeard-jspace-g1-control-stop-20260715.md`](../reports/treebeard-jspace-g1-control-stop-20260715.md).
+[`reports/archive/20260713-jspace-steering/treebeard-jspace-g1-control-stop-20260715.md`](../reports/archive/20260713-jspace-steering/treebeard-jspace-g1-control-stop-20260715.md).
 A mean-pooled v2 sensor also failed its calibration/coverage gates. The
 source-disjoint v3 attempt then scored only 0.6685 macro AUROC on its frozen
 MELD-train calibration gate, with 0.89% usable coverage. It stopped before any
 MELD-test activation capture, as recorded in
-[`reports/treebeard-jspace-g1-v3-stop-20260715.md`](../reports/treebeard-jspace-g1-v3-stop-20260715.md).
+[`reports/archive/20260713-jspace-steering/treebeard-jspace-g1-v3-stop-20260715.md`](../reports/archive/20260713-jspace-steering/treebeard-jspace-g1-v3-stop-20260715.md).
 These results do not admit G2 and make threshold-only retuning an unsupported
 next step.
 
