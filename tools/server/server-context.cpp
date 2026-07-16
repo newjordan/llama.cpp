@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-pcbt-parse.h"
 #include "server-queue.h"
 #include "server-snapshot-store.h"
 #include "server-snapshot-manifest.h"
@@ -972,6 +973,89 @@ public:
 
     server_queue    queue_tasks;
     server_response queue_results;
+
+    // Proof-carrying branch transactions: state-thread-owned registry and
+    // the task handler (invariant 1; docs/treebeard-pcbt-contract-v1.md).
+    pcbt_registry pcbt_txs;
+
+    std::unique_ptr<server_task_result_pcbt> handle_pcbt(const server_task & task) {
+        auto res = std::make_unique<server_task_result_pcbt>();
+        auto fail = [&](pcbt_error e, const char * cls, std::string msg) {
+            res->http_status = pcbt_error_http(e);
+            res->error_class = cls;
+            res->message     = std::move(msg);
+        };
+        using OP = server_task::pcbt_action;
+        switch (task.pcbt.op) {
+            case OP::CREATE: {
+                const auto body = json::parse(task.pcbt.body_json, nullptr, false);
+                pcbt_create_request req;
+                const auto pr = pcbt_parse_create(body, req);
+                if (!pr.ok()) {
+                    fail(pr.error, "invalid_request", pr.message);
+                    break;
+                }
+                // Idempotency probe is read-only; registry mutation may only
+                // happen after a successful fork (invariant 2), which lands
+                // with PCBT-3. Until then the surface is capability-disabled.
+                const auto it = pcbt_txs.by_request_id.find(req.request_id);
+                if (it != pcbt_txs.by_request_id.end()) {
+                    const auto & existing = pcbt_txs.by_id.at(it->second);
+                    if (existing.create_digest != req.create_digest) {
+                        fail(pcbt_error::CONFLICT, "conflict",
+                             "request_id reused with a different body");
+                        break;
+                    }
+                }
+                fail(pcbt_error::CAPACITY, "capacity",
+                     "pcbt: transactions not yet enabled (fork wiring pending)");
+                break;
+            }
+            case OP::OBSERVE:
+            case OP::EVENTS: {
+                auto * tx = pcbt_txs.find(task.pcbt.transaction_id);
+                if (tx == nullptr) {
+                    fail(pcbt_error::NOT_FOUND, "not_found", "unknown transaction");
+                    break;
+                }
+                json view {
+                    {"transaction_id", tx->id},
+                    {"status", pcbt_status_name(tx->status)},
+                    {"generation", tx->generation},
+                    {"deadline_unix_ms", tx->deadline_unix_ms},
+                    {"create_digest", tx->create_digest},
+                };
+                if (task.pcbt.op == OP::EVENTS) {
+                    json events = json::array();
+                    for (const auto & e : tx->events) {
+                        if (e.seq > task.pcbt.after_seq) {
+                            events.push_back({{"seq", e.seq}, {"unix_ms", e.unix_ms},
+                                              {"kind", e.kind}, {"data", e.data}});
+                        }
+                    }
+                    view["events"]    = std::move(events);
+                    view["first_seq"] = tx->first_seq;
+                }
+                res->payload = std::move(view);
+                break;
+            }
+            case OP::COMMIT:
+            case OP::ABORT: {
+                auto * tx = pcbt_txs.find(task.pcbt.transaction_id);
+                if (tx == nullptr) {
+                    fail(pcbt_error::NOT_FOUND, "not_found", "unknown transaction");
+                    break;
+                }
+                fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                     "pcbt: decision handling lands with PCBT-6/7");
+                break;
+            }
+            default:
+                fail(pcbt_error::INVALID_REQUEST, "invalid_request", "unknown pcbt op");
+                break;
+        }
+        return res;
+    }
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -6081,6 +6165,12 @@ private:
                         ? statetree_journal_next_sequence
                         : statetree_journal.front().sequence;
                     res->journal_next_sequence = statetree_journal_next_sequence;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PCBT:
+                {
+                    auto res = handle_pcbt(task);
+                    res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
