@@ -74,12 +74,17 @@ same-binary performance gates before it can ship.
 
 ## Hard operating boundaries
 
-- Push only to `turbo-private`; NEVER to origin. Verify GitHub Actions are
-  disabled before any push. The main agent reviews and pushes - do not push.
+- Push only to `turbo-private` (standing-approved for the main session
+  agent); NEVER to origin (upstream ggml-org/llama.cpp). Subagents do not
+  push - the main agent reviews and pushes. Never create/edit/enable/dispatch
+  GitHub Actions workflows.
 - Every assisted commit ends with the trailer `Assisted-by: Claude Fable 5`
-  (no `Co-authored-by`). Commit in small logical chunks.
+  (no `Co-authored-by`). Commit in small logical chunks; commit new files as
+  WIP checkpoints BEFORE any risky operation.
 - Never `pkill`; stop/restore exact systemd user units only. Never run `cmake`
-  (especially not with cwd in the worktree), `git clean`, or network calls.
+  with cwd in the worktree or `git clean`. Localhost service calls (:8093
+  production, :8098 bench, CPU smoke ports) are normal; no external network
+  beyond the approved turbo-private remote.
 - Never touch `results/`, `build-*`, `turbo-combined/release/`, systemd units,
   or the `DO NOT REVIVE/` quarantine.
 - Never pipe a guard script on invocation (a pipe masks its exit code). Never
@@ -114,7 +119,11 @@ same-binary performance gates before it can ship.
 3. Evaluator follow-up: make all-arm token parity diagnostic-only for the
    attribution (non-ship) arms (c1 flutter, a6ec035bc precedent;
    `results/treebeard-ragged-promo-b70/20260716-142959-confirm-comp-aba/verdict.md`).
-4. Ragged activation-ratio heuristic (open RC9-material refinement;
+4. The ragged min-reduction heuristic SHIPPED in RC7
+   (`LLAMA_KV_TREE_RAGGED_MIN_REDUCTION`, default 10). The compact-layout
+   penalty above N=7 is only partially recovered (-3.7%, noise band); any
+   further activation-ratio refinement is RC9-material and needs a fresh
+   preregistration (context:
    `reports/treebeard-nxy-optimizer-preregistration-20260715.md`).
 
 Evidence under `results/` is append-only and immutable: cite it, never edit it.
