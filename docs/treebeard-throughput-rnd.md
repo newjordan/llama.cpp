@@ -286,6 +286,47 @@ gate. Evidence:
 `results/treebeard-single-wavefront-b70/20260715-005316` and
 `reports/treebeard-linear-attention-projection-fusion-20260715.md`.
 
+### T10 - Sequence-ragged StateTree KV attention plus state-I/O fusion
+
+State: gated and advanced as the turbo-statetree-0.1.0-rc.5 candidate.
+
+Hypothesis: on fragmented multi-branch StateTree shapes, attending only over
+each branch's actual KV (indexed FATTN) removes the dense-padded scan; and the
+recurrent state-I/O fusion accepted at `76befe8c8` carries an unmeasured
+dense-shape win.
+
+- [x] Correctness: `test-tree-ragged-kv` (SYCL and CPU builds), RC4 fusion
+  regression (`MOE_DOWN_REDUCE`, `MOE_DUAL_SWIGLU`) with hit events and no
+  fallback/snapshot events in any perf arm.
+- [x] Dense golden-shape 1/8/12 A/B/A (10 repeats): candidate versus control
+  midpoint +3.71%/+16.68%/+18.88% p50 (+3.69%/+16.72%/+19.16% mean), drift
+  <= 0.20%, zero failures. The stio-only attribution arm (+3.70%/+16.88%/
+  +20.06%) shows the dense gain is entirely state-I/O fusion; the ragged env
+  is inert on dense (no fork families) and its per-ubatch plan scan costs
+  about 1% at 12 agents, inside the gate. Evidence:
+  `results/treebeard-ragged-promo-b70/20260715-193609-golden-aba`
+  (first attempt `20260715-192041` recorded invalid: guard assert bug).
+- [x] Fragmented composition matrix (3 repeats, drift 0.055%, exact branch
+  hash parity across every arm and repeat): ragged alone +58.90%, ship config
+  (ragged + state-io) +70.92% versus the both-off midpoint; state-io
+  incremental +7.56%. Evidence:
+  `results/treebeard-ragged-promo-b70/20260715-195819-confirm-comp-aba`.
+- [x] Q8 ncols weight-hoist composition (C3): +1.12% p50 over the ship config
+  (its >= 1.0% p50 gate passes) but +0.18% mean; adoption deferred pending a
+  hoist-on dense golden arm because every golden-shape measurement ran
+  hoist=0. The hoist stays compiled default-off with strengthened evidence.
+- [ ] 250k long-prefix parity and commit-churn probes (edge window in flight;
+  first attempt timed out at the 900s request ceiling — a 250k prefill needs
+  about 15 minutes).
+
+Token-level speculative width note: ragged-KV changes multi-sequence
+attention indexing, not wide-batch ubatch numerics, so it does not lift the
+three recorded serial-equivalence park verdicts on speculative verification.
+That family stays parked.
+
+Perf gate: >= -1.0% dense golden shape at 1/8/12 agents (met with a large
+positive margin) and >= +55% fragmented ship-config aggregate (met: +70.92%).
+
 ## Decision order
 
 Execute T1 first because it is the smallest architecture-enabling slice and
