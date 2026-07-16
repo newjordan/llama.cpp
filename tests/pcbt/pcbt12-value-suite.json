@@ -1,0 +1,366 @@
+[
+  {
+    "id": "trace-fanout7-assert",
+    "validator": "json_exact",
+    "expected": {
+      "assert_basename": "ggml.c",
+      "assert_line": 1751,
+      "frame4_fn": "ggml_permute",
+      "frame5_method": "build_attn_mha"
+    },
+    "repair_hint": "assert_line is the integer after the last colon on the GGML_ASSERT path. frame4_fn is the bare ggml_* name at #4; frame5_method is only the method name after '::' at #5.",
+    "task": "A llama-server crashed. Below is the assert line and the backtrace top. Return ONLY a compact JSON object (no markdown) with keys assert_basename, assert_line, frame4_fn, frame5_method. assert_basename is the source file name only (no directory). assert_line is the integer line number. frame4_fn is the ggml_* function named at frame #4 (bare name, no args). frame5_method is the method name at frame #5 after the '::' (no class, no args).\n\n/home/frosty40/turbo/worktrees/treebeard-moe-down-reduce/ggml/src/ggml.c:1751: GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src)) failed\n#2  ggml_abort () from libggml-base.so.0\n#3  ggml_new_tensor_impl () from libggml-base.so.0\n#4  ggml_permute () from libggml-base.so.0\n#5  llm_graph_context::build_attn_mha(...) const () from libllama.so.0\n#6  llm_graph_context::build_attn(...) const () from libllama.so.0\n#7  llama_model_qwen35moe::graph::build_layer_attn(...) () from libllama.so.0"
+  },
+  {
+    "id": "trace-kvprobe-overflow",
+    "validator": "json_exact",
+    "expected": {
+      "n_kv": 33024,
+      "attn_streams": 8,
+      "n_kv_times_streams": 264192,
+      "exceeds_kv_size": true
+    },
+    "repair_hint": "Multiply n_kv by attn_streams from the probe line. Compare that product to kv_size 262144.",
+    "task": "This is the last kv-page-probe line logged immediately before the crash, plus the assert it hit. kv_size is 262144. Return ONLY a compact JSON object (no markdown) with keys n_kv, attn_streams, n_kv_times_streams, exceeds_kv_size. n_kv_times_streams is n_kv multiplied by attn_streams. exceeds_kv_size is true if that product is greater than kv_size (262144).\n\nkv-page-probe[get_n_kv_tree_ragged]: stream=0 n_kv=33024 size=262144 used=33025 holes=0 live_pages=130 dense_pages=130 head=33025 slot_rows=8 slot_pages=2 page_size=256 tree_ragged=1 attn_streams=8 attn_union_rows=33025 dense_n_kv=33280\nggml.c:1751: GGML_ASSERT(... data_size + view_offs <= ggml_nbytes(view_src)) failed"
+  },
+  {
+    "id": "trace-ragged-flag",
+    "validator": "json_exact",
+    "expected": {
+      "crash_probe_tag": "get_n_kv_tree_ragged",
+      "tree_ragged": 1,
+      "attn_streams": 8,
+      "dense_n_kv": 33280
+    },
+    "repair_hint": "Read the probe tag inside the square brackets on the second (crash) line and its tree_ragged, attn_streams, dense_n_kv fields.",
+    "task": "Two kv-page-probe lines are shown: an early healthy one and the final one logged just before the abort. Return ONLY a compact JSON object (no markdown) with keys crash_probe_tag, tree_ragged, attn_streams, dense_n_kv, taken from the SECOND line. crash_probe_tag is the identifier inside the square brackets of that line.\n\nkv-page-probe[get_n_kv]: stream=0 n_kv=256 used=2 tree_ragged=0 attn_streams=1 attn_union_rows=0 dense_n_kv=256\nkv-page-probe[get_n_kv_tree_ragged]: stream=0 n_kv=33024 used=33025 tree_ragged=1 attn_streams=8 attn_union_rows=33025 dense_n_kv=33280"
+  },
+  {
+    "id": "trace-branch-cost-kill",
+    "validator": "json_exact",
+    "expected": {
+      "first_aggregate_drop_fanout": 7,
+      "n5_aggregate_tps": 124.2889,
+      "n7_aggregate_tps": 123.0093
+    },
+    "repair_hint": "Scan the ragged aggregate_tps_p50 values in fanout order; find the first fanout whose value is lower than the previous fanout's value.",
+    "task": "Below is the ragged arm of a branch-cost curve (fanout N -> aggregate throughput). Return ONLY a compact JSON object (no markdown) with keys first_aggregate_drop_fanout, n5_aggregate_tps, n7_aggregate_tps. first_aggregate_drop_fanout is the first fanout N (reading in order 0,1,3,5,7,11) whose aggregate_tps_p50 is LOWER than the previous fanout's value. Copy the two aggregate values exactly.\n\nN=0 aggregate_tps_p50=68.5455\nN=1 aggregate_tps_p50=86.7324\nN=3 aggregate_tps_p50=110.9104\nN=5 aggregate_tps_p50=124.2889\nN=7 aggregate_tps_p50=123.0093\nN=11 aggregate_tps_p50=153.9307"
+  },
+  {
+    "id": "trace-edge-timeout",
+    "validator": "json_exact",
+    "expected": {
+      "timeout_s": 900,
+      "prefill_s": 965.6,
+      "cause": "timeout",
+      "assert_tripped": false
+    },
+    "repair_hint": "The failure was a wall-clock timeout, not an assert. The prefill later completed at 965.6s once the timeout was raised.",
+    "task": "Below is an edge-probe note. Return ONLY a compact JSON object (no markdown) with keys timeout_s, prefill_s, cause, assert_tripped. timeout_s is the wall-clock limit (seconds) that produced the first attempt's only failure. prefill_s is the actual prefill time. cause is the single word describing why the first attempt failed. assert_tripped is true only if an assert fired.\n\n250k long-prefix, ragged OFF: completed clean (6 branches decoded, min_cache_n 250000, no assert trips; prefill 965.6s -- the first attempt's 900s timeout was the only failure)."
+  },
+  {
+    "id": "trace-restore-guard",
+    "validator": "json_exact",
+    "expected": {
+      "pass_token": "RESTORE_OK",
+      "fail_token": "RESTORE_FAILED",
+      "required_families_length": 0
+    },
+    "repair_hint": "The guard prints RESTORE_FAILED when ok==0 (any check failed) and RESTORE_OK otherwise. The states check requires (.families | length) == 0.",
+    "task": "Below is the tail of a guard script's restore routine. Return ONLY a compact JSON object (no markdown) with keys pass_token, fail_token, required_families_length. pass_token is the leading status word printed when the restore succeeds; fail_token the word printed when it fails. required_families_length is the .families length the states check requires.\n\n  jq -e '(.families | length) == 0' \"$OUT/restore-states.json\" || ok=0\n  if (( ok == 0 )); then\n      rc=1\n      printf 'RESTORE_FAILED out=%s\\n' \"$OUT\" >&2\n  else\n      printf 'RESTORE_OK out=%s\\n' \"$OUT\"\n  fi"
+  },
+  {
+    "id": "extract-branch-cost-curve",
+    "validator": "json_exact",
+    "expected": {
+      "fork_ms_n1": 16.4642,
+      "fork_ms_n5": 30.7216,
+      "fork_ms_n11": 54.9241,
+      "gate_kill": true
+    },
+    "repair_hint": "Copy fork_client_ms_p50 for the ragged arm at N=1, N=5, N=11 and the top-level gate_G-B2_kill boolean.",
+    "task": "Below is a treebeard-branch-cost-summary excerpt (ragged arm). Return ONLY a compact JSON object (no markdown) with keys fork_ms_n1, fork_ms_n5, fork_ms_n11, gate_kill. The fork_ms_* values are the ragged fork_client_ms_p50 at N=1, N=5, N=11. gate_kill is the top-level gate_G-B2_kill value.\n\ncurve.ragged: N=1 {fork_client_ms_p50: 16.4642}; N=3 {fork_client_ms_p50: 23.8337}; N=5 {fork_client_ms_p50: 30.7216}; N=7 {fork_client_ms_p50: 39.3814}; N=11 {fork_client_ms_p50: 54.9241}\ngate_G-B2_kill: true\nparity_ragged_vs_dense: true\nzero_failed_samples: true"
+  },
+  {
+    "id": "extract-confirm-gates",
+    "validator": "json_exact",
+    "expected": {
+      "gates_total": 6,
+      "gates_passed": 6,
+      "pass": true,
+      "hoist_adopt": false
+    },
+    "repair_hint": "Count the keys inside the gates object and how many are true. Copy the top-level pass and hoist_adopt.",
+    "task": "Below is a treebeard-ragged-confirm-summary excerpt. Return ONLY a compact JSON object (no markdown) with keys gates_total, gates_passed, pass, hoist_adopt. gates_total is the number of entries in the gates object; gates_passed is how many of them are true. pass and hoist_adopt are the top-level values.\n\n\"hoist_adopt\": false,\n\"gates\": { \"drift_le_1pct\": true, \"c1_gain_ge_50pct\": true, \"c2_gain_ge_55pct\": true, \"c2_over_c1_ge_5pct\": true, \"parity_fragmented\": true, \"zero_failed_samples\": true },\n\"pass\": true"
+  },
+  {
+    "id": "extract-pcbt-gate",
+    "validator": "json_exact",
+    "expected": {
+      "winner_nodes": [
+        10,
+        26,
+        42
+      ],
+      "orch_overhead_pct": -0.457,
+      "pass": true
+    },
+    "repair_hint": "List the pcbt winner_node values in cycle order, then copy orch_overhead_pct and pass.",
+    "task": "Below is a treebeard-pcbt-b70-gate excerpt. Return ONLY a compact JSON object (no markdown) with keys winner_nodes, orch_overhead_pct, pass. winner_nodes is a JSON array of the three pcbt winner_node values in cycle order. orch_overhead_pct and pass are the top-level values.\n\n\"orch_overhead_pct\": -0.457,\n\"pcbt\": [ {\"winner_node\": 10, \"decode_tps\": 38.15}, {\"winner_node\": 26, \"decode_tps\": 37.64}, {\"winner_node\": 42, \"decode_tps\": 36.44} ],\n\"gates\": {\"orchestration_le_5pct\": true, \"decode_ge_-1pct\": true, \"continuation_no_replay\": true},\n\"pass\": true"
+  },
+  {
+    "id": "extract-pcbt-metrics",
+    "validator": "json_exact",
+    "expected": {
+      "created": 3,
+      "committed": 3,
+      "aborted": 0,
+      "expired": 0,
+      "active": 0
+    },
+    "repair_hint": "Read the integer value after each llamacpp:pcbt_* series name.",
+    "task": "Below are Prometheus-format PCBT metrics. Return ONLY a compact JSON object (no markdown) with keys created, committed, aborted, expired, active, each set to the integer sample value of the matching llamacpp:pcbt_* series.\n\nllamacpp:pcbt_created_total 3\nllamacpp:pcbt_committed_total 3\nllamacpp:pcbt_aborted_total 0\nllamacpp:pcbt_expired_total 0\nllamacpp:pcbt_active 0"
+  },
+  {
+    "id": "extract-freeze-hashes",
+    "validator": "json_exact",
+    "expected": {
+      "llama_server_sha8": "393397fb",
+      "libllama_sha8": "c71031ef",
+      "libggml_sycl_sha8": "0a0536fd",
+      "model_sha8": "25233af7"
+    },
+    "repair_hint": "Take the first 8 hex characters of each SHA-256 shown.",
+    "task": "Below is a build-freeze record. Return ONLY a compact JSON object (no markdown) with keys llama_server_sha8, libllama_sha8, libggml_sycl_sha8, model_sha8. Each value is the FIRST 8 hex characters of the corresponding SHA-256.\n\nbin/llama-server: 393397fb42f418f4b360b908d2d639343e262e0cf5c5ac4a4aa58acfb694481c\nbin/libllama.so: c71031ef41abeb15a6b291c7abdd060a8452928e76ebfb3e4d83dc065cf7ba22\nbin/libggml-sycl.so: 0a0536fd5eba5caf6c8c4b00febe4320e868fe19bc99bd42767eb77d6c872e61\nmodel Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf: 25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506"
+  },
+  {
+    "id": "extract-deploy-rc7",
+    "validator": "json_exact",
+    "expected": {
+      "port": 8093,
+      "min_reduction_default_pct": 10,
+      "pcbt_enabled_default": false,
+      "create_status_without_enable": 503
+    },
+    "repair_hint": "Read the serving port, the LLAMA_KV_TREE_RAGGED_MIN_REDUCTION default percent, the default PCBT enabled flag, and the create HTTP status without the enable env.",
+    "task": "Below is a deployment summary. Return ONLY a compact JSON object (no markdown) with keys port, min_reduction_default_pct, pcbt_enabled_default, create_status_without_enable, filled from the text.\n\nPort 8093; alias turbo-statetree-0.1.0-rc.7-...-ragged.\nRagged activation-ratio heuristic (LLAMA_KV_TREE_RAGGED_MIN_REDUCTION, default 10%): fork families whose plan saves under 10% of dense columns stay on the dense scan.\nPCBT surface compiled in; /props reports pcbt {contract v1, enabled false} and create returns 503 without TREEBEARD_PCBT_ENABLE=1."
+  },
+  {
+    "id": "config-ship-env-lines",
+    "validator": "lines_exact",
+    "expected": [
+      "Environment=LLAMA_KV_TREE_RAGGED=1",
+      "Environment=GGML_SYCL_ENABLE_STATE_IO_FUSION=1",
+      "Environment=GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=0"
+    ],
+    "expected_lines": [
+      "Environment=LLAMA_KV_TREE_RAGGED=1",
+      "Environment=GGML_SYCL_ENABLE_STATE_IO_FUSION=1",
+      "Environment=GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=0"
+    ],
+    "repair_hint": "Emit exactly one Environment= line per ship toggle, in the order ragged, state-io fusion, Q8 hoist, with the shipped values 1, 1, 0.",
+    "task": "The ship env for turbo-statetree-rc7 is: LLAMA_KV_TREE_RAGGED=1 GGML_SYCL_ENABLE_STATE_IO_FUSION=1 GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=0. Produce EXACTLY these three systemd unit lines and nothing else, one per line, each of the form Environment=VAR=VALUE, in the order listed above."
+  },
+  {
+    "id": "config-control-arm-env",
+    "validator": "lines_exact",
+    "expected": [
+      "export LLAMA_KV_TREE_RAGGED=0",
+      "export GGML_SYCL_ENABLE_STATE_IO_FUSION=0"
+    ],
+    "expected_lines": [
+      "export LLAMA_KV_TREE_RAGGED=0",
+      "export GGML_SYCL_ENABLE_STATE_IO_FUSION=0"
+    ],
+    "repair_hint": "The control (rollback) arm disables both toggles: RAGGED=0 and STATE_IO_FUSION=0. Emit them as two shell export lines in that order.",
+    "task": "The build-freeze env contract defines the Control arm as: LLAMA_KV_TREE_RAGGED=0 GGML_SYCL_ENABLE_STATE_IO_FUSION=0. Produce EXACTLY two shell lines and nothing else, one per variable in that order, each of the form: export VAR=VALUE"
+  },
+  {
+    "id": "config-c3-arm-env",
+    "validator": "lines_exact",
+    "expected": [
+      "export LLAMA_KV_TREE_RAGGED=1",
+      "export GGML_SYCL_ENABLE_STATE_IO_FUSION=1",
+      "export GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=1"
+    ],
+    "expected_lines": [
+      "export LLAMA_KV_TREE_RAGGED=1",
+      "export GGML_SYCL_ENABLE_STATE_IO_FUSION=1",
+      "export GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=1"
+    ],
+    "repair_hint": "The C3 composition arm is the Candidate (RAGGED=1 STATE_IO_FUSION=1) plus the added Q8 hoist=1. Emit three export lines in that order.",
+    "task": "The env contract says: Candidate = LLAMA_KV_TREE_RAGGED=1 GGML_SYCL_ENABLE_STATE_IO_FUSION=1; and the C3 composition arm ADDS GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=1. Produce EXACTLY the three shell export lines for the C3 arm and nothing else, one per variable, ordered ragged, state-io fusion, Q8 hoist, each of the form: export VAR=VALUE"
+  },
+  {
+    "id": "config-rollback-command",
+    "validator": "lines_exact",
+    "expected": [
+      "systemctl --user disable --now turbo-statetree-rc5 && systemctl --user enable --now turbo-statetree-rc4"
+    ],
+    "expected_lines": [
+      "systemctl --user disable --now turbo-statetree-rc5 && systemctl --user enable --now turbo-statetree-rc4"
+    ],
+    "repair_hint": "The rollback disables the new unit rc5 and enables the previous unit rc4, joined by &&, on one line.",
+    "task": "The decision record specifies the RC5->RC4 rollback exactly as: disable the rc5 unit (with --now) then enable the rc4 unit (with --now), joined by &&. Both use `systemctl --user`. Produce EXACTLY that single command on ONE line and nothing else."
+  },
+  {
+    "id": "config-server-flags-json",
+    "validator": "json_exact",
+    "expected": {
+      "n_ctx": 262144,
+      "n_parallel": 12,
+      "batch": 8192,
+      "ubatch": 1024,
+      "port": 8093
+    },
+    "repair_hint": "Read -c (context), -np (parallel slots), -b (batch), -ub (ubatch), --port from the ExecStart flags.",
+    "task": "Below is the llama-server ExecStart flag string from the unit. Return ONLY a compact JSON object (no markdown) with keys n_ctx, n_parallel, batch, ubatch, port, filled from the flags -c, -np, -b, -ub, --port respectively.\n\nllama-server -m MODEL.gguf -ngl 99 -ncmoe 0 --no-op-offload -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 -b 8192 -ub 1024 -t 15 --host 0.0.0.0 --port 8093 --jinja --metrics -a turbo-statetree-...-ragged"
+  },
+  {
+    "id": "config-package-modes",
+    "validator": "json_exact",
+    "expected": {
+      "pin_by_hash_env": "TREEBEARD_PIN_BY_HASH",
+      "pin_requires_all_three_hashes": true,
+      "copy_install_env": "TREEBEARD_COPY_INSTALL"
+    },
+    "repair_hint": "pin-by-hash is triggered by TREEBEARD_PIN_BY_HASH=1 and requires all three runtime hashes; copy-install is triggered by TREEBEARD_COPY_INSTALL=1.",
+    "task": "Below is an excerpt of the packaging script's two optional modes. Return ONLY a compact JSON object (no markdown) with keys pin_by_hash_env, pin_requires_all_three_hashes, copy_install_env. The *_env values are the environment variable names that enable each mode; pin_requires_all_three_hashes is true if pin-by-hash mandates all three runtime hashes.\n\nif [[ \"${TREEBEARD_PIN_BY_HASH:-0}\" == 1 ]]; then\n    [[ -n \"$TREEBEARD_SERVER_SHA\" && -n \"$TREEBEARD_LIBLLAMA_SHA\" && -n \"$TREEBEARD_IMPL_SHA\" ]] || { echo PIN_BY_HASH_REQUIRES_ALL_THREE_HASHES; exit 1; }\n...\nif [[ \"${TREEBEARD_COPY_INSTALL:-0}\" == 1 ]]; then  # ship exact build-tree bytes"
+  },
+  {
+    "id": "repair-broadcast-nstream",
+    "validator": "json_exact",
+    "expected": {
+      "buggy_n_stream_src": "k->ne[3]",
+      "fixed_n_stream_src": "kv_idxs->ne[1]",
+      "broadcast_fn": "build_attn_mha"
+    },
+    "repair_hint": "In the ragged path k->ne[3] is 1, so n_stream must instead come from kv_idxs->ne[1]; the stream broadcast is applied inside build_attn_mha after the permutes.",
+    "task": "The ragged stream-broadcast crash: build_attn_mha derived the stream count from the single-stream cache view, so fork families aborted at the ggml view bound. Buggy line:\n    const auto n_stream = k->ne[3];\nFix: when an index tensor kv_idxs is present, take the stream count from it, and apply the ne[3]/nb[3] broadcast AFTER the permutes:\n    const auto n_stream = kv_idxs ? kv_idxs->ne[1] : k->ne[3];\nReturn ONLY a compact JSON object (no markdown) with keys buggy_n_stream_src, fixed_n_stream_src, broadcast_fn. buggy_n_stream_src is the expression the buggy code read n_stream from; fixed_n_stream_src is the expression used when kv_idxs is set; broadcast_fn is the function the broadcast is applied in (bare name)."
+  },
+  {
+    "id": "repair-none-round",
+    "validator": "json_exact",
+    "expected": {
+      "none_field": "fork_client_ms_p50",
+      "none_at_fanout": 0,
+      "fix_guards_type": "float"
+    },
+    "repair_hint": "At N=0 the solo probe sets fork_client_ms_p50=None; blindly rounding it crashes, so the fix rounds only when the value isinstance float.",
+    "task": "A branch-cost evaluator crashed serializing the N=0 point. The N=0 solo probe sets fork_client_ms_p50=None (no fork happens). Buggy serialization:\n    {k: round(v, 4) for k, v in pt.items()}   # round(None, 4) -> TypeError\nFix:\n    {k: (round(v, 4) if isinstance(v, float) else v) for k, v in pt.items()}\nReturn ONLY a compact JSON object (no markdown) with keys none_field, none_at_fanout, fix_guards_type. none_field is the key whose value is None; none_at_fanout is the fanout N where it is None; fix_guards_type is the type name the fix guards on before rounding."
+  },
+  {
+    "id": "repair-parity-gate",
+    "validator": "json_exact",
+    "expected": {
+      "exit_zero_condition": "failures == 0",
+      "parity_is_gate": false,
+      "parity_field_role": "diagnostic"
+    },
+    "repair_hint": "Cross-arm parity is nondeterministic backend flutter, so it must not gate: exit 0 when failures == 0 alone, and parity is reported as diagnostic only.",
+    "task": "Cross-arm token parity showed run-to-run backend flutter, so it must not fail the run. Buggy (over-strict) exit:\n    sys.exit(0 if (failures == 0 and parity) else 1)\nFix (parity becomes report-only):\n    sys.exit(0 if failures == 0 else 1)\nand parity is emitted as parity_ragged_vs_dense_diagnostic plus a per-N breakdown. Return ONLY a compact JSON object (no markdown) with keys exit_zero_condition, parity_is_gate, parity_field_role. exit_zero_condition is the condition (as written) under which the fixed code exits 0; parity_is_gate is whether parity still gates the exit code; parity_field_role is the single word describing parity's new role."
+  },
+  {
+    "id": "repair-fork-identity",
+    "validator": "json_exact",
+    "expected": {
+      "state_id_type": "int",
+      "state_id_min": 0,
+      "fork_id_type": "int"
+    },
+    "repair_hint": "A valid fork requires state_id to be an int that is >= 0, and fork_id to be an int; the buggy version dropped the non-negative check.",
+    "task": "Validating a StateTree fork response. Buggy check (accepts a negative state_id):\n    if type(state_id) is not int or type(fork_id) is not int:\n        raise RuntimeError('fork did not allocate logical and generation identities')\nCorrect check also rejects a negative state_id:\n    if type(state_id) is not int or state_id < 0 or type(fork_id) is not int:\n        raise RuntimeError(...)\nReturn ONLY a compact JSON object (no markdown) with keys state_id_type, state_id_min, fork_id_type. state_id_type/fork_id_type are the required type names; state_id_min is the smallest state_id the corrected check accepts."
+  },
+  {
+    "id": "repair-refork-advance",
+    "validator": "json_exact",
+    "expected": {
+      "fork_id_must_be_int": true,
+      "fork_id_must_differ_from_parent": true,
+      "state_id_must_equal_parent": true
+    },
+    "repair_hint": "A refork must return an int fork_id that differs from the parent fork_id (generation advanced) while keeping the same state_id (logical identity unchanged).",
+    "task": "Validating a node-addressed re-fork. The refork must ADVANCE the generation but keep the same logical identity. Correct checks:\n    refork_id = refork.get('fork_id')\n    if type(refork_id) is not int or refork_id == fork_id:\n        raise RuntimeError('refork did not advance the generation')\n    if refork['response'].get('state_id') != state_id:\n        raise RuntimeError('refork changed the logical identity')\nReturn ONLY a compact JSON object (no markdown) with keys fork_id_must_be_int, fork_id_must_differ_from_parent, state_id_must_equal_parent, each true or false per the checks above."
+  },
+  {
+    "id": "repair-min-reduction-gate",
+    "validator": "json_exact",
+    "expected": {
+      "env_var": "LLAMA_KV_TREE_RAGGED_MIN_REDUCTION",
+      "default_pct": 10,
+      "disable_value": 0
+    },
+    "repair_hint": "The fix gates activation on saving at least LLAMA_KV_TREE_RAGGED_MIN_REDUCTION percent of columns; default 10, and 0 restores the old any-reduction behavior.",
+    "task": "Compact fork families where the ragged plan barely shrinks the column count cost more than dense. Buggy activation (fires on ANY reduction):\n    plan.reduces_columns = plan.has_shared_prefix && plan.n_kv < plan.dense_n_kv;\nFix: require at least a minimum percent column saving before activating; the threshold is read from an env var (default 10; 0 restores the old any-reduction behavior). Return ONLY a compact JSON object (no markdown) with keys env_var, default_pct, disable_value. env_var is the environment variable name; default_pct is its default; disable_value is the value that restores any-reduction activation."
+  },
+  {
+    "id": "review-activation-ratio",
+    "validator": "json_exact",
+    "expected": {
+      "env_var": "LLAMA_KV_TREE_RAGGED_MIN_REDUCTION",
+      "threshold_default": 10,
+      "disable_value": 0,
+      "clamp_max": 100
+    },
+    "repair_hint": "The diff reads the threshold from LLAMA_KV_TREE_RAGGED_MIN_REDUCTION (default 10), clamps it to 0..100, and 0 restores any-reduction activation.",
+    "task": "Review this diff hunk and report the findings. Return ONLY a compact JSON object (no markdown) with keys env_var, threshold_default, disable_value, clamp_max. env_var is the tuning variable; threshold_default its default percent; disable_value the value that restores old any-reduction behavior; clamp_max the upper clamp bound.\n\n+    static const uint32_t min_reduction_pct = []() {\n+        const char * env = getenv(\"LLAMA_KV_TREE_RAGGED_MIN_REDUCTION\");\n+        const long v = env ? atol(env) : 10;\n+        return (uint32_t) std::clamp(v, 0l, 100l);\n+    }();\n+    plan.reduces_columns = plan.has_shared_prefix &&\n+        (uint64_t) plan.n_kv * 100 <= (uint64_t) plan.dense_n_kv * (100 - min_reduction_pct) &&\n+        plan.n_kv < plan.dense_n_kv;\n// default 10; 0 restores the old any-reduction behavior"
+  },
+  {
+    "id": "review-broadcast-fix",
+    "validator": "json_exact",
+    "expected": {
+      "assert_line": 1751,
+      "repro_case": "ragged-n7",
+      "overflow_product": 264192,
+      "kv_size": 262144
+    },
+    "repair_hint": "The commit cites ggml.c:1751, deterministic repro branch-cost ragged-n7, with 33024*8 = 264192 exceeding kv_size 262144.",
+    "task": "Review this commit message and report the findings. Return ONLY a compact JSON object (no markdown) with keys assert_line, repro_case, overflow_product, kv_size. assert_line is the ggml.c line cited; repro_case the named deterministic repro; overflow_product the product shown (compute it); kv_size the cache size it exceeds.\n\nllama: fix ragged stream-broadcast view bound crash\n... any fork family with plan.n_kv * n_streams > kv_size aborted at graph build (ggml.c:1751 view bound; deterministic repro: branch-cost ragged-n7, 33024*8 > 262144). Return the honest single-stream views and apply the stream broadcast in build_attn_mha after the permutes."
+  },
+  {
+    "id": "review-unit-test-thresholds",
+    "validator": "json_exact",
+    "expected": {
+      "plan_n_kv": 6400,
+      "dense_n_kv": 6912,
+      "reduces_columns": false
+    },
+    "repair_hint": "The added test asserts plan.n_kv==6400 and plan.dense_n_kv==6912 (a 7.4% saving, under 10%), so reduces_columns is false.",
+    "task": "Review the added unit test and report what it asserts. Return ONLY a compact JSON object (no markdown) with keys plan_n_kv, dense_n_kv, reduces_columns, matching the assertions.\n\nstatic void test_small_reduction_stays_dense() {\n    const auto plan = llama_kv_build_ragged_plan(cells, { 3, 7 }, 256);\n    assert(plan.has_shared_prefix);\n    assert(plan.n_kv == 6400);        // GGML_PAD(6300 + 100, 256)\n    assert(plan.dense_n_kv == 6912);  // GGML_PAD(6900, 256)\n    // 6400/6912 = 92.6% of dense: a 7.4% saving, under the 10% threshold.\n    assert(!plan.reduces_columns);\n}"
+  },
+  {
+    "id": "review-decision-gates",
+    "validator": "json_exact",
+    "expected": {
+      "c1_gate_pct": 50,
+      "c2_gate_pct": 55,
+      "stateio_incremental_gate_pct": 5,
+      "stateio_incremental_actual_pct": 7.56
+    },
+    "repair_hint": "From the fragmented-shape gates line: C1 >= +50%, C2 >= +55%, state-io incremental >= +5% with actual +7.56%.",
+    "task": "Review this gate line from a decision record. Return ONLY a compact JSON object (no markdown) with keys c1_gate_pct, c2_gate_pct, stateio_incremental_gate_pct, stateio_incremental_actual_pct. The *_gate_pct are the required thresholds; stateio_incremental_actual_pct is the measured value.\n\nGates: C1 >= +50% -- PASS; C2 >= +55% -- PASS; state-io incremental >= +5% -- PASS (+7.56%); parity -- PASS; zero failures -- PASS."
+  },
+  {
+    "id": "review-golden-shape",
+    "validator": "json_exact",
+    "expected": {
+      "agents_12_delta_p50_pct": 18.88,
+      "stio_only_12_pct": 20.06,
+      "ragged_inert_on_dense": true
+    },
+    "repair_hint": "At 12 agents the candidate Delta p50 is +18.88%; the state-io-only attribution arm is +20.06%; the note says the ragged env is inert on dense.",
+    "task": "Review this dense golden-shape result. Return ONLY a compact JSON object (no markdown) with keys agents_12_delta_p50_pct, stio_only_12_pct, ragged_inert_on_dense. The first is the candidate Delta p50 at 12 agents; the second is the state-io-only attribution value at 12 agents; the third is whether the text says the ragged env has no effect on dense.\n\n| agents | Delta p50 |\n| 1 | +3.71% |\n| 8 | +16.68% |\n| 12 | +18.88% |\nstio-only attribution arm: +3.70% / +16.88% / +20.06% -- the dense gain is entirely state-I/O fusion; the ragged env is inert on dense."
+  },
+  {
+    "id": "review-edge-closed",
+    "validator": "json_exact",
+    "expected": {
+      "status": "CLOSED-PASS",
+      "streams": 6,
+      "byte_identical_to_dense": true,
+      "zero_failures": true
+    },
+    "repair_hint": "The RC6 edge probe is CLOSED-PASS: ragged-ON byte-identical to dense at 250k x 6 streams with zero failures.",
+    "task": "Review this edge-probe closure note. Return ONLY a compact JSON object (no markdown) with keys status, streams, byte_identical_to_dense, zero_failures. status is the verdict token; streams is the stream count in the '250k x N streams' geometry; the two booleans reflect the stated outcome.\n\n250k long-prefix, ragged ON + commit-churn probe: CLOSED-PASS on the RC6 fixed build: ragged-ON byte-identical to dense at 250k x 6 streams (a geometry the pre-fix code aborts on) and all commit-churn samples hash-identical, zero failures. No residual long-prefix risk on RC6."
+  }
+]
