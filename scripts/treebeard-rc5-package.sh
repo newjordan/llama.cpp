@@ -55,7 +55,17 @@ fi
 rm -rf "$RELEASE"
 mkdir -p "$RELEASE/metadata"
 set +u; source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1; set -u
-DESTDIR="$RELEASE/root" cmake --install "$BUILD" --prefix "$PREFIX" >/dev/null
+if [[ "${TREEBEARD_COPY_INSTALL:-0}" == 1 ]]; then
+    # Ship exactly the (hash-pinned) build-tree bytes; cmake --install would
+    # re-derive install manifests from HEAD and can skew against a frozen
+    # build (version-stamped lib names, later-added targets).
+    mkdir -p "$RELEASE/root$PREFIX/bin" "$RELEASE/root$PREFIX/lib"
+    find "$BUILD/bin" -maxdepth 1 -type f -name '*.so*' -exec cp -a {} "$RELEASE/root$PREFIX/lib/" \;
+    find "$BUILD/bin" -maxdepth 1 -name '*.so*' -type l -exec cp -a {} "$RELEASE/root$PREFIX/lib/" \;
+    find "$BUILD/bin" -maxdepth 1 -type f ! -name '*.so*' -executable -exec cp -a {} "$RELEASE/root$PREFIX/bin/" \;
+else
+    DESTDIR="$RELEASE/root" cmake --install "$BUILD" --prefix "$PREFIX" >/dev/null
+fi
 
 git -C "$WORKTREE" rev-parse "$FROZEN_COMMIT" > "$RELEASE/metadata/commit.txt"
 printf 'clean committed source build from private branch agent/treebeard-single-wavefront\n' \
