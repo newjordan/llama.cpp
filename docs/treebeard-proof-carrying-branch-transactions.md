@@ -292,27 +292,34 @@ every illegal transition without launching inference.
 
 ### PCBT-2 - Add task and route surfaces
 
-State: schema slice complete (2026-07-16): `tools/server/server-pcbt-parse.h`
-parses/validates create-commit-abort with contract error classes and
-canonical digests; `tests/test-pcbt-parse.cpp` proves fixture-verdict and
-golden-digest parity with the Python reference. Route/task wiring remains.
+State: complete (2026-07-16). Schema slice: `tools/server/server-pcbt-parse.h`
+(+ `tests/test-pcbt-parse.cpp`, fixture-verdict and golden-digest parity with
+the Python reference). Wiring: `SERVER_TASK_TYPE_PCBT` + `pcbt_action` +
+`server_task_result_pcbt` (server-task.h), state-thread dispatch + registry +
+`handle_pcbt` (server-context.cpp), four route handlers in the house
+`?action=` idiom (server.cpp registration), `/props` pcbt capability, and a
+13-check live route smoke (`scripts/treebeard-pcbt-route-smoke.sh`) covering
+schema 400s, unknown-id 404s, action routing, and the contract-correct 503
+boundary at the PCBT-3 fork seam. Create obeys invariant 2: no registry
+mutation before a successful fork, so idempotent-retry route coverage
+activates with PCBT-3.
 
-- [ ] Add transaction task types and result structures in
+- [x] Add transaction task types and result structures in
   `tools/server/server-task.h`, with JSON result serialization in
   `tools/server/server-task.cpp`.
-- [ ] Declare the transaction route handlers and helpers in
+- [x] Declare the transaction route handlers and helpers in
   `tools/server/server-context.h`.
-- [ ] Implement request parsing, task enqueue, result wait, and response
+- [x] Implement request parsing, task enqueue, result wait, and response
   serialization alongside the existing StateTree handlers in
   `tools/server/server-context.cpp`.
-- [ ] Register `POST /transactions`, `GET /transactions/:id`,
+- [x] Register `POST /transactions`, `GET /transactions/:id`,
   `GET /transactions/:id/events`, `POST /transactions/:id/commit`, and
   `POST /transactions/:id/abort` in `tools/server/server.cpp`.
-- [ ] Reject unknown fields where ambiguity would change mutation semantics.
-- [ ] Keep HTTP handlers free of direct shared-state mutation: they may wait
+- [x] Reject unknown fields where ambiguity would change mutation semantics.
+- [x] Keep HTTP handlers free of direct shared-state mutation: they may wait
   for results using the existing response-reader pattern, but every mutation
   must enter the state-thread task queue.
-- [ ] Expose feature capability and limits in `/props`.
+- [x] Expose feature capability and limits in `/props`.
 
 Exit gate: route tests validate schemas, size limits, error mapping, and exact
 retry behavior against a server with inference disabled.
