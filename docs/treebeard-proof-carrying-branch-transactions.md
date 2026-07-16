@@ -292,6 +292,11 @@ every illegal transition without launching inference.
 
 ### PCBT-2 - Add task and route surfaces
 
+State: schema slice complete (2026-07-16): `tools/server/server-pcbt-parse.h`
+parses/validates create-commit-abort with contract error classes and
+canonical digests; `tests/test-pcbt-parse.cpp` proves fixture-verdict and
+golden-digest parity with the Python reference. Route/task wiring remains.
+
 - [ ] Add transaction task types and result structures in
   `tools/server/server-task.h`, with JSON result serialization in
   `tools/server/server-task.cpp`.
