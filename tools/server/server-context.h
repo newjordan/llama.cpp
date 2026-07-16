@@ -114,6 +114,10 @@ struct server_routes {
     server_http_context::handler_t get_snapshot_heads;
     server_http_context::handler_t post_snapshot_heads;
     server_http_context::handler_t get_states;
+    server_http_context::handler_t post_transactions;
+    server_http_context::handler_t post_transaction_action;
+    server_http_context::handler_t get_transactions;
+    server_http_context::handler_t get_transaction_events;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

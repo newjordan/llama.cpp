@@ -8669,6 +8669,140 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // --- proof-carrying branch transactions (contract v1) ----------------
+    // HTTP threads parse for early 400s; every mutation decision happens on
+    // the state thread via SERVER_TASK_TYPE_PCBT (invariant 1).
+
+    auto pcbt_error_type = [](const std::string & cls) {
+        if (cls == "not_found")  return ERROR_TYPE_NOT_FOUND;
+        if (cls == "capacity")   return ERROR_TYPE_UNAVAILABLE;
+        if (cls == "conflict" || cls == "expired" || cls == "unprocessable") {
+            return ERROR_TYPE_NOT_SUPPORTED;
+        }
+        return ERROR_TYPE_INVALID_REQUEST;
+    };
+
+    auto pcbt_roundtrip = [this, pcbt_error_type](const server_http_req & req,
+                                                  server_task::pcbt_action action) {
+        auto res = create_response();
+        server_task task(SERVER_TASK_TYPE_PCBT);
+        task.pcbt = std::move(action);
+        task.id = res->rd.get_new_id();
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        auto * pcbt = dynamic_cast<server_task_result_pcbt *>(result.get());
+        GGML_ASSERT(pcbt != nullptr);
+        if (pcbt->is_error()) {
+            json err = format_error_response(pcbt->message, pcbt_error_type(pcbt->error_class));
+            err["class"]       = pcbt->error_class;
+            err["http_status"] = pcbt->http_status;
+            res->error(err);
+            return res;
+        }
+        res->ok(pcbt->payload);
+        return res;
+    };
+
+    auto pcbt_parse_tx_id = [](const server_http_req & req, uint64_t & out) {
+        const std::string str = req.get_param("transaction_id");
+        try {
+            size_t parsed = 0;
+            const long long v = std::stoll(str, &parsed);
+            if (parsed != str.size() || v < 0) {
+                return false;
+            }
+            out = (uint64_t) v;
+            return true;
+        } catch (const std::exception &) {
+            return false;
+        }
+    };
+
+    this->post_transactions = [this, pcbt_roundtrip](const server_http_req & req) {
+        const json body = json::parse(req.body, nullptr, false);
+        pcbt_create_request parsed;
+        const auto pr = body.is_discarded()
+            ? pcbt_parse_result::fail(pcbt_error::INVALID_REQUEST, "invalid JSON")
+            : pcbt_parse_create(body, parsed);
+        if (!pr.ok()) {
+            auto res = create_response();
+            res->error(format_error_response(pr.message, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task::pcbt_action action;
+        action.op        = server_task::pcbt_action::CREATE;
+        action.body_json = req.body;
+        return pcbt_roundtrip(req, std::move(action));
+    };
+
+    this->post_transaction_action = [this, pcbt_roundtrip, pcbt_parse_tx_id](const server_http_req & req) {
+        server_task::pcbt_action action;
+        if (!pcbt_parse_tx_id(req, action.transaction_id)) {
+            auto res = create_response();
+            res->error(format_error_response("invalid transaction ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string verb = req.get_param("action");
+        const json body = json::parse(req.body, nullptr, false);
+        pcbt_parse_result pr;
+        if (body.is_discarded()) {
+            pr = pcbt_parse_result::fail(pcbt_error::INVALID_REQUEST, "invalid JSON");
+        } else if (verb == "commit") {
+            pcbt_commit_request parsed;
+            pr = pcbt_parse_commit(body, parsed);
+            action.op = server_task::pcbt_action::COMMIT;
+        } else if (verb == "abort") {
+            pcbt_abort_request parsed;
+            pr = pcbt_parse_abort(body, parsed);
+            action.op = server_task::pcbt_action::ABORT;
+        } else {
+            pr = pcbt_parse_result::fail(pcbt_error::INVALID_REQUEST, "invalid action");
+        }
+        if (!pr.ok()) {
+            auto res = create_response();
+            res->error(format_error_response(pr.message, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        action.body_json = req.body;
+        return pcbt_roundtrip(req, std::move(action));
+    };
+
+    this->get_transactions = [this, pcbt_roundtrip, pcbt_parse_tx_id](const server_http_req & req) {
+        server_task::pcbt_action action;
+        if (!pcbt_parse_tx_id(req, action.transaction_id)) {
+            auto res = create_response();
+            res->error(format_error_response("invalid transaction ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        action.op = server_task::pcbt_action::OBSERVE;
+        return pcbt_roundtrip(req, std::move(action));
+    };
+
+    this->get_transaction_events = [this, pcbt_roundtrip, pcbt_parse_tx_id](const server_http_req & req) {
+        server_task::pcbt_action action;
+        if (!pcbt_parse_tx_id(req, action.transaction_id)) {
+            auto res = create_response();
+            res->error(format_error_response("invalid transaction ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string after = req.get_param("after");
+        if (!after.empty()) {
+            try {
+                action.after_seq = (uint64_t) std::stoull(after);
+            } catch (const std::exception &) {
+                auto res = create_response();
+                res->error(format_error_response("invalid after", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        action.op = server_task::pcbt_action::EVENTS;
+        return pcbt_roundtrip(req, std::move(action));
+    };
+
     this->get_states = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_slots) {
@@ -9364,6 +9498,7 @@ void server_routes::init_routes() {
         json props = {
             { "default_generation_settings", default_generation_settings_for_props },
             { "total_slots",                 params.n_parallel },
+            { "pcbt",                        { {"contract", "v1"}, {"enabled", false} } },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
             { "modalities",                  json {

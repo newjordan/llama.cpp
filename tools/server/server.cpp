@@ -235,6 +235,10 @@ int llama_server(int argc, char ** argv) {
     ctx_http.get ("/snapshot-heads",            ex_wrapper(routes.get_snapshot_heads));
     ctx_http.post("/snapshot-heads/:head",      ex_wrapper(routes.post_snapshot_heads));
     ctx_http.get ("/states",                   ex_wrapper(routes.get_states));
+    ctx_http.post("/transactions",             ex_wrapper(routes.post_transactions));
+    ctx_http.post("/transactions/:transaction_id", ex_wrapper(routes.post_transaction_action));
+    ctx_http.get ("/transactions/:transaction_id", ex_wrapper(routes.get_transactions));
+    ctx_http.get ("/transactions/:transaction_id/events", ex_wrapper(routes.get_transaction_events));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
