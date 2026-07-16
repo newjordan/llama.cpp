@@ -177,7 +177,22 @@ llama_kv_ragged_plan llama_kv_build_ragged_plan(
     const uint32_t n_pad_cur = std::max(n_pad, 256u);
     plan.n_kv = std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(max_visible, n_pad_cur)));
     plan.dense_n_kv = std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur)));
-    plan.reduces_columns = plan.has_shared_prefix && plan.n_kv < plan.dense_n_kv;
+
+    // Activation-ratio heuristic: the indexed path pays a gather overhead
+    // per column, so a plan that barely reduces columns loses to the dense
+    // scan (measured -6..-11% aggregate at fanout >= 7 on compact layouts,
+    // results/treebeard-nxy-optimizer/20260715-221845-branch-cost). Require
+    // the ragged plan to save at least LLAMA_KV_TREE_RAGGED_MIN_REDUCTION
+    // percent of the dense columns (default 10; 0 restores the old
+    // any-reduction behavior).
+    static const uint32_t min_reduction_pct = []() {
+        const char * env = getenv("LLAMA_KV_TREE_RAGGED_MIN_REDUCTION");
+        const long v = env ? atol(env) : 10;
+        return (uint32_t) std::clamp(v, 0l, 100l);
+    }();
+    plan.reduces_columns = plan.has_shared_prefix &&
+        (uint64_t) plan.n_kv * 100 <= (uint64_t) plan.dense_n_kv * (100 - min_reduction_pct) &&
+        plan.n_kv < plan.dense_n_kv;
 
     const uint32_t invalid = std::numeric_limits<uint32_t>::max();
     plan.rows.assign(seqs.size()*plan.n_kv, invalid);

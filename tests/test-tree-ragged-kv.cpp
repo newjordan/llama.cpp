@@ -128,11 +128,37 @@ static void test_commit_then_refork_rebuilds_generation_visibility() {
     assert(reforked.rows[reforked.n_kv + 160] == 1536);
 }
 
+static void test_small_reduction_stays_dense() {
+    // Activation-ratio heuristic (default LLAMA_KV_TREE_RAGGED_MIN_REDUCTION
+    // = 10): a fork family whose ragged plan saves under 10% of the dense
+    // columns must stay on the dense graph — the indexed gather costs more
+    // than it saves there (B2 branch-cost evidence).
+    llama_kv_cells cells;
+    cells.resize(8192);
+
+    for (uint32_t i = 0; i < 6300; ++i) {
+        add_cell(cells, i, i, { 3, 7 });
+    }
+    for (uint32_t i = 0; i < 100; ++i) {
+        add_cell(cells, 6300 + i, 6300 + i, { 3 });
+        add_cell(cells, 6800 + i, 6300 + i, { 7 });
+    }
+
+    const auto plan = llama_kv_build_ragged_plan(cells, { 3, 7 }, 256);
+
+    assert(plan.has_shared_prefix);
+    assert(plan.n_kv == 6400);        // GGML_PAD(6300 + 100, 256)
+    assert(plan.dense_n_kv == 6912);  // GGML_PAD(6900, 256)
+    // 6400/6912 = 92.6% of dense: a 7.4% saving, under the 10% threshold.
+    assert(!plan.reduces_columns);
+}
+
 int main() {
     test_shared_prefix_private_tails_are_ragged();
     test_unrelated_sequences_do_not_activate_tree_path();
     test_shared_dense_family_stays_on_existing_graph();
     test_commit_then_refork_rebuilds_generation_visibility();
+    test_small_reduction_stays_dense();
     std::cout << "Treebeard ragged KV plan tests passed\n";
     return 0;
 }
