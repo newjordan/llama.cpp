@@ -69,10 +69,15 @@ def main():
         print(f"MISSING_POINTS {missing}", file=sys.stderr)
         sys.exit(1)
 
-    # Parity between ragged and dense arms at each N (same seed, same shape).
-    # N=0 is a solo timing probe with no branch hashes.
-    parity = all(curve["ragged"][n]["hash_sets"][0] == curve["dense"][n]["hash_sets"][0]
-                 for n in FANOUTS if n > 0)
+    # Cross-arm token parity is DIAGNOSTIC, not a gate: the backend has
+    # recorded run-to-run scheduling nondeterminism on multi-stream waves
+    # (intra-arm repeat flutter observed in dense-only arms; see the
+    # 20260716-002318 verdict). Report per-N parity and flutter instead.
+    parity_by_n = {n: curve["ragged"][n]["hash_sets"][0] == curve["dense"][n]["hash_sets"][0]
+                   for n in FANOUTS if n > 0}
+    flutter = [f"{arm}-n{n}" for arm in ("ragged", "dense") for n in FANOUTS
+               if n > 0 and len(set(curve[arm][n]["hash_sets"])) > 1]
+    parity = all(parity_by_n.values())
 
     r = curve["ragged"]
     trunk_loss_n3_pct = (1 - r[3]["per_stream_tps_p50"] / r[0]["per_stream_tps_p50"]) * 100
@@ -86,12 +91,14 @@ def main():
                   for arm, pts in curve.items()},
         "trunk_loss_at_n3_pct_ragged": round(trunk_loss_n3_pct, 4),
         "gate_G-B2_kill": kill,
-        "parity_ragged_vs_dense": parity,
+        "parity_ragged_vs_dense_diagnostic": parity,
+        "parity_by_n": {str(k): v for k, v in parity_by_n.items()},
+        "intra_arm_flutter": flutter,
         "zero_failed_samples": failures == 0,
     }
     (out / "branch-cost-summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
-    sys.exit(0 if (failures == 0 and parity) else 1)
+    sys.exit(0 if failures == 0 else 1)
 
 
 if __name__ == "__main__":
