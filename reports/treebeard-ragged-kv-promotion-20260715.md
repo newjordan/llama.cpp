@@ -76,12 +76,18 @@ measurement ran hoist=0, RC5 ships `GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=0`
 and hoist adoption is deferred pending a hoist-on dense golden arm. The
 activation trace `[treebeard-q8-hoist] activated` appeared in C3 only.
 
-## Edge probes
+## Edge probes — partial (outstanding follow-up)
 
-250k long-prefix parity (ragged on/off) and commit-churn probes: first
-attempt timed out at the 900s request ceiling (a 250k dense prefill takes
-about 15 minutes); rerun in flight with a 3600s ceiling in edge-only mode.
-This section is updated by the edge run's `edge-summary.json`.
+250k long-prefix ragged-OFF completed clean (6 branches, min_cache_n 250000,
+no assert trips; prefill 965.6s — the original 900s timeout was the only
+failure mode). The ragged-ON arm and the commit-churn probe were externally
+stopped mid-prefill in two consecutive windows (20260715-205324,
+20260715-212915; production restored exactly both times) and were not re-run
+tonight. Residual risk: the ragged plan at fork-family prefixes near kv_size
+is untested; dense serving is unaffected (the plan never forms there) and
+the fragmented gates cover 32k prefixes exhaustively. Follow-up queued: one
+edge-long-on + churn window (~35 min) before relying on very-long-prefix
+multi-branch workloads.
 
 ## Ship decision
 

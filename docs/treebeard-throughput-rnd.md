@@ -315,9 +315,11 @@ dense-shape win.
   (its >= 1.0% p50 gate passes) but +0.18% mean; adoption deferred pending a
   hoist-on dense golden arm because every golden-shape measurement ran
   hoist=0. The hoist stays compiled default-off with strengthened evidence.
-- [ ] 250k long-prefix parity and commit-churn probes (edge window in flight;
-  first attempt timed out at the 900s request ceiling — a 250k prefill needs
-  about 15 minutes).
+- [ ] 250k long-prefix ragged-ON parity and commit-churn probes: OFF-arm
+  completed clean (no assert trips at 250k); the ON-arm windows were
+  externally stopped twice and are queued as follow-up. Dense serving is
+  unaffected (the plan never forms there); fragmented gates cover 32k
+  prefixes exhaustively.
 
 Token-level speculative width note: ragged-KV changes multi-sequence
 attention indexing, not wide-batch ubatch numerics, so it does not lift the
