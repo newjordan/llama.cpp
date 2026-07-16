@@ -27,6 +27,15 @@ def point(out, label):
     if not p.exists():
         return None
     doc = json.loads(p.read_text())
+    if doc.get("kind") == "solo-probe":
+        return {
+            "per_stream_tps_p50": doc["timings"]["predicted_per_second"],
+            "aggregate_tps_p50": doc["timings"]["predicted_per_second"],
+            "fork_client_ms_p50": None,
+            "requests": 1,
+            "failed_samples": 0,
+            "hash_sets": [],
+        }
     per_stream, aggregate, fork_ms, hashes = [], [], [], []
     for s in doc["samples"]:
         reqs = s["branch_wave"]["requests"]
@@ -61,8 +70,9 @@ def main():
         sys.exit(1)
 
     # Parity between ragged and dense arms at each N (same seed, same shape).
+    # N=0 is a solo timing probe with no branch hashes.
     parity = all(curve["ragged"][n]["hash_sets"][0] == curve["dense"][n]["hash_sets"][0]
-                 for n in FANOUTS)
+                 for n in FANOUTS if n > 0)
 
     r = curve["ragged"]
     trunk_loss_n3_pct = (1 - r[3]["per_stream_tps_p50"] / r[0]["per_stream_tps_p50"]) * 100

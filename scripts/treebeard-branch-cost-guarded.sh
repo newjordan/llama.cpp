@@ -16,7 +16,9 @@ SERVICE="${TREEBEARD_LIVE_SERVICE:-turbo-statetree-rc4.service}"
 LIVE_PORT=8093
 BENCH_PORT=8098
 REPEATS="${TREEBEARD_BRANCH_COST_REPEATS:-2}"
-FANOUTS=(0 1 3 5 7 11)
+# fanout 0 is rejected by the harness; the N=0 solo point is measured by
+# solo_probe() below (32k token-array prompt, server decode timings).
+FANOUTS=(1 3 5 7 11)
 RUN_ID="$(date +%Y%m%d-%H%M%S)-branch-cost"
 OUT="$ROOT/results/treebeard-nxy-optimizer/$RUN_ID"
 STARTED="$(date --iso-8601=seconds)"
@@ -143,6 +145,54 @@ run_point() {
     [[ -z "$(listener_pid)" ]]
 }
 
+# solo_probe <label> <ragged 0|1>: N=0 trunk-alone decode rate at 32k depth.
+solo_probe() {
+    local label="$1" ragged="$2"
+    local dir="$OUT/run"
+    env -u SIQ_PROF -u SIQ_PROF_TRIGGER_FILE -u GGML_SYCL_STATE_IO_DEBUG \
+        -u GGML_SYCL_STATE_IO_MODE -u LLAMA_KV_INDEXED_FATTN \
+        LLAMA_KV_TREE_RAGGED="$ragged" \
+        GGML_SYCL_ENABLE_STATE_IO_FUSION=1 \
+        GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=0 \
+        GGML_SYCL_DISABLE_GRAPH=1 \
+        GGML_SYCL_ENABLE_MOE_PIPELINE=0 \
+        GGML_SYCL_ENABLE_MOE_DOWN_GROUPED=0 \
+        taskset -c 0-10,12-15 "$BUILD/bin/llama-server" \
+        -m "$MODEL" -ngl 99 -ncmoe 0 --no-op-offload \
+        -c 262144 -np 12 -kvu -fa on -ctk f16 -ctv f16 -b 8192 -ub 1024 -t 15 \
+        --host 127.0.0.1 --port "$BENCH_PORT" --jinja --metrics -a "$label" \
+        > "$dir/$label.server.log" 2>&1 &
+    local pid=$!
+    for _ in {1..240}; do
+        curl -fsS --max-time 3 "http://127.0.0.1:$BENCH_PORT/health" >/dev/null 2>&1 && break
+        kill -0 "$pid" 2>/dev/null || { tail -50 "$dir/$label.server.log" >&2; return 1; }
+        sleep 1
+    done
+    python3 - "$BENCH_PORT" "$dir/$label.result.json" <<'PYEOF'
+import json, sys, urllib.request
+port, dest = sys.argv[1], sys.argv[2]
+body = json.dumps({"prompt": [872] * 32768, "n_predict": 64,
+                   "temperature": 0, "seed": 1709}).encode()
+req = urllib.request.Request(f"http://127.0.0.1:{port}/completion", data=body,
+                             headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=1800) as r:
+    doc = json.loads(r.read())
+out = {"kind": "solo-probe", "prefix_tokens": 32768,
+       "timings": doc.get("timings"), "predicted_n": doc.get("tokens_predicted")}
+json.dump(out, open(dest, "w"), indent=2)
+print("solo predicted_per_second:", out["timings"]["predicted_per_second"])
+PYEOF
+    local rc=$?
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+        ss -ltn "( sport = :$BENCH_PORT )" | rg -q LISTEN || break
+        sleep 1
+    done
+    return "$rc"
+}
+
+solo_probe ragged-n0 1
+solo_probe dense-n0 0
 for fanout in "${FANOUTS[@]}"; do
     run_point "ragged-n$fanout" 1 "$fanout"
 done

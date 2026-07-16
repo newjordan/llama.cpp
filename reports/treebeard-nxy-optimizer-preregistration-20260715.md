@@ -80,6 +80,13 @@ Per-stream state and rule, identical wherever the controller is evaluated:
 - Geometry: ragged-kv screen shape (ctx 262144, np 12, 32K shared prefix),
   1 trunk + N forked branches, N in {0, 1, 3, 5, 7, 11}, greedy, 64 branch
   tokens, seed 1709, 2 repeats per point.
+- **Pre-data method amendment (2026-07-15, before any c(N) point was
+  measured; gate unchanged):** `turbo-statetree-bench.py` rejects
+  `--fanout 0`, so the N=0 solo-trunk point is measured instead by a direct
+  `/completion` against the same server env with a 32768-token token-array
+  prompt and `n_predict 64`, reading the server's `timings.predicted_per_second`
+  (decode throughput depends on context depth, not token content). N >= 1
+  points come from the harness fanout sweep as originally specified.
 - Arms: `LLAMA_KV_TREE_RAGGED=1` vs `=0`, both with
   `GGML_SYCL_ENABLE_STATE_IO_FUSION=1`.
 - Metrics: trunk per-stream tok/s vs N, aggregate tok/s, fork and commit
