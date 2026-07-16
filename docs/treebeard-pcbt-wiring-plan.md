@@ -66,3 +66,46 @@ every PCBT-2 route response under test is non-mutating by construction.
   python) once routes exist: each fixture -> expected HTTP status.
 - PCBT-3 exit gate fixtures (dense + fragmented all-or-nothing create)
   live in the guarded window scripts, not unit tests.
+
+
+## PCBT-3 implementation strategy (scoped 2026-07-16 ~02:15, anchors verified)
+
+The SLOT_FORK state-thread case (server-context.cpp:4804-5001) decomposes:
+
+1. Validation prelude (4806-4895): capability (kv_unified, !mtmd, !spec,
+   !lora), source resolution/idleness, fork-reservation semantics, prompt
+   non-empty, explicit-destination validation. PARTIALLY SLOT_FORK-specific.
+2. REUSABLE CORE (4898-4959): per-destination prompt.tokens.clone(),
+   id-space exhaustion checks, `common_context_seq_cp(ctx_tgt, src, dst,
+   -1, -1)` COW fork per destination, family identity assignment
+   (fork_source_id / state_id / node_id / parent_node_id / fork_id over
+   id-sorted members), `touch_family(id_slot, fork_id, false)`.
+3. Journal + result tail (4960-5001): `record_statetree_event("fork", ...)`
+   with family bytes, then the SLOT_FORK result fill.
+
+Plan:
+- Extract 2 (+ the id-space checks) into a member helper
+  `statetree_fork_family(server_slot * source, const std::vector<server_slot*> &
+  destinations, std::string & error) -> optional<family identity struct>`;
+  SLOT_FORK keeps its prelude/tail and calls the helper (behavior-identical;
+  verify via StateTree gates + existing route smoke).
+- PCBT create (in handle_pcbt): after parse + idempotency probe →
+  resolve source slot by node_id over `slots` (committed singleton, idle,
+  non-empty prompt) → auto-select N idle destination slots (excluding
+  source; fewer than N idle -> CAPACITY 503, nothing mutated) → call helper
+  → on success ONLY: registry.create, fill branch node/slot ids, deadline =
+  now + budget.deadline_ms, push create event, respond 201-shape view.
+  Branches stay QUEUED (scheduling is PCBT-4); transaction stays CREATING.
+- Safety: keep /props enabled:false and the 503 boundary unless env
+  `TREEBEARD_PCBT_ENABLE=1` — created families hold slots with only manual
+  cleanup until PCBT-4/7 land, so production must not expose create yet.
+- Fixture matrix (extend treebeard-pcbt-route-smoke.sh, CPU 0.8B server,
+  TREEBEARD_PCBT_ENABLE=1, -np 4): create 2-branch -> 201-shape view with
+  generation + branch_nodes; exact retry -> 200 same transaction_id;
+  changed body same request_id -> 409; create needing 3 slots with np=4
+  and one family already holding 3 -> 503 with zero orphan reservations
+  (assert via /slots); observe/events on the created tx -> 200 view with
+  create event seq 1.
+- Dense/fragmented KV-semantics proof (exit gate) reuses the guarded
+  turbo-statetree-bench fixtures unchanged — the helper refactor must not
+  alter SLOT_FORK behavior, which those gates already cover.
