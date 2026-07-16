@@ -1653,17 +1653,17 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = get_n_attn_stream(sinfo);
     const size_t stream_stride = ggml_row_size(k->type, n_embd_k_gqa*kv_size);
 
-    auto * result = ggml_view_4d(ctx, k,
+    // Tree-ragged returns the single-stream view; the stream broadcast
+    // (ne[3]=ns, nb[3]=0) is applied after the permutes in build_attn_mha.
+    // Patching it here makes any later view re-derivation (ggml_permute)
+    // compute a contiguous n_kv*ns size that can legitimately exceed the
+    // cache and trip the ggml_new_tensor_impl view bound.
+    return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, sinfo.tree_ragged_attn ? 1 : ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             stream_stride,
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
-    if (sinfo.tree_ragged_attn) {
-        result->ne[3] = ns;
-        result->nb[3] = 0;
-    }
-    return result;
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1682,17 +1682,14 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
-        auto * result = ggml_view_4d(ctx, v,
+        // See get_k: the tree-ragged stream broadcast is applied after the
+        // permutes in build_attn_mha, not here.
+        return ggml_view_4d(ctx, v,
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, sinfo.tree_ragged_attn ? 1 : ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 stream_stride,                                          // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
-        if (sinfo.tree_ragged_attn) {
-            result->ne[3] = ns;
-            result->nb[3] = 0;
-        }
-        return result;
     }
 
     // note: v->nb[1] > v->nb[2]

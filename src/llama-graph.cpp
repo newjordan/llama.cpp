@@ -2147,14 +2147,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kv_idxs) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
-    // split the batch into streams if needed
-    const auto n_stream = k->ne[3];
+    // split the batch into streams if needed; sequence-ragged indexed
+    // attention passes single-stream k/v cache views with the stream count
+    // carried by the index tensor
+    const auto n_stream = kv_idxs ? kv_idxs->ne[1] : k->ne[3];
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    // sequence-ragged: broadcast the single-stream cache views across the
+    // attention streams AFTER the permutes, so no view re-derivation ever
+    // sees the inflated contiguous n_kv*n_stream product (which can
+    // legitimately exceed kv_size and would trip the ggml view bound).
+    if (kv_idxs && n_stream > 1 && k->ne[3] == 1) {
+        k->ne[3] = n_stream;
+        k->nb[3] = 0;
+        v->ne[3] = n_stream;
+        v->nb[3] = 0;
+    }
 
     ggml_tensor * cur;
 
