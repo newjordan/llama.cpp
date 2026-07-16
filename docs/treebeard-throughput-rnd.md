@@ -333,6 +333,13 @@ ragged win is fragmentation-specific; a column-reduction-ratio activation
 threshold is the follow-up lever. Evidence:
 `results/treebeard-nxy-optimizer/20260715-221845-branch-cost`.
 
+Activation-ratio heuristic (2fed29794, RC7 candidate, evidence-complete):
+`LLAMA_KV_TREE_RAGGED_MIN_REDUCTION` (default 10) keeps sub-threshold fork
+families on the dense scan; the compact-layout N=7 indexed penalty recovered
+from -11.5% to -3.7% (noise band) with fragmented workloads unaffected by
+construction. Promotion flip deliberately deferred to the user. Evidence:
+`results/treebeard-nxy-optimizer/20260716-002318-branch-cost`.
+
 Token-level speculative width note: ragged-KV changes multi-sequence
 attention indexing, not wide-batch ubatch numerics, so it does not lift the
 three recorded serial-equivalence park verdicts on speculative verification.
