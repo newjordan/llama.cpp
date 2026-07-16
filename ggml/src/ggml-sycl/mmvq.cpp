@@ -119,6 +119,89 @@ static void mul_mat_vec_q_reorder_ncols(const void * __restrict__ vx, const void
     }
 }
 
+template <int ncols_dst>
+static void mul_mat_vec_q8_0_reorder_ncols_hoisted(
+        const void * __restrict__ vx, const void * __restrict__ vy,
+        float * __restrict__ dst, const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        const sycl::nd_item<3> & nd_item) {
+    using block_type   = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg           = nd_item.get_sub_group();
+    const int  sg_range     = sg.get_group_linear_range();
+    const int  workgroup_id = nd_item.get_group_linear_id();
+    const int  sg_id        = sg.get_group_linear_id();
+    const int  row          = workgroup_id * sg_range + sg_id;
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * blocks_per_row;
+    const auto *  base                        = static_cast<const uint8_t *>(vx);
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    float partial_sum[ncols_dst] = {0.0f};
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+         i < blocks_per_row; i += blocks_per_subgroup) {
+        const int  ibx       = row * blocks_per_row + i;
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int  iby       = i * block_type::block_to_q8_1_ratio();
+        const auto * qs      = reinterpret_cast<const int8_t *>(base + bx_offset.first);
+        const float d        = static_cast<float>(
+            *reinterpret_cast<const ggml_half *>(base + d_offset.first));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq *
+                (sg.get_local_linear_id() % block_elements_per_subgroup);
+            int v[block_traits::vdr_mmvq];
+
+#pragma unroll
+            for (size_t q = 0; q < block_traits::vdr_mmvq; ++q) {
+                v[q] = get_int_from_int8(qs, iqs + q);
+            }
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const char * vy_j = static_cast<const char *>(vy) + j * stride_col_y_bytes;
+                const auto * q8_1_quant_ptr = reinterpret_cast<const int8_t *>(vy_j) + iby * QK8_1;
+                const auto * q8_1_ds_ptr = reinterpret_cast<const sycl::half2 *>(
+                    vy_j + ncols + iby * sizeof(sycl::half2));
+                int u[block_traits::vdr_mmvq];
+
+#pragma unroll
+                for (size_t q = 0; q < block_traits::vdr_mmvq; ++q) {
+                    u[q] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + q);
+                }
+
+                int sumi = 0;
+#pragma unroll
+                for (size_t q = 0; q < block_traits::vdr_mmvq; ++q) {
+                    sumi = dpct::dp4a(v[q], u[q], sumi);
+                }
+                const sycl::half2 ds_values = *q8_1_ds_ptr;
+                partial_sum[j] += d * static_cast<float>(ds_values[0]) * sumi;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const float sum = sycl::reduce_over_group(sg, partial_sum[j], std::plus<>());
+        if (sg.leader()) {
+            dst[j * stride_col_dst + row] = sum;
+        }
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
                           const int ncols, const int nrows, const sycl::nd_item<3> & item_ct1) {
@@ -1119,11 +1202,80 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
     });
 }
 
+template <int ncols_dst>
+static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted(
+        const void * vx, const void * vy, float * dst,
+        const int ncols, const int nrows,
+        const int stride_col_y_bytes, const int stride_col_dst,
+        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK8_0 == 0);
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
+    constexpr size_t num_subgroups = 16;
+    GGML_ASSERT(block_num_y % num_subgroups == 0);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(global_size, workgroup_size),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q8_0_reorder_ncols_hoisted<ncols_dst>(
+                                 vx, vy, dst, ncols, nrows,
+                                 stride_col_y_bytes, stride_col_dst, nd_item);
+                         });
+    });
+}
+
+static bool q8_0_ncols_weight_hoist_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
         const void * vx, const void * vy, float * dst,
         const int ncols, const int nrows, const int ncols_dst,
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
+    if (q8_0_ncols_weight_hoist_enabled()) {
+        static std::atomic<bool> traced { false };
+        if (!traced.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr, "[treebeard-q8-hoist] activated ncols=%d nrows=%d k=%d\n",
+                    ncols_dst, nrows, ncols);
+        }
+        switch (ncols_dst) {
+            case 2:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<2>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            case 3:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<3>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            case 4:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<4>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            case 5:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<5>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            case 6:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<6>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            case 7:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<7>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            case 8:
+                reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted<8>(
+                    vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream);
+                return;
+            default:
+                break;
+        }
+    }
     switch (ncols_dst) {
         case 1: reorder_mul_mat_vec_q8_0_q8_1_sycl(vx, vy, dst, ncols, nrows, stream); break;
         case 2: reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols<2>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;

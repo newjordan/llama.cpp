@@ -9524,6 +9524,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Qwen3.6 recurrent output and QKV projections at StateTree decode widths.
+    for (int bs : {1, 6, 8, 12}) {
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048, bs, 4096, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, bs, 2048, {1, 1}, {1, 1}));
+    }
+
     // Qwen3.6-35B-A3B fused decode shapes: gate/up, common down, and Q8_0 down.
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 256, 8, true,  512,  12, 2048));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 256, 8, true,  512,  12, 2048));
