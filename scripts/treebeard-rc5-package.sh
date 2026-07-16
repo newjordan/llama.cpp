@@ -7,17 +7,18 @@
 set -Eeuo pipefail
 
 HOIST="${1:-0}"
+RC="${TREEBEARD_RC:-rc.5}"
 ROOT=/home/frosty40/turbo/treebeard-work
 WORKTREE=/home/frosty40/turbo/worktrees/treebeard-moe-down-reduce
 BUILD="$ROOT/build-treebeard-single-wavefront"
 MODEL=/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
-NAME=turbo-statetree-0.1.0-rc.5
+NAME=turbo-statetree-0.1.0-$RC
 RELEASE=/home/frosty40/turbo/turbo-combined/release/$NAME
 PREFIX=/opt/$NAME
 ALIAS=$NAME-Qwen3.6-35B-A3B-Q5-c262144-np12-ragged
-UNIT="$HOME/.config/systemd/user/turbo-statetree-rc5.service"
+UNIT="$HOME/.config/systemd/user/turbo-statetree-${RC/rc./rc}.service"
 BENCH_PORT=8098
-FROZEN_COMMIT=de0834ca0
+FROZEN_COMMIT="${TREEBEARD_FROZEN_COMMIT:-de0834ca0}"
 OUT="$ROOT/results/treebeard-rc5-deploy/$(date +%Y%m%d-%H%M%S)-package-smoke"
 mkdir -p "$OUT"
 
@@ -28,10 +29,16 @@ if ! git -C "$WORKTREE" diff --quiet "$FROZEN_COMMIT" HEAD -- src ggml tools com
     exit 1
 fi
 sha256sum "$BUILD/bin/llama-server" | rg -q \
-    '^393397fb42f418f4b360b908d2d639343e262e0cf5c5ac4a4aa58acfb694481c ' || {
+    "^${TREEBEARD_SERVER_SHA:-393397fb42f418f4b360b908d2d639343e262e0cf5c5ac4a4aa58acfb694481c} " || {
     printf 'BUILD_BINARY_HASH_MISMATCH_VS_FREEZE_RECORD\n' >&2
     exit 1
 }
+if [[ -n "${TREEBEARD_LIBLLAMA_SHA:-}" ]]; then
+    sha256sum "$BUILD/bin/libllama.so" | rg -q "^$TREEBEARD_LIBLLAMA_SHA " || {
+        printf 'LIBLLAMA_HASH_MISMATCH_VS_FREEZE_RECORD\n' >&2
+        exit 1
+    }
+fi
 
 rm -rf "$RELEASE"
 mkdir -p "$RELEASE/metadata"
@@ -47,7 +54,7 @@ sha256sum "$MODEL" > "$RELEASE/metadata/model.sha256"
     > "$RELEASE/metadata/runtime-libraries.sha256"
 cat > "$RELEASE/metadata/provenance.txt" <<EOF
 product=Turbo StateTree
-version=0.1.0-rc.5
+version=0.1.0-$RC
 packaging_revision=pkg1
 source_commit=$(git -C "$WORKTREE" rev-parse "$FROZEN_COMMIT")
 baseline_tag=treebeard-statetree-0.1.0-rc.4
@@ -64,7 +71,7 @@ EOF
 
 cat > "$UNIT" <<EOF
 [Unit]
-Description=Turbo StateTree 0.1.0-rc.5 ragged+state-io B70 262K / 12-slot serving surface on :8093
+Description=Turbo StateTree 0.1.0-$RC ragged+state-io B70 262K / 12-slot serving surface on :8093
 Wants=network-online.target
 After=network-online.target
 
@@ -93,7 +100,7 @@ systemctl --user daemon-reload
 
 # --- Isolated smoke on the bench port. The B70 cannot hold two full
 # instances, so production is stopped for the smoke and restored after. ---
-SERVICE=turbo-statetree-rc4.service
+SERVICE="${TREEBEARD_LIVE_SERVICE:-turbo-statetree-rc5.service}"
 LIVE_PORT=8093
 if ss -ltn "( sport = :$BENCH_PORT )" | rg -q LISTEN; then
     printf 'BENCH_PORT_BUSY\n' >&2
