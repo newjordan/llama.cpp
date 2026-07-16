@@ -114,7 +114,7 @@ commit a deterministically accepted branch and continue from the returned head.
 ### Fork performance
 
 - `docs/turbo-unified-kv-paged-attn.md`
-- `reports/turbo-slot-fork-20260709.md`
+- `reports/archive/20260708-serving-speculative/turbo-slot-fork-20260709.md`
 
 Recorded evidence reports mean server-native fork wall around 6.926 ms versus
 200.398 ms for file save/restore, with forced 12-way decode effectively flat.
@@ -124,7 +124,7 @@ Do not re-prove this before starting the transaction layer.
 
 - `docs/turbo-speculative-breakout.md`
 - `docs/turbo-speculative-breakout-value-benchmark.md`
-- `reports/turbo-speculative-breakout-handoff-20260709.md`
+- `reports/archive/20260708-serving-speculative/turbo-speculative-breakout-handoff-20260709.md`
 - `scripts/turbo-speculative-breakout.py`
 
 The objective-core harness reached 11/11 deterministic passes versus 5/11 for

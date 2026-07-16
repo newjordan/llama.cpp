@@ -58,6 +58,6 @@ python3 scripts/turbo-speculative-breakout.py \
   rerun with task suites closer to the target workload before treating this as a
   production gate.
 - The stronger deterministic objective benchmark run is recorded separately in
-  `reports/turbo-speculative-breakout-objective-core-20260708.md`.
+  `reports/archive/20260708-serving-speculative/turbo-speculative-breakout-objective-core-20260708.md`.
 - Prefix clone was disabled for this run because the live attached server was
   not launched with `--slot-save-path`. Launch mode enables prefix clone.

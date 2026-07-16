@@ -234,7 +234,7 @@ For controlled A/B resets, verify every requested slot reports
 metadata on erase and successful file restore; older builds did not.
 
 The first controlled 35B/B70 gate is recorded in
-`reports/turbo-slot-fork-20260709.md`. After fixing stale file-lane checkpoint
+`reports/archive/20260708-serving-speculative/turbo-slot-fork-20260709.md`. After fixing stale file-lane checkpoint
 metadata, the clean rerun made clone wall time 28.9x faster, kept an equal-token
 12-way branch wave effectively flat, and improved complete flow wall by 2.17%.
 Clone latency, branch throughput, full-flow wall, and output quality remain

@@ -1,7 +1,7 @@
 # Turbo Speculative Breakout Objective Benchmark - 2026-07-08
 
 Superseded for acceptance by the expanded 11-case core run in
-`reports/turbo-speculative-breakout-objective-core-20260708.md`.
+`reports/archive/20260708-serving-speculative/turbo-speculative-breakout-objective-core-20260708.md`.
 
 ## Summary
 

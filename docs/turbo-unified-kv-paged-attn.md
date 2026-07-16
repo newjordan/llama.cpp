@@ -194,7 +194,7 @@ The clean 35B/B70 gate passed 18/18 reset and clone contracts. Mean clone wall
 fell from 200.398 ms for file save/restore to 6.926 ms for fork, while forced
 12-way decode stayed effectively flat at 158.05 versus 158.48 predicted tok/s.
 Complete forced-flow wall improved 2.17%. See
-`reports/turbo-slot-fork-20260709.md`; this is still R&D evidence, not a rollout.
+`reports/archive/20260708-serving-speculative/turbo-slot-fork-20260709.md`; this is still R&D evidence, not a rollout.
 
 ### Path B: True Paged SYCL Flash Attention
 
