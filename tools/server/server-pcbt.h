@@ -135,6 +135,8 @@ struct server_branch_transaction {
     int32_t     generation      = -1;    // family generation once forked
     pcbt_status status        = pcbt_status::CREATING;
     pcbt_budget budget;
+    std::string acceptance_kind;   // create-time acceptance contract binding
+    std::string acceptance_name;
     uint64_t    accepted_unix_ms = 0;
     uint64_t    deadline_unix_ms = 0;
     std::string terminal_reason;

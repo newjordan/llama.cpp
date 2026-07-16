@@ -394,6 +394,14 @@ aggregate budget, or leave the transaction in a nonterminal impossible state.
 
 ### PCBT-5 - Implement candidate and evidence binding
 
+State: complete (2026-07-16): canonical candidate records with
+domain-separated digests land at attribution (PCBT-4); observe/events expose
+candidate metadata and bounded-body truncation flags; commit requires the
+evidence kind to match the create-time contract and the winner
+candidate_digest to match the exact observed-under-generation candidate;
+the server binds evidence bytes/digest without claiming semantic
+verification.
+
 - [ ] Canonicalize each candidate from exact branch identity, output bytes,
   finish reason, model/runtime identity, and token/timing counters.
 - [ ] Domain-separate and hash the canonical candidate representation.
@@ -409,6 +417,18 @@ Exit gate: changing one candidate byte, branch identity, evidence byte, or
 contract name changes the digest and makes a stale decision fail.
 
 ### PCBT-6 - Implement atomic winner commit
+
+State: complete (2026-07-16): the SLOT_COMMIT family-commit core is
+extracted into `statetree_commit_family` (SLOT_COMMIT re-pointed,
+behavior-identical) and PCBT commit validates state/deadline/generation/
+winner-membership/candidate-digest/evidence-contract on the state thread
+immediately before mutation, reuses the in-place commit path (winner
+preserved, losers released with deferred wakeups), stores a versioned
+canonical receipt with a pcbt.receipt.v1 digest, returns byte-identical
+receipts on exact retries, and conflicts on any changed decision. A
+deadline-expired commit performs terminal EXPIRED cleanup and returns 410.
+Route smoke green end-to-end (create -> decode -> attribute -> commit ->
+receipt).
 
 - [ ] Validate transaction state, deadline, generation, winner membership,
   terminal candidate digest, evidence contract, and family idleness on the

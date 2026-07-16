@@ -1059,6 +1059,55 @@ public:
         return true;
     }
 
+    // Zero-copy StateTree family commit: keeps `winner` in place, clears
+    // every loser prompt, reanchors the winner as its own fork root, and
+    // journals the commit. Family membership is (fork_source_id, fork_id).
+    // Extracted from SERVER_TASK_TYPE_SLOT_COMMIT for PCBT winner commit.
+    bool statetree_commit_family(server_slot * winner, std::vector<int> & released, std::string & error) {
+        const int source_id  = winner->fork_source_id;
+        const int64_t state_id = winner->state_id;
+        const int64_t fork_id  = winner->fork_id;
+        std::vector<server_slot *> family;
+        family.reserve(slots.size());
+        released.clear();
+        for (server_slot & slot : slots) {
+            if (slot.fork_source_id != source_id || slot.fork_id != fork_id) {
+                continue;
+            }
+            GGML_ASSERT(slot.state_id == state_id);
+            if (slot.is_processing()) {
+                error = "Fork family is still processing";
+                return false;
+            }
+            family.push_back(&slot);
+            if (slot.id != winner->id) {
+                released.push_back(slot.id);
+            }
+        }
+        GGML_ASSERT(!family.empty());
+        const auto family_nodes = get_statetree_node_refs(family);
+        for (server_slot * slot : family) {
+            if (slot != winner) {
+                slot->prompt_clear(false);
+            }
+        }
+        winner->fork_source_id = winner->id;
+        touch_family(winner->id, winner->fork_id, false);
+        record_statetree_event(
+                "commit",
+                state_id,
+                winner->fork_id,
+                winner->id,
+                released,
+                winner->prompt_state_bytes(),
+                -1,
+                family_nodes);
+        for (const int released_id : released) {
+            slots[released_id].callback_on_deferred(released_id);
+        }
+        return true;
+    }
+
     // Proof-carrying branch transactions: state-thread-owned registry and
     // the task handler (invariant 1; docs/treebeard-pcbt-contract-v1.md).
     pcbt_registry pcbt_txs;
@@ -1163,6 +1212,13 @@ public:
                         : b.phase == pcbt_branch_phase::RUNNING ? "running"
                         : b.phase == pcbt_branch_phase::COMPLETED ? "completed"
                         : b.phase == pcbt_branch_phase::FAILED ? "failed" : "canceled"},
+                {"prompt_tokens", b.prompt_tokens},
+                {"predicted_tokens", b.predicted_tokens},
+                {"wall_ms", b.wall_ms},
+                {"finish_reason", b.finish_reason},
+                {"output_digest", b.output_digest},
+                {"candidate_digest", b.candidate_digest},
+                {"body_truncated", b.body_truncated},
             });
         }
         return json {
@@ -1278,6 +1334,8 @@ public:
                 tx->source_fork_id  = req.source_fork_id;
                 tx->generation      = (int32_t) fork_res.fork_id;
                 tx->budget          = req.budget;
+                tx->acceptance_kind = req.acceptance_kind;
+                tx->acceptance_name = req.acceptance_name;
                 tx->accepted_unix_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
                 tx->deadline_unix_ms = tx->accepted_unix_ms + req.budget.deadline_ms;
@@ -1320,7 +1378,141 @@ public:
                 res->payload = std::move(view);
                 break;
             }
-            case OP::COMMIT:
+            case OP::COMMIT: {
+                auto * tx = pcbt_txs.find(task.pcbt.transaction_id);
+                if (tx == nullptr) {
+                    fail(pcbt_error::NOT_FOUND, "not_found", "unknown transaction");
+                    break;
+                }
+                const auto body = json::parse(task.pcbt.body_json, nullptr, false);
+                pcbt_commit_request req;
+                const auto pr = pcbt_parse_commit(body, req);
+                if (!pr.ok()) {
+                    fail(pr.error, "invalid_request", pr.message);
+                    break;
+                }
+                const uint64_t now_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                // Exact committed retry returns the stored receipt.
+                if (tx->status == pcbt_status::COMMITTED) {
+                    if (tx->decision.winner_node_id == req.winner_node_id &&
+                            tx->decision.candidate_digest == req.candidate_digest &&
+                            tx->decision.evidence_digest == req.evidence_digest) {
+                        res->payload = json::parse(tx->receipt_json);
+                        break;
+                    }
+                    fail(pcbt_error::CONFLICT, "conflict", "a different decision already committed");
+                    break;
+                }
+                if (tx->status != pcbt_status::AWAITING_DECISION) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                         std::string("transaction is ") + pcbt_status_name(tx->status));
+                    break;
+                }
+                if (now_ms > tx->deadline_unix_ms) {
+                    tx->transition(pcbt_status::EXPIRING);
+                    tx->cleanup_members();
+                    tx->transition(pcbt_status::EXPIRED);
+                    tx->terminal_reason = "deadline";
+                    tx->push_event(now_ms, "expired", "{}");
+                    fail(pcbt_error::EXPIRED, "expired", "transaction deadline passed");
+                    break;
+                }
+                if (req.expected_fork_id != tx->generation) {
+                    fail(pcbt_error::CONFLICT, "conflict", "stale generation assertion");
+                    break;
+                }
+                if (req.evidence_kind != tx->acceptance_kind) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable",
+                         "evidence kind does not match the acceptance contract");
+                    break;
+                }
+                pcbt_branch * winner_branch = nullptr;
+                for (auto & b : tx->branches) {
+                    if (b.node_id == req.winner_node_id) {
+                        winner_branch = &b;
+                        break;
+                    }
+                }
+                if (winner_branch == nullptr) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable", "winner is not a transaction branch");
+                    break;
+                }
+                if (winner_branch->phase != pcbt_branch_phase::COMPLETED) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable", "winner candidate is not terminal-completed");
+                    break;
+                }
+                if (winner_branch->candidate_digest != req.candidate_digest) {
+                    fail(pcbt_error::CONFLICT, "conflict", "candidate digest mismatch");
+                    break;
+                }
+                server_slot * winner_slot = nullptr;
+                for (server_slot & slot : slots) {
+                    if (slot.node_id == (int64_t) req.winner_node_id &&
+                            slot.fork_id == (int64_t) tx->generation) {
+                        winner_slot = &slot;
+                        break;
+                    }
+                }
+                if (winner_slot == nullptr || winner_slot->is_processing()) {
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable", "winner slot unavailable");
+                    break;
+                }
+                tx->transition(pcbt_status::COMMITTING);
+                std::vector<int> released;
+                std::string commit_error;
+                if (!statetree_commit_family(winner_slot, released, commit_error)) {
+                    tx->transition(pcbt_status::FAILED);
+                    tx->terminal_reason = commit_error;
+                    tx->cleanup_members();
+                    fail(pcbt_error::UNPROCESSABLE, "unprocessable", commit_error);
+                    break;
+                }
+                tx->decision.winner_node_id   = req.winner_node_id;
+                tx->decision.candidate_digest = req.candidate_digest;
+                tx->decision.evidence_kind    = req.evidence_kind;
+                tx->decision.evidence_digest  = req.evidence_digest;
+                tx->decision.decision_digest  = req.evidence_obj_digest;
+                tx->transition(pcbt_status::COMMITTED);
+                tx->terminal_reason = "committed";
+                json branches_receipt = json::array();
+                for (const auto & b : tx->branches) {
+                    branches_receipt.push_back({
+                        {"key", b.key}, {"node_id", b.node_id},
+                        {"phase", b.phase == pcbt_branch_phase::COMPLETED ? "completed"
+                                : b.phase == pcbt_branch_phase::FAILED ? "failed" : "canceled"},
+                        {"candidate_digest", b.candidate_digest},
+                        {"predicted_tokens", b.predicted_tokens},
+                    });
+                }
+                json receipt {
+                    {"receipt_version", 1},
+                    {"transaction_id", tx->id},
+                    {"request_id", tx->request_id},
+                    {"create_digest", tx->create_digest},
+                    {"generation", tx->generation},
+                    {"winner_node_id", req.winner_node_id},
+                    {"winner_slot", winner_slot->id},
+                    {"state_id", winner_slot->state_id},
+                    {"released_slots", released},
+                    {"branches", std::move(branches_receipt)},
+                    {"evidence", {{"kind", req.evidence_kind}, {"digest", req.evidence_digest}}},
+                    {"decision_digest", tx->decision.decision_digest},
+                    {"terminal_reason", "committed"},
+                    {"committed_unix_ms", now_ms},
+                    {"model_identity", params_base.model_alias},
+                    {"runtime_identity", std::string(llama_build_info())},
+                };
+                tx->receipt_digest = pcbt_digest("pcbt.receipt.v1", receipt);
+                receipt["receipt_digest"] = tx->receipt_digest;
+                tx->receipt_json = receipt.dump();
+                tx->cleanup_members();
+                tx->push_event(now_ms, "committed",
+                        json({{"winner_node_id", req.winner_node_id},
+                              {"receipt_digest", tx->receipt_digest}}).dump());
+                res->payload = std::move(receipt);
+                break;
+            }
             case OP::ABORT: {
                 auto * tx = pcbt_txs.find(task.pcbt.transaction_id);
                 if (tx == nullptr) {
@@ -1328,7 +1520,7 @@ public:
                     break;
                 }
                 fail(pcbt_error::UNPROCESSABLE, "unprocessable",
-                     "pcbt: decision handling lands with PCBT-6/7");
+                     "pcbt: abort lands with PCBT-7");
                 break;
             }
             default:
@@ -5310,25 +5502,17 @@ private:
 
                     const int64_t t_start = ggml_time_us();
                     const auto family_nodes = get_statetree_node_refs(family);
-                    for (server_slot * slot : family) {
-                        if (slot != winner) {
-                            slot->prompt_clear(false);
+                    {
+                        std::vector<int> commit_released;
+                        std::string commit_error;
+                        if (!statetree_commit_family(winner, commit_released, commit_error)) {
+                            send_error(task, commit_error, ERROR_TYPE_UNAVAILABLE);
+                            break;
                         }
+                        released = std::move(commit_released);
                     }
-
-                    winner->fork_source_id = winner->id;
-                    touch_family(winner->id, winner->fork_id, false);
                     const int64_t t_end = ggml_time_us();
                     const auto retention = get_retention_stats();
-                    record_statetree_event(
-                            "commit",
-                            state_id,
-                            winner->fork_id,
-                            winner->id,
-                            released,
-                            winner->prompt_state_bytes(),
-                            -1,
-                            family_nodes);
 
                     auto res = std::make_unique<server_task_result_slot_commit>();
                     res->id        = task.id;
@@ -5351,10 +5535,6 @@ private:
                     res->retained_bytes = retention.retained_bytes;
                     res->state_budget_bytes = params_base.statetree_max_state_bytes;
                     queue_results.send(std::move(res));
-
-                    for (const int released_id : released) {
-                        slots[released_id].callback_on_deferred(released_id);
-                    }
                 } break;
             case SERVER_TASK_TYPE_SLOT_RENEW:
                 {

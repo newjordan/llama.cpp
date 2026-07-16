@@ -158,6 +158,43 @@ print(",".join(sorted(b["phase"] for b in v["branches"])))')
     grep -q "awaiting-decision" /tmp/pcbt-smoke-body.json && echo "ok   awaiting-decision event present" || { echo "FAIL decision event"; fail=1; }
 fi
 
+# --- PCBT-6: winner commit -> receipt --------------------------------------
+if [[ "$NODE_ID" != "-1" && "$TX_ID" != "-1" ]]; then
+    curl -s "http://127.0.0.1:$PORT/transactions/$TX_ID" > /tmp/pcbt-view.json
+    python3 - <<PYEOF > /tmp/pcbt-commit.json
+import json
+v=json.load(open("/tmp/pcbt-view.json"))
+w=[b for b in v["branches"] if b["phase"]=="completed"][0]
+print(json.dumps({
+  "winner_node_id": w["node_id"],
+  "expected_fork_id": v["generation"],
+  "candidate_digest": w["candidate_digest"],
+  "evidence": {"kind":"external","digest":"sha256:"+"ab"*32,"summary":{"passed":1,"failed":0}},
+}))
+PYEOF
+    check "commit winner -> 200 receipt" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions/$TX_ID?action=commit" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-commit.json)"
+    RECEIPT1=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("receipt_digest",""))')
+    [[ -n "$RECEIPT1" ]] && echo "ok   receipt digest present: ${RECEIPT1:0:24}..." || { echo "FAIL receipt digest"; fail=1; }
+
+    check "commit exact retry -> 200" 200 \
+        "$(code -X POST "http://127.0.0.1:$PORT/transactions/$TX_ID?action=commit" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-commit.json)"
+    RECEIPT2=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json")).get("receipt_digest",""))')
+    check "retry returns same receipt" "$RECEIPT1" "$RECEIPT2"
+
+    python3 -c '
+import json
+doc=json.load(open("/tmp/pcbt-commit.json"))
+doc["candidate_digest"]="sha256:"+"00"*32
+print(json.dumps(doc))' > /tmp/pcbt-commit-bad.json
+    code -X POST "http://127.0.0.1:$PORT/transactions/$TX_ID?action=commit" -H 'Content-Type: application/json' --data-binary @/tmp/pcbt-commit-bad.json >/dev/null
+    grep -q '"conflict"' /tmp/pcbt-smoke-body.json && echo "ok   changed-decision conflict class" || { echo "FAIL decision conflict"; fail=1; }
+
+    code "http://127.0.0.1:$PORT/transactions/$TX_ID" >/dev/null
+    STATUS=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')
+    check "observe -> committed" "committed" "$STATUS"
+fi
+
 if (( fail )); then
     echo "PCBT ROUTE SMOKE FAILED" >&2
     exit 1
