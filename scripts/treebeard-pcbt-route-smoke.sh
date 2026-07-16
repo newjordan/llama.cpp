@@ -132,6 +132,32 @@ else
     fail=1
 fi
 
+# --- PCBT-4: branch decode -> attribution -> AWAITING_DECISION ------------
+if [[ "$NODE_ID" != "-1" && "$TX_ID" != "-1" ]]; then
+    curl -s "http://127.0.0.1:$PORT/transactions/$TX_ID" > /tmp/pcbt-view.json
+    GEN=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-view.json"))["generation"])')
+    python3 -c '
+import json
+v=json.load(open("/tmp/pcbt-view.json"))
+for b in v["branches"]:
+    print(b["key"], b["node_id"], b["slot_id"])' | while read -r KEY BNODE BSLOT; do
+        curl -s -X POST "http://127.0.0.1:$PORT/completion" -H 'Content-Type: application/json' \
+            -d "{\"prompt\":\"branch $KEY:\",\"n_predict\":8,\"temperature\":0,\"node_id\":$BNODE,\"fork_id\":$GEN}" >/dev/null
+    done
+    sleep 1
+    check "observe post-decode -> 200" 200 "$(code "http://127.0.0.1:$PORT/transactions/$TX_ID")"
+    STATUS=$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')
+    check "status awaiting_decision" "awaiting_decision" "$STATUS"
+    PHASES=$(python3 -c '
+import json
+v=json.load(open("/tmp/pcbt-smoke-body.json"))
+print(",".join(sorted(b["phase"] for b in v["branches"])))')
+    check "both branches completed" "completed,completed" "$PHASES"
+    code "http://127.0.0.1:$PORT/transactions/$TX_ID/events" >/dev/null
+    grep -q "branch-completed" /tmp/pcbt-smoke-body.json && echo "ok   branch-completed events present" || { echo "FAIL branch events"; fail=1; }
+    grep -q "awaiting-decision" /tmp/pcbt-smoke-body.json && echo "ok   awaiting-decision event present" || { echo "FAIL decision event"; fail=1; }
+fi
+
 if (( fail )); then
     echo "PCBT ROUTE SMOKE FAILED" >&2
     exit 1

@@ -358,18 +358,35 @@ generation identity, zero orphan reservations, and unchanged fork/KV semantics.
 
 ### PCBT-4 - Schedule and account branch requests
 
+State: complete (2026-07-16, morning) in the CLIENT-DRIVEN ATTRIBUTION
+design (owner-authorized "roll pcbt-4 your way"; rationale in
+`treebeard-pcbt-wiring-plan.md`): branches are decoded by ordinary
+completion requests carrying the exact node/fork assertions (the proven B3
+pattern — the server schedules nothing), and `pcbt_attribute_completion` on
+the state thread attributes finalized completions to matching transaction
+branches: token/wall accounting, finish reason, output digest, bounded
+candidate bytes, canonical candidate digest, branch-completed/failed
+events, aggregate predicted-token budget enforcement at attribution
+(over-budget marks the branch FAILED with `budget_exceeded`), and the
+CREATING -> RUNNING -> AWAITING_DECISION / FAILED(no_candidate)
+transitions. Error-path completions attribute as FAILED via the slot
+send_error overload. Route smoke: branch decode -> attribution ->
+awaiting_decision with events, green. Deviations from the original letter
+(server-side task conversion, pre-enqueue and mid-generation budget stops,
+scheduling-stop-after-terminal) are follow-ups noted for PCBT-7/11.
+
 - [ ] Convert each declared branch request into an ordinary completion task
   addressed to its exact branch node and generation.
-- [ ] Add transaction and branch-key metadata to task ownership and results.
+- [x] Add transaction and branch-key metadata to task ownership and results.
 - [ ] Enforce per-branch and aggregate predicted-token limits before enqueue and
   during generation.
 - [ ] Stop scheduling new work after abort, expiry, failure, or decision start.
-- [ ] Distinguish queued, running, completed, failed, and canceled branches.
-- [ ] Capture exact prompt/predicted token counts, wall timings, finish reason,
+- [x] Distinguish queued, running, completed, failed, and canceled branches.
+- [x] Capture exact prompt/predicted token counts, wall timings, finish reason,
   output digest, and bounded output bytes.
 - [ ] Define partial-failure policy: the first slice may continue while at least
   one branch can become a valid candidate, but it must report every failure.
-- [ ] Transition to `AWAITING_DECISION` when no branch remains running and at
+- [x] Transition to `AWAITING_DECISION` when no branch remains running and at
   least one terminal candidate exists.
 
 Exit gate: concurrent branch runs cannot escape their family, overrun the

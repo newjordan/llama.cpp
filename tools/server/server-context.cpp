@@ -1063,6 +1063,97 @@ public:
     // the task handler (invariant 1; docs/treebeard-pcbt-contract-v1.md).
     pcbt_registry pcbt_txs;
 
+    // PCBT-4 (client-driven attribution): a finished completion whose slot
+    // carries a (fork_id, node_id) matching a live transaction branch is
+    // attributed on the state thread — phase, accounting, digest, bounded
+    // candidate bytes, aggregate-budget enforcement, and the
+    // CREATING -> RUNNING -> AWAITING_DECISION / FAILED transitions.
+    void pcbt_attribute_completion(const server_slot & slot, bool failed, const std::string & output_text) {
+        if (slot.fork_id < 0 || slot.node_id < 0 || pcbt_txs.by_id.empty()) {
+            return;
+        }
+        for (auto & [tx_id, tx] : pcbt_txs.by_id) {
+            if (pcbt_status_terminal(tx.status) || tx.generation != (int32_t) slot.fork_id) {
+                continue;
+            }
+            for (auto & b : tx.branches) {
+                if (b.node_id != (int32_t) slot.node_id) {
+                    continue;
+                }
+                if (pcbt_branch_terminal(b.phase)) {
+                    return; // already attributed (retry or duplicate finalization)
+                }
+                const uint64_t now_ms = (uint64_t) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                if (tx.status == pcbt_status::CREATING) {
+                    tx.transition(pcbt_status::RUNNING);
+                }
+                b.prompt_tokens    = slot.task ? (uint32_t) slot.task->n_tokens() : 0;
+                b.predicted_tokens = (uint32_t) std::max(0, slot.n_decoded);
+                const auto timings = slot.get_timings();
+                b.wall_ms = (uint64_t) std::max(0.0, timings.prompt_ms + timings.predicted_ms);
+                uint64_t aggregate = 0;
+                for (const auto & other : tx.branches) {
+                    aggregate += other.predicted_tokens;
+                }
+                const bool over_budget = aggregate > tx.budget.max_predicted_tokens;
+                if (failed || over_budget) {
+                    b.phase = pcbt_branch_phase::FAILED;
+                    b.finish_reason = over_budget ? "budget_exceeded" : "error";
+                } else {
+                    b.phase = pcbt_branch_phase::COMPLETED;
+                    b.finish_reason = slot.stop == STOP_TYPE_EOS   ? "stop"
+                                    : slot.stop == STOP_TYPE_LIMIT ? "length"
+                                    : slot.stop == STOP_TYPE_WORD  ? "stop_word"
+                                                                   : "none";
+                    {
+                        sha256_t h;
+                        sha256_init(&h);
+                        sha256_update(&h, (const unsigned char *) output_text.data(), output_text.size());
+                        unsigned char out[32];
+                        sha256_final(&h, out);
+                        static const char * hexd = "0123456789abcdef";
+                        b.output_digest = "sha256:";
+                        for (unsigned char byte : out) {
+                            b.output_digest += hexd[byte >> 4];
+                            b.output_digest += hexd[byte & 15];
+                        }
+                    }
+                    tx.store_candidate_bytes(b, (const uint8_t *) output_text.data(), output_text.size());
+                    const json candidate {
+                        {"transaction_id", tx.id},
+                        {"generation", tx.generation},
+                        {"branch_key", b.key},
+                        {"node_id", b.node_id},
+                        {"output_sha256", b.output_digest},
+                        {"output_bytes", (uint64_t) output_text.size()},
+                        {"finish_reason", b.finish_reason},
+                        {"prompt_tokens", b.prompt_tokens},
+                        {"predicted_tokens", b.predicted_tokens},
+                        {"model_identity", params_base.model_alias},
+                        {"runtime_identity", std::string(llama_build_info())},
+                    };
+                    b.candidate_digest = pcbt_digest("pcbt.candidate.v1", candidate);
+                }
+                tx.push_event(now_ms,
+                        b.phase == pcbt_branch_phase::COMPLETED ? "branch-completed" : "branch-failed",
+                        json({{"key", b.key}, {"node_id", b.node_id},
+                              {"predicted_tokens", b.predicted_tokens},
+                              {"finish_reason", b.finish_reason}}).dump());
+                if (tx.ready_for_decision()) {
+                    tx.transition(pcbt_status::AWAITING_DECISION);
+                    tx.push_event(now_ms, "awaiting-decision", "{}");
+                } else if (tx.all_branches_failed_or_canceled()) {
+                    tx.transition(pcbt_status::FAILED);
+                    tx.terminal_reason = "no_candidate";
+                    tx.cleanup_members();
+                    tx.push_event(now_ms, "failed", "{\"reason\":\"no_candidate\"}");
+                }
+                return;
+            }
+        }
+    }
+
     json pcbt_transaction_view(const server_branch_transaction & tx) const {
         json branches = json::array();
         for (const auto & b : tx.branches) {
@@ -4028,6 +4119,7 @@ private:
     }
 
     void send_error(const server_slot & slot, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
+        pcbt_attribute_completion(slot, true, "");
         send_error(slot.task->id, error, type, slot.task->n_tokens(), slot.n_ctx);
     }
 
@@ -4101,6 +4193,8 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        pcbt_attribute_completion(slot, false, slot.generated_text);
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
