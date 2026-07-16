@@ -343,6 +343,13 @@ from -11.5% to -3.7% (noise band) with fragmented workloads unaffected by
 construction. Promotion flip deliberately deferred to the user. Evidence:
 `results/treebeard-nxy-optimizer/20260716-002318-branch-cost`.
 
+B4 slot arbitration (2026-07-16, preregistered): FALSIFIED on G-B4a —
+idle-slot-only thinking taxes real agents +26.8% wall at 4-agent load
+(batch bandwidth sharing, confirming the B2 curve) while self-extinguishing
+at load >= 8 (slot rotation starves the >=3-idle requirement). G-B4b/c
+passed. Follow-up lever: preemptive abort-on-arrival via PCBT-7 fencing.
+Evidence: `results/treebeard-b4/20260716-130842-b4`.
+
 Token-level speculative width note: ragged-KV changes multi-sequence
 attention indexing, not wide-batch ubatch numerics, so it does not lift the
 three recorded serial-equivalence park verdicts on speculative verification.
