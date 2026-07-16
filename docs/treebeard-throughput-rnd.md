@@ -350,6 +350,19 @@ at load >= 8 (slot rotation starves the >=3-idle requirement). G-B4b/c
 passed. Follow-up lever: preemptive abort-on-arrival via PCBT-7 fencing.
 Evidence: `results/treebeard-b4/20260716-130842-b4`.
 
+PCBT-4..8 production surface (SHIPPED in RC8 b9743-c7091b65b on 2026-07-16
+15:52 with `TREEBEARD_PCBT_ENABLE=1` in the serving unit; deployment:
+`results/treebeard-rc5-deploy/20260716-155210-rc8-production`, freeze:
+`results/treebeard-ragged-promo-b70/build-freeze-rc8-20260716.md`): fresh
+golden +19.2%/+16.3%/+2.6% p50 at 12/8/1 with the candidate arm's /props
+proving pcbt enabled during the gate; fragmented ship +73.4% with exact
+ship-arm parity (all-arm parity gate flagged single-request c1 flutter —
+see the confirm run's verdict.md); commit-churn hash-identical over the
+statetree_commit_family refactor. Includes the /props enable-gate
+truthfulness fix (c7091b65b), found when the first golden run's candidate
+props claimed enabled=false; that run (20260716-134917, PASS) was
+superseded by the re-run on fixed bytes (20260716-141226).
+
 Token-level speculative width note: ragged-KV changes multi-sequence
 attention indexing, not wide-batch ubatch numerics, so it does not lift the
 three recorded serial-equivalence park verdicts on speculative verification.
