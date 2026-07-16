@@ -52,6 +52,16 @@ extern "C" {
 #include <dlfcn.h>
 #endif
 
+// PCBT surface gate: one env read shared by the create route and /props so
+// introspection can never disagree with the actual route behavior.
+static bool pcbt_enabled_from_env() {
+    static const bool enabled = []() {
+        const char * env = getenv("TREEBEARD_PCBT_ENABLE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -1261,16 +1271,11 @@ public:
                     res->payload = pcbt_transaction_view(existing);
                     break;
                 }
-                // Slot lifecycle (PCBT-4 scheduling, PCBT-7 expiry/abort) is
-                // not wired yet, so the create surface stays opt-in for test
-                // servers only.
-                static const bool pcbt_enabled = []() {
-                    const char * env = getenv("TREEBEARD_PCBT_ENABLE");
-                    return env != nullptr && atoi(env) != 0;
-                }();
-                if (!pcbt_enabled) {
+                // The full lifecycle (PCBT-4..8) is wired; the surface stays
+                // env-gated so only units that opt in expose transactions.
+                if (!pcbt_enabled_from_env()) {
                     fail(pcbt_error::CAPACITY, "capacity",
-                         "pcbt: transactions not yet enabled (set TREEBEARD_PCBT_ENABLE=1 on test servers)");
+                         "pcbt: transactions not enabled (set TREEBEARD_PCBT_ENABLE=1)");
                     break;
                 }
                 if (!params_base.kv_unified || ctx_dft || spec ||
@@ -10059,7 +10064,7 @@ void server_routes::init_routes() {
         json props = {
             { "default_generation_settings", default_generation_settings_for_props },
             { "total_slots",                 params.n_parallel },
-            { "pcbt",                        { {"contract", "v1"}, {"enabled", false} } },
+            { "pcbt",                        { {"contract", "v1"}, {"enabled", pcbt_enabled_from_env()} } },
             { "model_alias",                 meta->model_name },
             { "model_path",                  meta->model_path },
             { "modalities",                  json {
