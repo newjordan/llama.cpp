@@ -540,6 +540,15 @@ can identify the winner's authorized-to-review intent set.
 
 ### PCBT-10 - Integrate the breakout harness
 
+State: complete (2026-07-16): `turbo-speculative-breakout.py --pcbt` drives
+preserve-prefix-root stages through the transaction API — create from the
+source node (with a one-time slot-fork mint for fresh roots), branch decodes
+remapped onto the transaction's slot assignments (server-side attribution
+needs nothing else), validator-selected winner committed with the objective
+report's canonical evidence digest, and winner-node chaining across stages
+via the receipt. Verified live on the 0.8B CPU server: objective-smoke 5/5
+validated wins with pcbt_created_total=5 and pcbt_committed_total=5.
+
 - [ ] Add a PCBT client path to `scripts/turbo-speculative-breakout.py` without
   removing its manual legacy path.
 - [ ] Start from one committed node, create branches through the transaction

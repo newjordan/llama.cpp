@@ -625,6 +625,81 @@ def slot_commit(port: int, slot_id: int, fork_id: int, timeout: float = 300.0) -
     return result
 
 
+def pcbt_create(
+    port: int,
+    request_id: str,
+    source_node_id: int,
+    branches: list[dict[str, Any]],
+    budget: dict[str, int],
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    result = http_json(
+        "POST",
+        f"http://127.0.0.1:{port}/transactions",
+        {
+            "request_id": request_id,
+            "source": {"node_id": source_node_id},
+            "branches": branches,
+            "budget": budget,
+            "acceptance_contract": {"kind": "external", "name": "objective-validator-v1"},
+        },
+        timeout=timeout,
+    )
+    if not isinstance(result, dict) or "transaction_id" not in result:
+        raise RuntimeError(f"pcbt create failed: {result}")
+    return result
+
+
+def pcbt_observe(port: int, transaction_id: int, timeout: float = 60.0) -> dict[str, Any]:
+    result = http_json("GET", f"http://127.0.0.1:{port}/transactions/{transaction_id}", None, timeout=timeout)
+    if not isinstance(result, dict) or "status" not in result:
+        raise RuntimeError(f"pcbt observe failed: {result}")
+    return result
+
+
+def pcbt_commit_tx(
+    port: int,
+    transaction_id: int,
+    winner_node_id: int,
+    expected_fork_id: int,
+    candidate_digest: str,
+    evidence_digest: str,
+    evidence_summary: dict[str, Any],
+    timeout: float = 300.0,
+) -> dict[str, Any]:
+    result = http_json(
+        "POST",
+        f"http://127.0.0.1:{port}/transactions/{transaction_id}?action=commit",
+        {
+            "winner_node_id": winner_node_id,
+            "expected_fork_id": expected_fork_id,
+            "candidate_digest": candidate_digest,
+            "evidence": {
+                "kind": "external",
+                "digest": evidence_digest,
+                "summary": evidence_summary,
+            },
+        },
+        timeout=timeout,
+    )
+    if not isinstance(result, dict) or "receipt_digest" not in result:
+        raise RuntimeError(f"pcbt commit failed: {result}")
+    return result
+
+
+def pcbt_evidence_digest(report: dict[str, Any]) -> str:
+    canon = json.dumps(report, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canon.encode()).hexdigest()
+
+
+def slot_node_id(port: int, slot_id: int, timeout: float = 30.0) -> int:
+    rows = http_json("GET", f"http://127.0.0.1:{port}/slots", None, timeout=timeout)
+    for row in rows:
+        if row.get("id") == slot_id:
+            return int(row.get("node_id", -1))
+    return -1
+
+
 def cleanup_fork_reservations(
     port: int,
     slots: list[int],
@@ -1779,9 +1854,10 @@ def run_breakout(
     slots = parse_slot_list(args.branch_slots)
     preserve_prefix_root = getattr(args, "preserve_prefix_root", False)
     if preserve_prefix_root:
-        if not getattr(args, "adaptive_fanout", False) or objective_case is None:
-            raise SystemExit("--preserve-prefix-root requires adaptive objective fanout")
-        if not args.prefix_clone or args.prefix_clone_backend != "fork":
+        pcbt_mode = getattr(args, "pcbt", False)
+        if (not getattr(args, "adaptive_fanout", False) and not pcbt_mode) or objective_case is None:
+            raise SystemExit("--preserve-prefix-root requires adaptive objective fanout or --pcbt with an objective suite")
+        if not pcbt_mode and (not args.prefix_clone or args.prefix_clone_backend != "fork"):
             raise SystemExit("--preserve-prefix-root requires --prefix-clone and --prefix-clone-backend fork")
         if args.prefix_slot in slots:
             raise SystemExit("--prefix-slot must be excluded from --branch-slots with --preserve-prefix-root")
@@ -1917,6 +1993,8 @@ def run_breakout(
     adaptive_fanout = getattr(args, "adaptive_fanout", False)
     if adaptive_fanout and objective_case is None:
         raise SystemExit("--adaptive-fanout requires --benchmark-suite or --benchmark-suite-file")
+    if getattr(args, "pcbt", False) and not preserve_prefix_root:
+        raise SystemExit("--pcbt requires --preserve-prefix-root")
 
     stage_ends = (
         parse_fanout_stages(getattr(args, "fanout_stages", "1,2,4,8"), len(branch_prompts))
@@ -1927,12 +2005,53 @@ def run_breakout(
     fanout_stage_results: list[dict[str, Any]] = []
     branch_results: list[RequestResult] = []
     current_root_fork_id: int | None = None
+    current_source_node: int = -1
     for stage_end in stage_ends:
         stage_start = len(branch_results)
         stage_fork: dict[str, Any] | None = None
         stage_commit: dict[str, Any] | None = None
-        if preserve_prefix_root:
-            stage_slots = [item[2] for item in branch_prompts[stage_start:stage_end]]
+        stage_tx: dict[str, Any] | None = None
+        stage_prompts = branch_prompts[stage_start:stage_end]
+        if preserve_prefix_root and getattr(args, "pcbt", False):
+            source_node = current_source_node
+            if source_node < 0:
+                source_node = slot_node_id(args.port, args.prefix_slot, timeout=args.request_timeout)
+            if source_node < 0:
+                # Mint node identity once: fork + commit the root in place.
+                mint_dest = [item[2] for item in stage_prompts][:1]
+                minted = slot_fork(args.port, args.prefix_slot, mint_dest, timeout=args.request_timeout)
+                slot_commit(args.port, args.prefix_slot, int(minted["fork_id"]), timeout=args.request_timeout)
+                source_node = slot_node_id(args.port, args.prefix_slot, timeout=args.request_timeout)
+            tx_branches = []
+            for item in stage_prompts:
+                tx_branches.append({
+                    "key": item[0],
+                    "request": {"prompt": item[1], "max_tokens": int(item[8]), "seed": int(item[7])},
+                })
+            budget = {
+                "max_slots": max(2, len(tx_branches)),
+                "max_predicted_tokens": max(1, sum(int(item[8]) for item in stage_prompts) * 2),
+                "deadline_ms": min(600000, max(1000, int(args.request_timeout * 1000))),
+                "max_candidate_bytes": 1048576,
+            }
+            stage_tx = pcbt_create(
+                args.port,
+                f"breakout-{os.getpid()}-{suite_index}-{fanout_waves}",
+                source_node,
+                tx_branches,
+                budget,
+                timeout=args.request_timeout,
+            )
+            fork_waves.append({"pcbt": True, "transaction_id": stage_tx["transaction_id"],
+                               "generation": stage_tx["generation"]})
+            # Remap each branch decode onto the transaction's slot assignment.
+            key_to_slot = {b["key"]: b["slot_id"] for b in stage_tx["branches"]}
+            stage_prompts = [
+                (item[0], item[1], key_to_slot[item[0]], item[3], item[4], item[5], item[6], item[7], item[8])
+                for item in stage_prompts
+            ]
+        elif preserve_prefix_root:
+            stage_slots = [item[2] for item in stage_prompts]
             stage_fork = slot_fork(
                 args.port,
                 args.prefix_slot,
@@ -1942,7 +2061,7 @@ def run_breakout(
             )
             fork_waves.append(stage_fork)
 
-        stage_results = fanout(args, branch_prompts[stage_start:stage_end])
+        stage_results = fanout(args, stage_prompts)
         branch_results.extend(stage_results)
         fanout_waves += 1
 
@@ -1952,7 +2071,38 @@ def run_breakout(
                 if branch.ok and validate_objective(objective_case, branch.content).get("passed"):
                     passing_indices.append(index)
 
-        if preserve_prefix_root:
+        if preserve_prefix_root and stage_tx is not None:
+            view = pcbt_observe(args.port, stage_tx["transaction_id"], timeout=args.request_timeout)
+            completed = {b["key"]: b for b in view["branches"] if b["phase"] == "completed"}
+            winner_key = None
+            if passing_indices:
+                idx0 = passing_indices[0]
+                if idx0 >= stage_start:
+                    winner_key = stage_prompts[idx0 - stage_start][0]
+            if winner_key is None or winner_key not in completed:
+                root_key = stage_prompts[0][0]
+                winner_key = root_key if root_key in completed else (next(iter(completed)) if completed else None)
+            if winner_key is None:
+                raise RuntimeError("pcbt stage produced no completed candidate to commit")
+            wb = completed[winner_key]
+            report = {
+                "validator": "objective",
+                "passing": [stage_prompts[i - stage_start][0] for i in passing_indices if i >= stage_start],
+                "winner": winner_key,
+            }
+            stage_commit = pcbt_commit_tx(
+                args.port,
+                stage_tx["transaction_id"],
+                int(wb["node_id"]),
+                int(view["generation"]),
+                wb["candidate_digest"],
+                pcbt_evidence_digest(report),
+                report,
+                timeout=args.request_timeout,
+            )
+            current_root_fork_id = None
+            current_source_node = int(stage_commit["winner_node_id"])
+        elif preserve_prefix_root:
             winner_slot = (
                 branch_results[passing_indices[0]].id_slot
                 if passing_indices
@@ -2725,6 +2875,8 @@ def main() -> int:
     parser.add_argument("--adaptive-fanout", action=argparse.BooleanOptionalAction, default=False, help="Escalate objective branch width in stages and stop after a validator pass")
     parser.add_argument("--fanout-stages", default="1,2,4,8", help="Cumulative adaptive fanout widths, capped by available branch slots")
     parser.add_argument("--preserve-prefix-root", action=argparse.BooleanOptionalAction, default=False, help="Keep an untouched StateTree root, collapse failed waves, and commit a passing branch")
+    parser.add_argument("--pcbt", action=argparse.BooleanOptionalAction, default=False,
+                        help="Drive stages through proof-carrying branch transactions (/transactions API; server needs TREEBEARD_PCBT_ENABLE=1)")
     parser.add_argument("--baseline-tokens", type=int, default=512)
     parser.add_argument("--branch-tokens", type=int, default=384)
     parser.add_argument("--verify-tokens", type=int, default=192)
