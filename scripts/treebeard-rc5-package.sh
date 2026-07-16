@@ -100,7 +100,7 @@ systemctl --user daemon-reload
 
 # --- Isolated smoke on the bench port. The B70 cannot hold two full
 # instances, so production is stopped for the smoke and restored after. ---
-SERVICE="${TREEBEARD_LIVE_SERVICE:-turbo-statetree-rc5.service}"
+SERVICE="${TREEBEARD_LIVE_SERVICE:-turbo-statetree-rc6.service}"
 LIVE_PORT=8093
 if ss -ltn "( sport = :$BENCH_PORT )" | rg -q LISTEN; then
     printf 'BENCH_PORT_BUSY\n' >&2

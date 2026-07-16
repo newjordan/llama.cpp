@@ -10,11 +10,11 @@ BUILD="$ROOT/build-treebeard-single-wavefront"
 SRC=/home/frosty40/turbo/worktrees/treebeard-moe-down-reduce
 HARNESS="$SRC/scripts/turbo-multiagent-pareto.py"
 MODEL=/home/frosty40/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf
-SERVICE="${TREEBEARD_LIVE_SERVICE:-turbo-statetree-rc5.service}"
+SERVICE="${TREEBEARD_LIVE_SERVICE:-turbo-statetree-rc6.service}"
 LIVE_PORT=8093
 PORT=8098
-EXPECTED_BUILD="${TREEBEARD_EXPECTED_BUILD:-b9680-de0834ca0}"
-EXPECTED_ALIAS="${TREEBEARD_EXPECTED_ALIAS:-turbo-statetree-0.1.0-rc.5-Qwen3.6-35B-A3B-Q5-c262144-np12-ragged}"
+EXPECTED_BUILD="${TREEBEARD_EXPECTED_BUILD:-b9695-d794fd15d}"
+EXPECTED_ALIAS="${TREEBEARD_EXPECTED_ALIAS:-turbo-statetree-0.1.0-rc.6-Qwen3.6-35B-A3B-Q5-c262144-np12-ragged}"
 SKIP_CORRECTNESS="${TREEBEARD_SKIP_CORRECTNESS:-0}"
 read -r -a BENCH_AGENTS <<< "${TREEBEARD_BENCH_AGENTS:-1 8 12}"
 BENCH_REPEATS="${TREEBEARD_BENCH_REPEATS:-10}"
