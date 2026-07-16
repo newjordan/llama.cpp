@@ -11,7 +11,7 @@ FIX="$WORKTREE/tests/pcbt/fixtures"
 PORT="${TREEBEARD_PCBT_SMOKE_PORT:-8097}"
 
 TREEBEARD_PCBT_ENABLE=1 "$BUILD/bin/llama-server" -m "$MODEL" -c 4096 -np 4 -kvu \
-    --host 127.0.0.1 --port "$PORT" --jinja -a pcbt-smoke \
+    --host 127.0.0.1 --port "$PORT" --jinja --metrics -a pcbt-smoke \
     >/tmp/pcbt-route-smoke-server.log 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null' EXIT
@@ -246,6 +246,12 @@ PYEOF
     code "http://127.0.0.1:$PORT/transactions/$TX3" >/dev/null
     check "observe -> expired (timer sweep)" "expired" "$(python3 -c 'import json;print(json.load(open("/tmp/pcbt-smoke-body.json"))["status"])')"
 fi
+
+# --- PCBT-8: metrics ---------------------------------------------------------
+METRICS=$(curl -s "http://127.0.0.1:$PORT/metrics")
+for m in pcbt_created_total pcbt_committed_total pcbt_aborted_total pcbt_expired_total; do
+    echo "$METRICS" | grep -qE "$m [1-9]" && echo "ok   metric $m > 0" || { echo "FAIL metric $m"; fail=1; }
+done
 
 if (( fail )); then
     echo "PCBT ROUTE SMOKE FAILED" >&2

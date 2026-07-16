@@ -1353,6 +1353,7 @@ public:
                     assignments[b.key] = {{"node_id", b.node_id}, {"slot_id", b.slot_id}};
                 }
                 tx->push_event(tx->accepted_unix_ms, "create", assignments.dump());
+                pcbt_created_total++;
                 res->payload = pcbt_transaction_view(*tx);
                 break;
             }
@@ -1414,6 +1415,7 @@ public:
                     tx->cleanup_members();
                     tx->transition(pcbt_status::EXPIRED);
                     tx->terminal_reason = "deadline";
+                    pcbt_expired_total++;
                     tx->push_event(now_ms, "expired", "{}");
                     fail(pcbt_error::EXPIRED, "expired", "transaction deadline passed");
                     break;
@@ -1510,6 +1512,20 @@ public:
                 tx->push_event(now_ms, "committed",
                         json({{"winner_node_id", req.winner_node_id},
                               {"receipt_digest", tx->receipt_digest}}).dump());
+                pcbt_committed_total++;
+                // Receipt/transaction linkage in the StateTree journal
+                // (PCBT-8): joins with the commit event on (state_id, fork).
+                record_statetree_event(
+                        "pcbt-commit",
+                        winner_slot->state_id,
+                        tx->generation,
+                        winner_slot->id,
+                        released,
+                        0,
+                        -1,
+                        {},
+                        json({{"transaction_id", tx->id},
+                              {"receipt_digest", tx->receipt_digest}}).dump());
                 res->payload = std::move(receipt);
                 break;
             }
@@ -1567,6 +1583,7 @@ public:
                 tx->cleanup_members();
                 tx->transition(pcbt_status::ABORTED);
                 tx->terminal_reason = req.reason;
+                pcbt_aborted_total++;
                 tx->push_event(now_ms, "aborted",
                         json({{"reason", req.reason}}).dump());
                 res->payload = pcbt_transaction_view(*tx);
@@ -1821,13 +1838,14 @@ private:
         size_t state_bytes = 0;
         std::vector<int> slots;
         std::vector<statetree_node_ref> nodes;
+        std::string note;   // optional linkage payload (e.g. PCBT receipt digest)
 
         json to_json() const {
             json node_values = json::array();
             for (const auto & node : nodes) {
                 node_values.push_back(node.to_json());
             }
-            return json {
+            json value {
                 { "sequence", sequence },
                 { "timestamp_us", timestamp_us },
                 { "event", event },
@@ -1839,6 +1857,10 @@ private:
                 { "slots", slots },
                 { "nodes", node_values },
             };
+            if (!note.empty()) {
+                value["note"] = note;
+            }
+            return value;
         }
     };
 
@@ -1865,6 +1887,10 @@ private:
     uint64_t statetree_reclaimed_bytes_total = 0;
     uint64_t statetree_renewed_total = 0;
     uint64_t statetree_pressure_rejected_total = 0;
+    uint64_t pcbt_created_total   = 0;
+    uint64_t pcbt_committed_total = 0;
+    uint64_t pcbt_aborted_total   = 0;
+    uint64_t pcbt_expired_total   = 0;
     uint64_t snapshot_bytes = 0;
     uint64_t snapshot_high_water_bytes = 0;
     uint64_t snapshots_captured_total = 0;
@@ -1923,7 +1949,8 @@ private:
             std::vector<int> event_slots,
             size_t state_bytes,
             int64_t parent_fork_id = -1,
-            std::vector<statetree_node_ref> event_nodes = {}) {
+            std::vector<statetree_node_ref> event_nodes = {},
+            std::string note = {}) {
         if (state_id < 0) {
             return;
         }
@@ -1941,6 +1968,7 @@ private:
             state_bytes,
             std::move(event_slots),
             std::move(event_nodes),
+            std::move(note),
         });
     }
 
@@ -3072,6 +3100,7 @@ private:
                 tx.cleanup_members();
                 tx.transition(pcbt_status::EXPIRED);
                 tx.terminal_reason = "deadline";
+                pcbt_expired_total++;
                 tx.push_event(wall_ms, "expired", "{}");
             }
         }
@@ -5124,6 +5153,17 @@ private:
                     res->statetree_state_high_water_bytes = state_high_water_bytes;
                     res->statetree_retained_high_water_bytes = retained_high_water_bytes;
                     res->statetree_expired_total = statetree_expired_total;
+                    res->pcbt_created_total   = pcbt_created_total;
+                    res->pcbt_committed_total = pcbt_committed_total;
+                    res->pcbt_aborted_total   = pcbt_aborted_total;
+                    res->pcbt_expired_total   = pcbt_expired_total;
+                    {
+                        uint64_t active = 0;
+                        for (const auto & [tx_id, tx] : pcbt_txs.by_id) {
+                            active += pcbt_status_terminal(tx.status) ? 0 : 1;
+                        }
+                        res->pcbt_active = active;
+                    }
                     res->statetree_evicted_total = statetree_evicted_total;
                     res->statetree_reclaimed_bytes_total = statetree_reclaimed_bytes_total;
                     res->statetree_renewed_total = statetree_renewed_total;
@@ -8713,6 +8753,26 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "pcbt_created_total"},
+                    {"help",  "Proof-carrying branch transactions created."},
+                    {"value",  res_task->pcbt_created_total}
+            }, {
+                    {"name",  "pcbt_committed_total"},
+                    {"help",  "PCBT winners committed."},
+                    {"value",  res_task->pcbt_committed_total}
+            }, {
+                    {"name",  "pcbt_aborted_total"},
+                    {"help",  "PCBT transactions aborted."},
+                    {"value",  res_task->pcbt_aborted_total}
+            }, {
+                    {"name",  "pcbt_expired_total"},
+                    {"help",  "PCBT transactions expired at deadline."},
+                    {"value",  res_task->pcbt_expired_total}
+            }, {
+                    {"name",  "pcbt_active"},
+                    {"help",  "PCBT transactions currently non-terminal."},
+                    {"value",  res_task->pcbt_active}
             }, {
                     {"name",  "statetree_expired_total"},
                     {"help",  "Number of StateTree families reclaimed after lease expiry."},

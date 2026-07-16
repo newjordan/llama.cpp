@@ -480,6 +480,17 @@ timeout, and late-result tests leave no slot, state, or output leak.
 
 ### PCBT-8 - Add canonical receipts and audit telemetry
 
+State: complete (2026-07-16): versioned canonical receipts with
+pcbt.receipt.v1 digests ship at commit (byte-identical exact retries proven
+in the smoke); the receipt digest and transaction id link into the
+StateTree journal as a `pcbt-commit` event (additive `note` field on
+journal entries, serialized only when present); /metrics exposes
+pcbt_created/committed/aborted/expired_total counters plus a pcbt_active
+gauge, all asserted >0 by the lifecycle smoke; event-ring truncation is
+explicit via first_seq and registry capacity is bounded. Receipt eviction
+observability and independent re-canonicalization tooling are noted for
+PCBT-11's acceptance matrix.
+
 - [ ] Define a versioned canonical receipt schema and digest domain.
 - [ ] Include transaction/request identity, source state/node/generation,
   normalized request digest, every branch/candidate digest and status, complete

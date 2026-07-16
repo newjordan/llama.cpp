@@ -615,6 +615,11 @@ struct server_task_result_metrics : server_task_result {
     uint64_t statetree_state_high_water_bytes  = 0;
     uint64_t statetree_retained_high_water_bytes = 0;
     uint64_t statetree_expired_total           = 0;
+    uint64_t pcbt_created_total                = 0;
+    uint64_t pcbt_committed_total              = 0;
+    uint64_t pcbt_aborted_total                = 0;
+    uint64_t pcbt_expired_total                = 0;
+    uint64_t pcbt_active                       = 0;
     uint64_t statetree_evicted_total           = 0;
     uint64_t statetree_reclaimed_bytes_total   = 0;
     uint64_t statetree_renewed_total           = 0;
