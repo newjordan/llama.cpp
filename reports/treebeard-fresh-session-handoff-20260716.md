@@ -1,3 +1,6 @@
+> SUPERSEDED by `reports/treebeard-fresh-session-handoff-20260716-rc8.md`
+> (this handoff stops at RC6; production is now RC8). Kept for provenance.
+
 # Treebeard fresh-session handoff (2026-07-16, post-RC6)
 
 ## Start here
