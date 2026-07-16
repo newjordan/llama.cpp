@@ -77,3 +77,60 @@ mirror it into `expected` for template conformance.
 | review-decision-gates | Yes | Confirm 50/55/5 thresholds and +7.56% actual against `decision.md` fragmented-shape gates. |
 | review-golden-shape | Yes | Verify +18.88% (12 agents) and +20.06% (stio-only) and the "ragged inert on dense" claim against `decision.md`. |
 | review-edge-closed | Yes | Confirm CLOSED-PASS / 6 streams / byte-identical / zero failures against `decision.md` edge-probe closure. |
+
+## Machine pre-verification (2026-07-16, Claude Fable 5)
+
+Every human-note audit above was executed mechanically against the named
+source artifacts: excerpt values compared digit-for-digit, hashes checked
+character-by-character against the full digests, arithmetic recomputed,
+git hunks/messages and cited line numbers re-read in place. Result:
+**30/30 PASS** — no value, hash, line number, or claim in any embedded
+excerpt deviates from its source.
+
+| task id | verdict | source anchor |
+| --- | --- | --- |
+| trace-fanout7-assert | PASS | `results/treebeard-nxy-optimizer/20260715-215828-branch-cost/run/ragged-n7.server.log` lines 246 (assert) + 304–309 (frames #2–#7) |
+| trace-kvprobe-overflow | PASS | same log, lines 245–246 (probe is last line before assert); 33024×8=264192 > 262144 |
+| trace-ragged-flag | PASS | same log, lines 15 (healthy get_n_kv) + 245 (crash get_n_kv_tree_ragged); all field values verbatim |
+| trace-branch-cost-kill | PASS | `20260715-221845-branch-cost/branch-cost-summary.json`: ragged aggregates 68.5455/86.7324/110.9104/124.2889/123.0093/153.9307; only dip is 5→7; dense arm monotonic |
+| trace-edge-timeout | PASS | `treebeard-ragged-promo-b70/decision.md:68-69` verbatim (em-dash → `--` only) |
+| trace-restore-guard | PASS* | jspace g2/g2b guard tails: RESTORE_OK / RESTORE_FAILED / `(.families \| length) == 0` all match; see caveats |
+| extract-branch-cost-curve | PASS | same summary JSON: fork_client_ms_p50 16.4642/30.7216/54.9241 at N=1/5/11; gate_G-B2_kill=true |
+| extract-confirm-gates | PASS | `20260716-084741-confirm-comp-aba/confirm-summary.json`: 6 gates all true, pass=true, hoist_adopt=false |
+| extract-pcbt-gate | PASS | `treebeard-pcbt/20260716-102212-pcbt-gate/pcbt-b70-gate.json`: winners 10/26/42, orch −0.457, tps round to 38.15/37.64/36.44 |
+| extract-pcbt-metrics | PASS | `pcbt-metrics.txt`: created 3, committed 3, aborted 0, expired 0, active 0 — verbatim |
+| extract-freeze-hashes | PASS | `build-freeze-20260715.md`: all four 64-char digests match char-for-char; sha8 prefixes correct |
+| extract-deploy-rc7 | PASS | `treebeard-rc5-deploy/20260716-093113-rc7-production/deployment-summary.md`: 8093 / 10% / enabled false / 503 |
+| config-ship-env-lines | PASS | rc7 unit: the three Environment= lines present, values 1/1/0, in the listed order |
+| config-control-arm-env | PASS | `build-freeze-20260715.md:28` control arm = 0/0 |
+| config-c3-arm-env | PASS | freeze contract + `treebeard-ragged-confirm-guarded.sh` `run_arm c3 1 1 1` |
+| config-rollback-command | PASS | `decision.md:82-83` — command matches exactly (doc line-wraps it) |
+| config-server-flags-json | PASS | rc7 unit ExecStart: -c 262144 -np 12 -b 8192 -ub 1024 --port 8093 |
+| config-package-modes | PASS* | `treebeard-rc5-package.sh:30-34,58`: env names + all-three-hashes requirement exact; see caveats |
+| repair-broadcast-nstream | PASS | `git show d794fd15d`: buggy/fixed n_stream lines verbatim, hunk in build_attn_mha |
+| repair-none-round | PASS | `treebeard-branch-cost-evaluate.py:88` float-guard verbatim; N=0 fork_client_ms_p50=null in summary JSON |
+| repair-parity-gate | PASS | `git show a6ec035bc`: exit-condition change + parity_ragged_vs_dense_diagnostic verbatim |
+| repair-fork-identity | PASS | `turbo-statetree-logical-gate.py:184` verbatim incl. RuntimeError text |
+| repair-refork-advance | PASS | `turbo-statetree-logical-gate.py:388-392` verbatim |
+| repair-min-reduction-gate | PASS | `git show 2fed29794`: env var / default 10 / 0-disables / clamp(0,100); buggy line matches removed line |
+| review-activation-ratio | PASS | `git show 2fed29794` hunk verbatim (lambda, atol default 10, clamp, two-condition expression) |
+| review-broadcast-fix | PASS | `git log -1 d794fd15d`: excerpt is verbatim substring; 33024×8=264192 > 262144 |
+| review-unit-test-thresholds | PASS | 2fed29794 adds test_small_reduction_stays_dense: asserts 6400 / 6912 / !reduces_columns, comments identical |
+| review-decision-gates | PASS | `decision.md:61-62`: C1 ≥ +50, C2 ≥ +55, state-io ≥ +5 PASS (+7.56%) (≥ → `>=` only) |
+| review-golden-shape | PASS | `decision.md:39-43`: +3.71/+16.68/+18.88; stio-only +3.70/+16.88/+20.06; "inert on dense" verbatim |
+| review-edge-closed | PASS | `decision.md:71-75`: CLOSED-PASS / 250k x 6 streams / byte-identical / hash-identical churn / zero failures |
+
+Caveats (condensation only; no expected answer affected):
+
+1. `trace-restore-guard`: the excerpt condenses the jspace guard tail — it
+   shows `"$OUT/restore-states.json"` where the sources use
+   `"$OUT/maintenance/restore-states.json"` (g2) / `"$MAINT/…"` (g2b), and
+   places `rc=1` before the RESTORE_FAILED printf where the sources place
+   it after. The three gated elements are exact.
+2. `config-package-modes`: the excerpt paraphrases
+   `printf 'PIN_BY_HASH_REQUIRES_ALL_THREE_HASHES\n' >&2` as `echo …` and
+   drops the `${VAR:-}` default expansions. Env-var names and the
+   all-three-hashes requirement are exact.
+
+Human sign-off: _________________ (accept / override per task; the two
+caveats above are the only known deviations to weigh).
