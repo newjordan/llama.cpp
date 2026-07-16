@@ -48,6 +48,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SNAPSHOT_HEAD_MATERIALIZE,
     SERVER_TASK_TYPE_DURABLE_IO_COMPLETE,
     SERVER_TASK_TYPE_STATETREE,
+    SERVER_TASK_TYPE_PCBT,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -213,6 +214,19 @@ struct server_task {
         uint64_t target_bytes = 0;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_PCBT (proof-carrying branch transactions).
+    // HTTP threads parse-validate for early 400s and pass the raw body;
+    // the state thread re-parses via server-pcbt-parse.h before mutating
+    // (docs/treebeard-pcbt-contract-v1.md, docs/treebeard-pcbt-wiring-plan.md).
+    struct pcbt_action {
+        enum op_t { NONE = 0, CREATE, OBSERVE, EVENTS, COMMIT, ABORT };
+        int      op             = NONE;
+        uint64_t transaction_id = 0;
+        uint64_t after_seq      = 0;
+        std::string body_json;
+    };
+    pcbt_action pcbt;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -741,6 +755,28 @@ struct server_task_result_slot_renew : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+// SERVER_TASK_TYPE_PCBT result: an error class + canonical JSON payload
+// produced on the state thread (contract error mapping in
+// server-pcbt-parse.h; view/receipt shapes in docs/treebeard-pcbt-contract-v1.md).
+struct server_task_result_pcbt : server_task_result {
+    int         http_status = 200;
+    std::string error_class;    // empty on success
+    std::string message;
+    json        payload = json::object();
+
+    virtual bool is_error() override {
+        return !error_class.empty();
+    }
+    virtual json to_json() override {
+        if (is_error()) {
+            return json {
+                {"error", {{"class", error_class}, {"message", message}, {"http_status", http_status}}},
+            };
+        }
+        return payload;
+    }
 };
 
 struct server_task_result_statetree : server_task_result {
