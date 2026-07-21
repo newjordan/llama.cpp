@@ -1162,12 +1162,26 @@ static void mul_mat_vec_q5_1_q8_1_sycl_switch_ncols(
     }
 }
 
+static int ggml_sycl_q8_mmvq_subgroups() {
+    // Default 16 matches multi-col Q8 reorder. Override: GGML_SYCL_Q8_MMVQ_SUBGROUPS=1|2|4|8|16|32.
+    // Prior single-col used WARP_SIZE=32; 16 is denser for product decode rows (n_embd-class).
+    static const int n = []() {
+        const char * env = getenv("GGML_SYCL_Q8_MMVQ_SUBGROUPS");
+        const int value = env == nullptr ? 16 : atoi(env);
+        switch (value) {
+            case 1: case 2: case 4: case 8: case 16: case 32: return value;
+            default: return 16;
+        }
+    }();
+    return n;
+}
+
 static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                     const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
     // Round up to a whole number of subgroup-sized workgroups; out-of-range rows are skipped inside the kernel.
-    constexpr size_t num_subgroups = WARP_SIZE;
-    const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups) * (int) num_subgroups;
+    const size_t num_subgroups = (size_t) ggml_sycl_q8_mmvq_subgroups();
+    const int    block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups) * (int) num_subgroups;
 
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, (block_num_y * WARP_SIZE));
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
@@ -2598,7 +2612,16 @@ static int ggml_sycl_mmid_wg_subgroups(const int nrows) {
     if (override_subgroups != 0) {
         return override_subgroups;
     }
-    return nrows >= 1024 ? 4 : 1;
+    // Product MoE down is nrows=2048 (embd). 4 was conservative; 8 fills the WG
+    // better for the serial top-k expert loop without ballooning register pressure
+    // (measured A/B 2026-07-20: env 8/16/32 — keep 8 as new default for large).
+    if (nrows >= 2048) {
+        return 8;
+    }
+    if (nrows >= 1024) {
+        return 4;
+    }
+    return 1;
 }
 
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
@@ -3004,44 +3027,92 @@ static void mul_mat_vec_q_moe_weighted_reorder(
     static_assert(blocks_per_subgroup > 0);
     static_assert(block_elements_per_subgroup > 0);
 
+    // Prefetch routing for this token (top-k is typically 8 on product Qwen3.6).
+    // Keeps ids/weights out of the inner k-loop; expert_idx still serial for
+    // volatile ordered sum contract (matches MUL + ADD chain).
+    constexpr int k_max_prefetch = 16;
+    int   expert_ids_local[k_max_prefetch];
+    float expert_w_local[k_max_prefetch];
+    const int n_use = n_experts_used < k_max_prefetch ? n_experts_used : k_max_prefetch;
+    for (int e = 0; e < n_use; ++e) {
+        expert_ids_local[e] = ids_dev[token * ids_row_stride + e];
+        if (sg.leader()) {
+            expert_w_local[e] = *(const float *) ((const char *) weights +
+                (size_t) token * weights_token_stride +
+                (size_t) e * weights_slot_stride);
+        }
+    }
+
     float reduced = 0.0f;
-    for (int expert_idx = 0; expert_idx < n_experts_used; ++expert_idx) {
-        const int i02 = ids_dev[token * ids_row_stride + expert_idx];
-        const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
-        const char * vy = (const char *) vy_base + (size_t) token * src1_token_stride +
-                          (size_t) expert_idx * src1_row_stride;
-
-        float partial_sum = 0.0f;
-        for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
-             i < blocks_per_row; i += blocks_per_subgroup) {
-            const int ibx = row * blocks_per_row + i;
-
-            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
-            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
-
-            const int           iby            = i * block_type::block_to_q8_1_ratio();
-            const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
-            const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *)
-                ((const char *) vy + ncols + iby * sizeof(sycl::half2));
-
+    // Product top-k is 8: fully unroll that case so the compiler can schedule
+    // eight expert MMVQs inside the serial ordered-sum loop.
+    if (n_experts_used == 8) {
 #pragma unroll
-            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-                const int iqs = elem + block_traits::vdr_mmvq *
-                    (sg.get_local_linear_id() % block_elements_per_subgroup);
-                partial_sum += reorder_vec_dot_q_sycl()(
-                    vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        for (int expert_idx = 0; expert_idx < 8; ++expert_idx) {
+            const int i02 = expert_ids_local[expert_idx];
+            const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+            const char * vy = (const char *) vy_base + (size_t) token * src1_token_stride +
+                              (size_t) expert_idx * src1_row_stride;
+            float partial_sum = 0.0f;
+            for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+                 i < blocks_per_row; i += blocks_per_subgroup) {
+                const int ibx = row * blocks_per_row + i;
+                const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+                const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+                const int           iby            = i * block_type::block_to_q8_1_ratio();
+                const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+                const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *)
+                    ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+#pragma unroll
+                for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                    const int iqs = elem + block_traits::vdr_mmvq *
+                        (sg.get_local_linear_id() % block_elements_per_subgroup);
+                    partial_sum += reorder_vec_dot_q_sycl()(
+                        vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                }
+            }
+            const float expert_value = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+            if (sg.leader()) {
+                volatile float weighted = expert_value * expert_w_local[expert_idx];
+                reduced += weighted;
             }
         }
-
-        const float expert_value = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
-        if (sg.leader()) {
-            const float weight = *(const float *) ((const char *) weights +
-                (size_t) token * weights_token_stride +
-                (size_t) expert_idx * weights_slot_stride);
-
-            // Match the materialized MUL followed by the ordered ADD chain.
-            volatile float weighted = expert_value * weight;
-            reduced += weighted;
+    } else {
+        for (int expert_idx = 0; expert_idx < n_experts_used; ++expert_idx) {
+            const int i02 = (expert_idx < n_use)
+                ? expert_ids_local[expert_idx]
+                : ids_dev[token * ids_row_stride + expert_idx];
+            const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+            const char * vy = (const char *) vy_base + (size_t) token * src1_token_stride +
+                              (size_t) expert_idx * src1_row_stride;
+            float partial_sum = 0.0f;
+            for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+                 i < blocks_per_row; i += blocks_per_subgroup) {
+                const int ibx = row * blocks_per_row + i;
+                const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+                const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+                const int           iby            = i * block_type::block_to_q8_1_ratio();
+                const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+                const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *)
+                    ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+#pragma unroll
+                for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                    const int iqs = elem + block_traits::vdr_mmvq *
+                        (sg.get_local_linear_id() % block_elements_per_subgroup);
+                    partial_sum += reorder_vec_dot_q_sycl()(
+                        vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                }
+            }
+            const float expert_value = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+            if (sg.leader()) {
+                const float weight = (expert_idx < n_use)
+                    ? expert_w_local[expert_idx]
+                    : *(const float *) ((const char *) weights +
+                        (size_t) token * weights_token_stride +
+                        (size_t) expert_idx * weights_slot_stride);
+                volatile float weighted = expert_value * weight;
+                reduced += weighted;
+            }
         }
     }
 
