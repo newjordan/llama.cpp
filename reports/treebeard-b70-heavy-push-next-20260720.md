@@ -1,6 +1,6 @@
 # B70 heavy push - next wave prereg (2026-07-20)
 
-Status: OPEN - preregistered after kernel-max + RMS glue fold.
+Status: #1 dense MUL_MAT PARKED (2026-07-20) — see results/treebeard-b70-heavy-push-mulmat-20260720/RESULTS.md. OPEN for #2+.
 
 ## Shipped this session (do not re-litigate)
 
@@ -29,10 +29,12 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
 
 ## Next heavy-push candidates (priority)
 
-1. **Dense MUL_MAT family (~40% of serialized Treebeard SYCL op profile)**  
-   Named matmul breakdown under ship config (TREEBEARD_SYCL_PROF + oneDNN verbose shapes).  
-   Hypothesis: remaining non-router FP32/attention/SSM projections still leave headroom after 128^3 cutoff.  
-   Gate: same-binary env or rebuild A/B, r>=3 llama-bench, then multi-agent ABA if win >2% tg or >3% pp.
+1. **Dense MUL_MAT family — PARKED (no win)**  
+   Profile confirms MUL_MAT ~43% serialized; heat is named `attn_qkv` / shared-expert / SSM MMVQ, not FP32 cutoff leftovers.  
+   Measured: MKL cutoff 64^3 flat; cutoff 0 → tg −14%; ENABLE_MMQ hung GPU.  
+   Env knobs retained: `GGML_SYCL_MKL_FLOP_CUTOFF` (default 128^3), `TREEBEARD_SYCL_GEMM_ROUTE=1`.  
+   Evidence: `results/treebeard-b70-heavy-push-mulmat-20260720/`.  
+   Residual dense work → MMVQ kernel on top named families (not FLOP-cutoff).
 
 2. **Remaining MUL_MAT_ID (~12-17% of same profile) not covered by dual/down fuse**  
    Q8_0 down layers / shape rejects from dual-swiglu debug.  

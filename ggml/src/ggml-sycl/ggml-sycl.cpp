@@ -2539,11 +2539,40 @@ inline void ggml_sycl_op_mul_mat_sycl(
             //
             // For non-router GEMMs on B70 MoE, prefer oneDNN for mid/large shapes:
             // measured Qwen3.6-35B-A3B Q5_K_XL pp512 +~1.3% vs native MKL when
-            // GGML_SYCL_DISABLE_DNN is unset (ship speed path). Keep a smaller
-            // FLOP cutoff so only tiny mats stay on the direct MKL path.
+            // GGML_SYCL_DISABLE_DNN is unset (ship speed path). Default FLOP cutoff
+            // is 128^3 so only tiny mats stay on the direct MKL path. Heavy-push
+            // dense MUL_MAT A/B: override with GGML_SYCL_MKL_FLOP_CUTOFF=<int64 flops>
+            // (e.g. 262144=64^3, 0=all non-router oneDNN). Router always MKL.
+            static const int64_t mkl_flop_cutoff = []() {
+                const char * env = getenv("GGML_SYCL_MKL_FLOP_CUTOFF");
+                if (env != nullptr && env[0] != '\0') {
+                    return (int64_t) std::atoll(env);
+                }
+                return (int64_t) 128 * 128 * 128;
+            }();
             const bool is_moe_router = src0->type == GGML_TYPE_F32 &&
                     std::strstr(src0->name, ".ffn_gate_inp.weight") != nullptr;
-            const bool use_mkl_direct = is_moe_router || gemm_flops < 128 * 128 * 128;
+            const bool use_mkl_direct = is_moe_router || gemm_flops < mkl_flop_cutoff;
+            // Diagnostic: TREEBEARD_SYCL_GEMM_ROUTE=1 logs FP32 dense GEMM backend choice
+            // every 256 calls (stderr). Used by heavy-push-1 dense MUL_MAT excavation.
+            static const bool gemm_route_log = []() {
+                const char * env = getenv("TREEBEARD_SYCL_GEMM_ROUTE");
+                return env != nullptr && std::atoi(env) != 0;
+            }();
+            if (gemm_route_log) {
+                static std::atomic<long> route_n { 0 };
+                const long n = route_n.fetch_add(1, std::memory_order_relaxed);
+                if ((n % 256) == 0) {
+                    const char * backend = (is_moe_router) ? "mkl-router"
+                        : (g_ggml_sycl_disable_dnn || use_mkl_direct) ? "mkl" : "onednn";
+                    fprintf(stderr,
+                            "[treebeard-gemm-route] n=%ld backend=%s flops=%lld m=%lld n_cols=%lld k=%lld "
+                            "cutoff=%lld name=%s\n",
+                            n, backend, (long long) gemm_flops, (long long) row_diff,
+                            (long long) src1_ncols, (long long) ne10, (long long) mkl_flop_cutoff,
+                            src0->name[0] ? src0->name : "?");
+                }
+            }
 #if GGML_SYCL_DNNL
             if (!g_ggml_sycl_disable_dnn && !use_mkl_direct) {
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
