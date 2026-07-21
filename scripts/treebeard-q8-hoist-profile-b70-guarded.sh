@@ -96,7 +96,7 @@ run_leg() {
     local label=$1
     local hoist=$2
     local leg_out="$OUT/$label"
-    local trigger="$leg_out/siq-profile.trigger"
+    local trigger="$leg_out/treebeard-sycl-prof.trigger"
     local console="$leg_out/console.log"
 
     mkdir -p "$leg_out/run"
@@ -106,8 +106,8 @@ run_leg() {
         GGML_SYCL_ENABLE_STATE_IO_FUSION=1 \
         GGML_SYCL_STATE_IO_MODE=all \
         GGML_SYCL_DISABLE_GRAPH=1 \
-        SIQ_PROF=1 \
-        SIQ_PROF_TRIGGER_FILE="$trigger" \
+        TREEBEARD_SYCL_PROF=1 \
+        TREEBEARD_SYCL_PROF_TRIGGER_FILE="$trigger" \
         "$PYTHON" "$HARNESS" run \
         --bin "$BUILD/bin/llama-server" \
         --model "$MODEL" \
@@ -160,7 +160,7 @@ run_leg() {
 
     wait "$BENCH_PID"
     BENCH_PID=
-    rg '^\[treebeard-q8-hoist\]|^\[siq-prof' \
+    rg '^\[treebeard-q8-hoist\]|^\[treebeard-sycl-prof' \
         "$leg_out/run/$label.server.log" > "$leg_out/profile-summary.txt"
     printf 'LEG_COMPLETE leg=%s\n' "$label"
 }

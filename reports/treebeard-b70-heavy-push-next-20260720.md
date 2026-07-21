@@ -29,12 +29,12 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
 
 ## Next heavy-push candidates (priority)
 
-1. **Dense MUL_MAT family (~40% SIQ)**  
-   Named matmul breakdown under ship config (SIQ_PROF + oneDNN verbose shapes).  
+1. **Dense MUL_MAT family (~40% of serialized Treebeard SYCL op profile)**  
+   Named matmul breakdown under ship config (TREEBEARD_SYCL_PROF + oneDNN verbose shapes).  
    Hypothesis: remaining non-router FP32/attention/SSM projections still leave headroom after 128^3 cutoff.  
    Gate: same-binary env or rebuild A/B, r>=3 llama-bench, then multi-agent ABA if win >2% tg or >3% pp.
 
-2. **Remaining MUL_MAT_ID (~12-17% SIQ) not covered by dual/down fuse**  
+2. **Remaining MUL_MAT_ID (~12-17% of same profile) not covered by dual/down fuse**  
    Q8_0 down layers / shape rejects from dual-swiglu debug.  
    Hypothesis: type or n_tokens eligibility leaves unfused expert downs.  
    Gate: activation hit counts + e2e; park if only microbench wins.
@@ -45,7 +45,7 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
 
 4. **Attention / hybrid SSM path**  
    Model is qwen35moe with SSM + full_attention_interval.  
-   Profile GATED_DELTA_NET / SSM_CONV share under SIQ; only fuse if share >5% serialized.
+   Profile GATED_DELTA_NET / SSM_CONV share under TREEBEARD_SYCL_PROF; only fuse if share >5% serialized.
 
 5. **Product-shape multi-agent confirmation of stacked ship**  
    Not a new kernel - promotion gate for the stacked env:  
@@ -61,7 +61,7 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
 
 ## Working protocol
 
-1. b70-inspect -> b70-profile -> b70-kernel-trace / SIQ_PROF
+1. b70-inspect -> b70-profile -> b70-kernel-trace / TREEBEARD_SYCL_PROF
 2. One lever at a time; same-binary when possible
 3. Keep disable env for every default-ON change
 4. Append-only evidence under treebeard-work/results/<new-dir>/

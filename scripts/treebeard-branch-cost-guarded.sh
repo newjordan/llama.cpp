@@ -127,7 +127,8 @@ run_point() {
     local label="$1" ragged="$2" fanout="$3"
     local ragged_flag=--tree-ragged
     [[ "$ragged" == 1 ]] || ragged_flag=--no-tree-ragged
-    env -u SIQ_PROF -u SIQ_PROF_TRIGGER_FILE -u GGML_SYCL_STATE_IO_DEBUG \
+    env -u TREEBEARD_SYCL_PROF -u TREEBEARD_SYCL_PROF_TRIGGER_FILE \
+        -u SIQ_PROF -u SIQ_PROF_TRIGGER_FILE -u GGML_SYCL_STATE_IO_DEBUG \
         -u GGML_SYCL_STATE_IO_MODE -u LLAMA_KV_INDEXED_FATTN \
         GGML_SYCL_ENABLE_STATE_IO_FUSION=1 \
         GGML_SYCL_ENABLE_Q8_NCOLS_WEIGHT_HOIST=0 \
@@ -153,7 +154,8 @@ run_point() {
 solo_probe() {
     local label="$1" ragged="$2"
     local dir="$OUT/run"
-    env -u SIQ_PROF -u SIQ_PROF_TRIGGER_FILE -u GGML_SYCL_STATE_IO_DEBUG \
+    env -u TREEBEARD_SYCL_PROF -u TREEBEARD_SYCL_PROF_TRIGGER_FILE \
+        -u SIQ_PROF -u SIQ_PROF_TRIGGER_FILE -u GGML_SYCL_STATE_IO_DEBUG \
         -u GGML_SYCL_STATE_IO_MODE -u LLAMA_KV_INDEXED_FATTN \
         LLAMA_KV_TREE_RAGGED="$ragged" \
         GGML_SYCL_ENABLE_STATE_IO_FUSION=1 \

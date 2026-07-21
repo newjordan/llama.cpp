@@ -6729,14 +6729,21 @@ static int ggml_sycl_try_fuse(
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
-    // Optional per-op-type profiler (SIQ_PROF=1): serializes each op with a queue wait and accumulates
-    // host-observed GPU time per op type. Serialization inflates absolutes (removes overlap) but the
-    // RELATIVE breakdown + serialized-total-vs-wall ratio reveal where decode time goes. Diagnostic only.
-    // When SIQ_PROF_TRIGGER_FILE names a file, leave execution unmodified until that file exists. This
-    // permits a late profile window after expensive prompt/state setup without restarting the process.
-    static const bool prof = getenv("SIQ_PROF") != nullptr;
+    // Optional Treebeard SYCL per-op profiler (TREEBEARD_SYCL_PROF=1): serializes each op with a
+    // queue wait and accumulates host-observed GPU time per op type. Serialization inflates
+    // absolutes (removes overlap) but the RELATIVE breakdown + serialized-total-vs-wall ratio
+    // reveal where decode time goes. Diagnostic only - not a ship path.
+    // TREEBEARD_SYCL_PROF_TRIGGER_FILE: leave execution unmodified until that file exists so a
+    // late profile window can open after expensive prompt/state setup without restarting.
+    // Legacy aliases (still accepted): SIQ_PROF, SIQ_PROF_TRIGGER_FILE.
+    static const bool prof = []() {
+        return getenv("TREEBEARD_SYCL_PROF") != nullptr || getenv("SIQ_PROF") != nullptr;
+    }();
     static const std::string prof_trigger_file = []() {
-        const char * path = getenv("SIQ_PROF_TRIGGER_FILE");
+        const char * path = getenv("TREEBEARD_SYCL_PROF_TRIGGER_FILE");
+        if (path == nullptr) {
+            path = getenv("SIQ_PROF_TRIGGER_FILE");
+        }
         return path != nullptr ? std::string(path) : std::string();
     }();
     static std::atomic<bool> prof_active { prof_trigger_file.empty() };
@@ -6745,7 +6752,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (trigger != nullptr) {
             fclose(trigger);
             if (!prof_active.exchange(true, std::memory_order_relaxed)) {
-                fprintf(stderr, "[siq-prof] trigger active file=%s\n", prof_trigger_file.c_str());
+                fprintf(stderr, "[treebeard-sycl-prof] trigger active file=%s\n",
+                        prof_trigger_file.c_str());
             }
         }
     }
@@ -7080,7 +7088,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         std::sort(rows.begin(), rows.end(), [](const row & a, const row & b){ return a.us > b.us; });
         double tot = 0; for (auto & r : rows) tot += r.us;
-        fprintf(stderr, "[siq-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",
+        fprintf(stderr,
+                "[treebeard-sycl-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",
                 geval, tot / 1000.0, tot / geval);
         for (auto & r : rows) {
             fprintf(stderr, "  %-14s %9.1f ms  %6.1f%%  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
@@ -7096,7 +7105,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             named_total_us += row.us;
         }
         fprintf(stderr,
-                "[siq-prof-mul-mat] after %d graph evals window-total=%.1f ms families=%zu\n",
+                "[treebeard-sycl-prof-mul-mat] after %d graph evals window-total=%.1f ms families=%zu\n",
                 geval, named_total_us / 1000.0, named_rows.size());
         const size_t named_limit = std::min<size_t>(named_rows.size(), 32);
         for (size_t row_index = 0; row_index < named_limit; ++row_index) {
@@ -7120,7 +7129,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             state_total_us += row.us;
         }
         fprintf(stderr,
-                "[siq-prof-state] after %d graph evals window-total=%.1f ms families=%zu\n",
+                "[treebeard-sycl-prof-state] after %d graph evals window-total=%.1f ms families=%zu\n",
                 geval, state_total_us / 1000.0, state_rows.size());
         const size_t state_limit = std::min<size_t>(state_rows.size(), 32);
         for (size_t row_index = 0; row_index < state_limit; ++row_index) {
