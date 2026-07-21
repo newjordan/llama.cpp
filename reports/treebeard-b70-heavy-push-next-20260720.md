@@ -45,8 +45,9 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
 3. **Remaining MUL_MAT_ID (~3% serialized now; older notes 12–17%)**  
    MoE dual + down-reduce already hit on ship path. Residual ID work is low priority vs named `attn_qkv`.
 
-4. **Named residual dense MMVQ (`attn_qkv`, SSM linear, logits)**  
-   Still the bulk of MUL_MAT time after shexp dual. Kernel micro-opts / further fusions only.
+4. **Named residual dense dual-MMVQ (`attn_qkv`+`attn_gate`) — PARKED (flat)**  
+   Non-adjacent Q8 dual-MMVQ implemented; hits fire; r=3 tg **−0.07%** (flat). Prefill@64 regresses if uncapped. Opt-in `GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ=1`. Evidence: `results/treebeard-b70-heavy-push-attn-qkv-20260720/`.  
+   **ssm_alpha/beta are F32** (need dual-GEMM, not MMVQ). Next residual targets: FUSED_MOE_DOWN micro-opt, F32 dual-GEMM alpha/beta, linear_attn_out.
 
 5. **Submit / graph launch for single-token decode**  
    Clean retest under new ship: GRAPH alone was flat (+0.4% tg) this session — park unless new profile.

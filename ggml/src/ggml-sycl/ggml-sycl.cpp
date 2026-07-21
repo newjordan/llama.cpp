@@ -24,6 +24,7 @@
 #include <string>
 #include <stdint.h>
 #include <stdio.h>
+#include <unordered_set>
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -4824,6 +4825,279 @@ static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
     return ok;
 }
 
+// Dense dual MMVQ: two ordinary MUL_MATs sharing one activation (no GLU).
+// Targets GDN pairs that share `cur`: attn_qkv+attn_gate (z), ssm_alpha+ssm_beta.
+// Disable: GGML_SYCL_DISABLE_DENSE_DUAL_MMVQ=1.
+// Debug:   GGML_SYCL_DENSE_DUAL_MMVQ_DEBUG=1.
+static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
+    ggml_backend_sycl_context & ctx, ggml_tensor * mm_a, ggml_tensor * mm_b) {
+    const ggml_tensor * wa   = mm_a->src[0];
+    const ggml_tensor * wb   = mm_b->src[0];
+    const ggml_tensor * src1 = mm_a->src[1];
+    static const bool trace = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_MMVQ_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    const bool type_ok =
+        wa->type == wb->type &&
+        (wa->type == GGML_TYPE_Q8_0 || wa->type == GGML_TYPE_Q4_K ||
+         wa->type == GGML_TYPE_Q5_K || wa->type == GGML_TYPE_Q6_K);
+    if (mm_a->op != GGML_OP_MUL_MAT || mm_b->op != GGML_OP_MUL_MAT ||
+        mm_a->src[1] != mm_b->src[1] || !type_ok ||
+        src1->type != GGML_TYPE_F32 ||
+        mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] type-reject wa=%s wb=%s "
+                    "same_src1=%d\n",
+                    ggml_type_name(wa->type), ggml_type_name(wb->type),
+                    mm_a->src[1] == mm_b->src[1]);
+        }
+        return false;
+    }
+
+    const int64_t ncols     = src1->ne[0];
+    const int64_t ncols_dst = src1->ne[1];
+    const int64_t nrows_a   = wa->ne[1];
+    const int64_t nrows_b   = wb->ne[1];
+    // Decode-first: ncols_dst=1 is the ship path. Small multi-col kept for
+    // microbatch; large prefill batches (64+) measured regress (pp -38%).
+    if (ncols_dst < 1 || ncols_dst > 4 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        wa->ne[0] != ncols || wb->ne[0] != ncols ||
+        wa->ne[2] != 1 || wa->ne[3] != 1 ||
+        wb->ne[2] != 1 || wb->ne[3] != 1 ||
+        ncols % QK8_1 != 0 ||
+        !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
+        !ggml_is_contiguous(mm_a) || !ggml_is_contiguous(mm_b) ||
+        mm_a->ne[0] != nrows_a || mm_b->ne[0] != nrows_b ||
+        mm_a->ne[1] != ncols_dst || mm_b->ne[1] != ncols_dst) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] shape-reject ncols=%" PRId64
+                    " ncols_dst=%" PRId64 " rows_a=%" PRId64 " rows_b=%" PRId64
+                    " cont_src1=%d cont_a=%d cont_b=%d cont_wa=%d cont_wb=%d\n",
+                    ncols, ncols_dst, nrows_a, nrows_b,
+                    (int) ggml_is_contiguous(src1),
+                    (int) ggml_is_contiguous(mm_a),
+                    (int) ggml_is_contiguous(mm_b),
+                    (int) ggml_is_contiguous(wa),
+                    (int) ggml_is_contiguous(wb));
+        }
+        return false;
+    }
+
+    auto ensure_reorder_mmvq = [&](const ggml_tensor * w) {
+        if (g_ggml_sycl_disable_optimize || !ctx.opt_feature.reorder) {
+            return false;
+        }
+        if (!ggml_sycl_supports_reorder_mmvq(w->type)) {
+            return false;
+        }
+        ggml_tensor_extra_gpu * extra =
+            static_cast<ggml_tensor_extra_gpu *>(w->extra);
+        if (!extra) {
+            return false;
+        }
+        if (extra->optimized_feature.reorder) {
+            return true;
+        }
+        if (reorder_qw(w, ctx.stream())) {
+            extra->optimized_feature.reorder = true;
+            return true;
+        }
+        return false;
+    };
+    if (!ensure_reorder_mmvq(wa) || !ensure_reorder_mmvq(wb)) {
+        if (trace) {
+            fprintf(stderr, "[treebeard-dense-dual-mmvq] reorder-reject\n");
+        }
+        return false;
+    }
+
+    const queue_ptr stream = ctx.stream();
+    const int src1_padded_cols = GGML_PAD((int) ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(),
+        (size_t) ncols_dst * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_q8 = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_q8, (int) ncols, (int) ncols_dst,
+        src1_padded_cols, stream);
+
+    const size_t bytes_per_qrow =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t dst_a_col_stride = mm_a->nb[1] / sizeof(float);
+    const size_t dst_b_col_stride = mm_b->nb[1] / sizeof(float);
+
+    const bool ok = ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
+        wa->type, wa->data, wb->data, src1_q8,
+        (float *) mm_a->data, (float *) mm_b->data,
+        (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
+        bytes_per_qrow, dst_a_col_stride, dst_b_col_stride, stream);
+    if (ok && trace) {
+        static std::atomic<int> hits{0};
+        if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] hit type=%s rows_a=%" PRId64
+                    " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
+                    " wa=%s wb=%s\n",
+                    ggml_type_name(wa->type), nrows_a, nrows_b, ncols,
+                    ncols_dst, wa->name, wb->name);
+        }
+    }
+    return ok;
+}
+
+// Dense dual F32 GEMV for equal-K projections sharing one activation
+// (ssm_alpha + ssm_beta on the GDN path). Default OFF; opt-in with
+// GGML_SYCL_ENABLE_DENSE_DUAL_F32=1. Debug: GGML_SYCL_DENSE_DUAL_F32_DEBUG=1.
+static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
+    ggml_backend_sycl_context & ctx, ggml_tensor * mm_a, ggml_tensor * mm_b) {
+    const ggml_tensor * wa   = mm_a->src[0];
+    const ggml_tensor * wb   = mm_b->src[0];
+    const ggml_tensor * src1 = mm_a->src[1];
+    static const bool trace = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_F32_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    if (mm_a->op != GGML_OP_MUL_MAT || mm_b->op != GGML_OP_MUL_MAT ||
+        mm_a->src[1] != mm_b->src[1] ||
+        wa->type != GGML_TYPE_F32 || wb->type != GGML_TYPE_F32 ||
+        src1->type != GGML_TYPE_F32 ||
+        mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-f32] type-reject wa=%s wb=%s "
+                    "same_src1=%d\n",
+                    ggml_type_name(wa->type), ggml_type_name(wb->type),
+                    mm_a->src[1] == mm_b->src[1]);
+        }
+        return false;
+    }
+
+    const int64_t ncols     = src1->ne[0];
+    const int64_t ncols_dst = src1->ne[1];
+    const int64_t nrows_a   = wa->ne[1];
+    const int64_t nrows_b   = wb->ne[1];
+    // Decode-first: ship path is ncols_dst=1. Cap at 8 (prefill for these
+    // small F32 pairs is already oneDNN; dual is for MKL GEMV submit savings).
+    if (ncols_dst < 1 || ncols_dst > 8 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        wa->ne[0] != ncols || wb->ne[0] != ncols ||
+        wa->ne[2] != 1 || wa->ne[3] != 1 ||
+        wb->ne[2] != 1 || wb->ne[3] != 1 ||
+        !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
+        !ggml_is_contiguous(mm_a) || !ggml_is_contiguous(mm_b) ||
+        mm_a->ne[0] != nrows_a || mm_b->ne[0] != nrows_b ||
+        mm_a->ne[1] != ncols_dst || mm_b->ne[1] != ncols_dst) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-f32] shape-reject ncols=%" PRId64
+                    " ncols_dst=%" PRId64 " rows_a=%" PRId64 " rows_b=%" PRId64
+                    "\n",
+                    ncols, ncols_dst, nrows_a, nrows_b);
+        }
+        return false;
+    }
+
+    // Reject MoE router weights — must stay on oneMKL for bit-stable expert choice.
+    if (std::strstr(wa->name, ".ffn_gate_inp.weight") != nullptr ||
+        std::strstr(wb->name, ".ffn_gate_inp.weight") != nullptr) {
+        if (trace) {
+            fprintf(stderr, "[treebeard-dense-dual-f32] router-reject\n");
+        }
+        return false;
+    }
+
+    const size_t x_col_stride      = src1->nb[1] / sizeof(float);
+    const size_t dst_a_col_stride  = mm_a->nb[1] / sizeof(float);
+    const size_t dst_b_col_stride  = mm_b->nb[1] / sizeof(float);
+    const size_t wa_row_stride     = wa->nb[1] / sizeof(float);
+    const size_t wb_row_stride     = wb->nb[1] / sizeof(float);
+
+    // Backend choice (default MKL-batch; custom kernel measured −2.7% tg):
+    //   GGML_SYCL_DENSE_DUAL_F32_KERNEL=1  → custom dual GEMV
+    //   otherwise (default)                 → oneMKL gemm_batch of 2 (equal nrows)
+    static const bool use_custom_kernel = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_F32_KERNEL");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    bool ok = false;
+    if (use_custom_kernel) {
+        ok = ggml_sycl_mul_mat_vec_f32_dense_dual(
+            (const float *) wa->data, (const float *) wb->data,
+            (const float *) src1->data,
+            (float *) mm_a->data, (float *) mm_b->data,
+            (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
+            x_col_stride, dst_a_col_stride, dst_b_col_stride,
+            wa_row_stride, wb_row_stride, ctx.stream());
+    } else if (nrows_a == nrows_b && wa_row_stride == (size_t) ncols &&
+               wb_row_stride == (size_t) ncols &&
+               x_col_stride == (size_t) ncols &&
+               dst_a_col_stride == (size_t) nrows_a &&
+               dst_b_col_stride == (size_t) nrows_b) {
+        // Contiguous equal-shape pair: one gemm_batch of 2 (same B, two As).
+        // Matches column-major gemm(trans A): C = A^T * B with lda=K.
+        const float alpha = 1.0f;
+        const float beta  = 0.0f;
+        const void * a_ptrs[2] = { wa->data, wb->data };
+        const void * b_ptrs[2] = { src1->data, src1->data };
+        void *       c_ptrs[2] = { mm_a->data, mm_b->data };
+        // Host-side matrix_info for the pointer-array gemm_batch path.
+        matrix_info_t<float> matrix_info;
+        try {
+            dpct::gemm_batch(
+                *ctx.stream(),
+                oneapi::mkl::transpose::trans,
+                oneapi::mkl::transpose::nontrans,
+                (int) nrows_a, (int) ncols_dst, (int) ncols,
+                &alpha,
+                a_ptrs, dpct::library_data_t::real_float, (int) ncols,
+                b_ptrs, dpct::library_data_t::real_float, (int) ncols,
+                &beta,
+                c_ptrs, dpct::library_data_t::real_float, (int) nrows_a,
+                /*batch_size=*/2,
+                dpct::library_data_t::real_float,
+                &matrix_info);
+            ok = true;
+        } catch (const sycl::exception & e) {
+            if (trace) {
+                fprintf(stderr, "[treebeard-dense-dual-f32] mkl-batch-fail: %s\n",
+                        e.what());
+            }
+            ok = false;
+        }
+    } else {
+        // Unequal / non-contiguous: fall back to custom dual kernel.
+        ok = ggml_sycl_mul_mat_vec_f32_dense_dual(
+            (const float *) wa->data, (const float *) wb->data,
+            (const float *) src1->data,
+            (float *) mm_a->data, (float *) mm_b->data,
+            (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
+            x_col_stride, dst_a_col_stride, dst_b_col_stride,
+            wa_row_stride, wb_row_stride, ctx.stream());
+    }
+    if (ok && trace) {
+        static std::atomic<int> hits{0};
+        if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-f32] hit rows_a=%" PRId64
+                    " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
+                    " mode=%s wa=%s wb=%s\n",
+                    nrows_a, nrows_b, ncols, ncols_dst,
+                    use_custom_kernel ? "kernel" : "mkl-batch",
+                    wa->name, wb->name);
+        }
+    }
+    return ok;
+}
+
 // MoE down-projection specialization: compute routed expert dots, multiply by
 // routing weights in slot order, and write only the final token output.
 static bool ggml_sycl_mul_mat_id_mmvq_weighted(
@@ -4836,7 +5110,9 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
 
-    if (!ggml_sycl_mul_mat_id_fused_eligible(mmid) || ne12 < 2 || ne12 > 64) {
+    // ne12 is the token batch on src1. Allow single-token (decode) so the
+    // integrated weighted path can replace separate mul_mat_id + weighted_sum.
+    if (!ggml_sycl_mul_mat_id_fused_eligible(mmid) || ne12 < 1 || ne12 > 64) {
         return false;
     }
     const int64_t n_ids_per_group = ids->ne[0];
@@ -6564,6 +6840,13 @@ static int ggml_sycl_try_fuse_moe_down_reduce(
                 !ggml_sycl_tensor_ranges_overlap(weights, dst) &&
                 dst->ne[0] == nrows &&
                 dst->ne[1] == n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1) {
+                // Prefer integrated weighted MMVQ (one kernel, no expert
+                // intermediate + weighted_sum). Falls back to two-step path.
+                if (ggml_sycl_mul_mat_id_mmvq_weighted(ctx, experts, weights, dst)) {
+                    ggml_sycl_trace_moe_down_reduce(
+                        GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst, 0x10u);
+                    return 5;
+                }
                 ggml_sycl_mul_mat_id(ctx, experts);
                 ggml_sycl_op_moe_weighted_sum(experts, weights, dst, ctx.stream());
                 ggml_sycl_trace_moe_down_reduce(GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst);
@@ -6720,8 +7003,14 @@ enum ggml_sycl_fusion_profile_kind {
     GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD,
     GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL,
     GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_SWIGLU,
+    GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_MMVQ,
+    GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_F32,
     GGML_SYCL_FUSION_PROFILE_COUNT,
 };
+
+// Partners of non-adjacent dense dual-MMVQ fuses; cleared each graph eval.
+// Looked up from try_fuse and the SYCL graph compute loop.
+static thread_local std::unordered_set<ggml_tensor *> g_sycl_dual_mmvq_elide;
 
 static int ggml_sycl_try_fuse(
         ggml_backend_sycl_context & ctx,
@@ -6820,6 +7109,212 @@ static int ggml_sycl_try_fuse(
                 *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_SWIGLU;
                 return 2;
             }
+        }
+    }
+
+    // Dense dual MMVQ: two MUL_MATs sharing one activation. Independent
+    // projections get graph-sorted apart, so search ahead for a partner and
+    // elide it when non-adjacent (see g_sycl_dual_mmvq_elide).
+    // Must NOT steal dense dual-SwiGLU pairs (MUL_MAT+MUL_MAT+GLU).
+    // Default OFF (parked 2026-07-20: r=3 tg flat / prefill-large regress).
+    // Opt-in: GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ=1.
+    static const bool enable_dense_dual_mmvq = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static const bool trace_dual_mmvq = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_MMVQ_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (enable_dense_dual_mmvq && node->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * mm0 = node;
+        // Already the elided partner of an earlier dual fuse.
+        if (g_sycl_dual_mmvq_elide.count(mm0) != 0) {
+            return 0;
+        }
+        const enum ggml_type wtype = mm0->src[0]->type;
+        const bool type_ok =
+            wtype == GGML_TYPE_Q8_0 || wtype == GGML_TYPE_Q4_K ||
+            wtype == GGML_TYPE_Q5_K || wtype == GGML_TYPE_Q6_K;
+        int j = -1;
+        if (type_ok) {
+            // Search remaining graph for the first compatible partner on the
+            // same activation. Prefer nearest (keeps full-attn K/V tight).
+            for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+                ggml_tensor * cand = cgraph->nodes[k];
+                if (cand->op != GGML_OP_MUL_MAT) {
+                    continue;
+                }
+                if (g_sycl_dual_mmvq_elide.count(cand) != 0) {
+                    continue;
+                }
+                if (cand->src[1] != mm0->src[1] ||
+                    cand->src[0] == mm0->src[0] ||
+                    cand->src[0]->type != wtype) {
+                    continue;
+                }
+                if (cand->src[0] == mm0 || cand->src[1] == mm0 ||
+                    mm0->src[0] == cand || mm0->src[1] == cand) {
+                    continue;
+                }
+                // Leave gate+up+SwiGLU to dense dual-SwiGLU.
+                bool owned_by_swiglu = false;
+                if (k + 1 < cgraph->n_nodes &&
+                    cgraph->nodes[k + 1]->op == GGML_OP_GLU) {
+                    ggml_tensor * glu = cgraph->nodes[k + 1];
+                    owned_by_swiglu =
+                        (glu->src[0] == mm0 && glu->src[1] == cand) ||
+                        (glu->src[0] == cand && glu->src[1] == mm0);
+                }
+                // Also: if mm0 is immediately followed by GLU with cand as the
+                // other src, dense dual-swiglu owns it (adjacent shexp case).
+                if (i + 2 < cgraph->n_nodes &&
+                    cgraph->nodes[i + 1] == cand &&
+                    cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+                    ggml_tensor * glu = cgraph->nodes[i + 2];
+                    owned_by_swiglu =
+                        owned_by_swiglu ||
+                        (glu->src[0] == mm0 && glu->src[1] == cand) ||
+                        (glu->src[0] == cand && glu->src[1] == mm0);
+                }
+                if (owned_by_swiglu) {
+                    continue;
+                }
+                j = k;
+                break;
+            }
+        }
+        if (j > i) {
+            ggml_tensor * mm1 = cgraph->nodes[j];
+            if (ggml_sycl_mul_mat_dense_dual_mmvq_fused(ctx, mm0, mm1)) {
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_MMVQ;
+                if (j == i + 1) {
+                    // Adjacent: classic skip-1 (current + next).
+                    return 1;
+                }
+                // Non-adjacent: elide partner when the loop reaches it; return
+                // -1 so the eval loop skips recompute of mm0 only.
+                g_sycl_dual_mmvq_elide.insert(mm1);
+                if (trace_dual_mmvq) {
+                    static std::atomic<int> hits{0};
+                    if (hits.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        fprintf(stderr,
+                                "[treebeard-dense-dual-mmvq] hit-nonadj"
+                                " i=%d j=%d wa=%s wb=%s type=%s"
+                                " ne1_a=%" PRId64 " ne1_b=%" PRId64
+                                " act_ne1=%" PRId64 "\n",
+                                i, j, mm0->src[0]->name, mm1->src[0]->name,
+                                ggml_type_name(wtype),
+                                mm0->src[0]->ne[1], mm1->src[0]->ne[1],
+                                mm0->src[1]->ne[1]);
+                    }
+                }
+                return -1;
+            }
+            if (trace_dual_mmvq) {
+                static std::atomic<int> miss{0};
+                if (miss.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    fprintf(stderr,
+                            "[treebeard-dense-dual-mmvq] dispatch-miss"
+                            " i=%d j=%d wa=%s wb=%s\n",
+                            i, j, mm0->src[0]->name, mm1->src[0]->name);
+                }
+            }
+        }
+    }
+
+    // Dense dual F32 GEMV: two F32 MUL_MATs sharing one activation
+    // (ssm_alpha+ssm_beta). Prefer equal-shape partners (same nrows) so we do
+    // not pair router / sparse F32 mats with the GDN pair by accident.
+    // Opt-in: GGML_SYCL_ENABLE_DENSE_DUAL_F32=1 (default OFF until gated).
+    static const bool enable_dense_dual_f32 = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_DENSE_DUAL_F32");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static const bool trace_dual_f32 = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_F32_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (enable_dense_dual_f32 && node->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * mm0 = node;
+        if (g_sycl_dual_mmvq_elide.count(mm0) != 0) {
+            return 0;
+        }
+        if (mm0->src[0]->type == GGML_TYPE_F32) {
+            // Two-pass partner pick: (1) equal nrows (preferred for alpha/beta),
+            // (2) any other F32 same-act partner. Retry on dispatch miss.
+            auto try_partner = [&](int j) -> int {
+                ggml_tensor * mm1 = cgraph->nodes[j];
+                if (!ggml_sycl_mul_mat_dense_dual_f32_fused(ctx, mm0, mm1)) {
+                    return 0;
+                }
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_F32;
+                if (j == i + 1) {
+                    return 1;
+                }
+                g_sycl_dual_mmvq_elide.insert(mm1);
+                if (trace_dual_f32) {
+                    static std::atomic<int> hits{0};
+                    if (hits.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        fprintf(stderr,
+                                "[treebeard-dense-dual-f32] hit-nonadj"
+                                " i=%d j=%d wa=%s wb=%s"
+                                " ne1_a=%" PRId64 " ne1_b=%" PRId64 "\n",
+                                i, j, mm0->src[0]->name, mm1->src[0]->name,
+                                mm0->src[0]->ne[1], mm1->src[0]->ne[1]);
+                    }
+                }
+                return -1;
+            };
+            int equal_j = -1;
+            int any_j   = -1;
+            for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+                ggml_tensor * cand = cgraph->nodes[k];
+                if (cand->op != GGML_OP_MUL_MAT) {
+                    continue;
+                }
+                if (g_sycl_dual_mmvq_elide.count(cand) != 0) {
+                    continue;
+                }
+                if (cand->src[1] != mm0->src[1] ||
+                    cand->src[0] == mm0->src[0] ||
+                    cand->src[0]->type != GGML_TYPE_F32) {
+                    continue;
+                }
+                if (cand->src[0] == mm0 || cand->src[1] == mm0 ||
+                    mm0->src[0] == cand || mm0->src[1] == cand) {
+                    continue;
+                }
+                if (any_j < 0) {
+                    any_j = k;
+                }
+                if (equal_j < 0 && cand->src[0]->ne[1] == mm0->src[0]->ne[1] &&
+                    cand->src[0]->ne[0] == mm0->src[0]->ne[0]) {
+                    equal_j = k;
+                    break; // nearest equal-shape is ideal
+                }
+            }
+            if (equal_j > i) {
+                if (trace_dual_f32) {
+                    static std::atomic<int> cands{0};
+                    if (cands.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        fprintf(stderr,
+                                "[treebeard-dense-dual-f32] equal-cand"
+                                " i=%d j=%d wa=%s wb=%s act_ne1=%" PRId64 "\n",
+                                i, equal_j, mm0->src[0]->name,
+                                cgraph->nodes[equal_j]->src[0]->name,
+                                mm0->src[1]->ne[1]);
+                    }
+                }
+                const int skip = try_partner(equal_j);
+                if (skip != 0) {
+                    return skip;
+                }
+            }
+            // Do not fall through to unequal-shape partners for F32: the only
+            // ship wins are equal-shape GDN pairs; unequal often pairs router
+            // weight with a 1-row projection and would just shape-reject.
+            (void) any_j;
         }
     }
 
@@ -6934,6 +7429,7 @@ static int ggml_sycl_try_fuse(
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    g_sycl_dual_mmvq_elide.clear();
     ggml_sycl_set_main_device(sycl_ctx->device);
 
     // Optional Treebeard SYCL per-op profiler (TREEBEARD_SYCL_PROF=1): serializes each op with a
@@ -7194,6 +7690,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (state_io_contains(state_io_elide, node)) {
             continue;
         }
+        if (g_sycl_dual_mmvq_elide.count(node) != 0) {
+            continue;
+        }
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
@@ -7236,7 +7735,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     fusion_us[fusion_kind] += now_us() - tf0;
                     fusion_n[fusion_kind]++;
                 }
-                i += nodes_to_skip;
+                // nodes_to_skip > 0: classic skip of subsequent nodes
+                // nodes_to_skip < 0: fused current only (partner elided later)
+                if (nodes_to_skip > 0) {
+                    i += nodes_to_skip;
+                }
                 continue;
             }
         }
@@ -7287,6 +7790,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             "FUSED_RMS_ADD",
             "FUSED_RMS",
             "FUSED_DENSE_DUAL",
+            "FUSED_DUAL_MMVQ",
+            "FUSED_DUAL_F32",
         };
         for (int kind = GGML_SYCL_FUSION_PROFILE_NONE + 1;
              kind < GGML_SYCL_FUSION_PROFILE_COUNT; ++kind) {

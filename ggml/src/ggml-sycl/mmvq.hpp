@@ -170,6 +170,45 @@ bool ggml_sycl_mul_mat_vec_q_dense_dual_swiglu_reorder(
     size_t             dst_col_stride,
     dpct::queue_ptr    stream);
 
+// Dense dual MMVQ: two MUL_MATs sharing one activation (same K). Writes both
+// destinations. nrows may differ (e.g. attn_qkv vs attn_gate). Decode-first;
+// ncols_dst capped like dense dual-SwiGLU.
+bool ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
+    enum ggml_type     src0_type,
+    const void *       vx_a,
+    const void *       vx_b,
+    const void *       vy,
+    float *            dst_a,
+    float *            dst_b,
+    int                ncols,
+    int                nrows_a,
+    int                nrows_b,
+    int                ncols_dst,
+    size_t             src1_col_stride_bytes,
+    size_t             dst_a_col_stride,
+    size_t             dst_b_col_stride,
+    dpct::queue_ptr    stream);
+
+// Dense dual F32 GEMV: two contiguous F32 weight matrices sharing one F32
+// activation column. Targets GDN ssm_alpha+ssm_beta (and similar). Decode-first
+// (ncols_dst small); prefill multi-col supported up to a modest cap.
+bool ggml_sycl_mul_mat_vec_f32_dense_dual(
+    const float *      wa,
+    const float *      wb,
+    const float *      x,
+    float *            dst_a,
+    float *            dst_b,
+    int                ncols,
+    int                nrows_a,
+    int                nrows_b,
+    int                ncols_dst,
+    size_t             x_col_stride,
+    size_t             dst_a_col_stride,
+    size_t             dst_b_col_stride,
+    size_t             wa_row_stride,
+    size_t             wb_row_stride,
+    dpct::queue_ptr    stream);
+
 bool ggml_sycl_mul_mat_vec_q_id_dual_swiglu_grouped_reorder(
     enum ggml_type     src0_type,
     const void *       vx_gate_base,

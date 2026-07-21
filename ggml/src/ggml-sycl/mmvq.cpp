@@ -3903,6 +3903,257 @@ bool ggml_sycl_mul_mat_vec_q_dense_dual_swiglu_reorder(
     }
 }
 
+// Dual dense MMVQ: share one quantized activation across two weight matrices.
+// Used for GDN pairs (attn_qkv+attn_gate, ssm_alpha+ssm_beta) that share `cur`.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_dense_dual_mmvq_reorder(
+    const void * __restrict__ vx_a,
+    const void * __restrict__ vx_b,
+    const void * __restrict__ vy_base,
+    float * __restrict__ dst_a_base,
+    float * __restrict__ dst_b_base,
+    const int ncols, const int nrows_a, const int nrows_b,
+    const size_t src1_col_stride_bytes,
+    const size_t dst_a_col_stride, const size_t dst_b_col_stride,
+    const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg  = item_ct1.get_sub_group();
+    const int  col = item_ct1.get_group(0);
+    const int  row = item_ct1.get_group(2) * sg.get_group_linear_range() +
+                     sg.get_group_linear_id();
+    const bool do_a = row < nrows_a;
+    const bool do_b = row < nrows_b;
+    if (!do_a && !do_b) {
+        return;
+    }
+
+    const char * vy = (const char *) vy_base + (size_t) col * src1_col_stride_bytes;
+    float * dst_a = dst_a_base + (size_t) col * dst_a_col_stride;
+    float * dst_b = dst_b_base + (size_t) col * dst_b_col_stride;
+
+    const int blocks_per_row = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup =
+        ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup =
+        block_traits::qi / block_traits::vdr_mmvq;
+    const int nblocks_a = nrows_a * blocks_per_row;
+    const int nblocks_b = nrows_b * blocks_per_row;
+
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+         i < blocks_per_row; i += blocks_per_subgroup) {
+        const int iby = i * block_type::block_to_q8_1_ratio();
+        const int8_t * q8 = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * q8_ds = (const sycl::half2 *)
+            ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq *
+                (sg.get_local_linear_id() % block_elements_per_subgroup);
+            if (do_a) {
+                const int ibx = row * blocks_per_row + i;
+                const auto bx = block_type::get_block_offset(ibx, nblocks_a);
+                const auto d  = block_type::get_d_offset(nrows_a, ncols, ibx);
+                partial_a += reorder_vec_dot_q_sycl()(vx_a, bx, d, q8, q8_ds, iqs);
+            }
+            if (do_b) {
+                const int ibx = row * blocks_per_row + i;
+                const auto bx = block_type::get_block_offset(ibx, nblocks_b);
+                const auto d  = block_type::get_d_offset(nrows_b, ncols, ibx);
+                partial_b += reorder_vec_dot_q_sycl()(vx_b, bx, d, q8, q8_ds, iqs);
+            }
+        }
+    }
+
+    if (do_a) {
+        const float sum = sycl::reduce_over_group(sg, partial_a, std::plus<>());
+        if (sg.leader()) {
+            dst_a[row] = sum;
+        }
+    }
+    if (do_b) {
+        const float sum = sycl::reduce_over_group(sg, partial_b, std::plus<>());
+        if (sg.leader()) {
+            dst_b[row] = sum;
+        }
+    }
+}
+
+template <typename reorder_vec_dot_q_sycl>
+static void launch_mul_mat_vec_q_dense_dual_mmvq_reorder(
+    const void * vx_a, const void * vx_b, const void * vy,
+    float * dst_a, float * dst_b, const int ncols,
+    const int nrows_a, const int nrows_b, const int ncols_dst,
+    const size_t src1_col_stride_bytes,
+    const size_t dst_a_col_stride, const size_t dst_b_col_stride,
+    dpct::queue_ptr stream) {
+    const int nrows_max = nrows_a > nrows_b ? nrows_a : nrows_b;
+    const int num_subgroups = ggml_sycl_mmid_wg_subgroups(2 * nrows_max);
+    const int block_num_y   = ceil_div(nrows_max, num_subgroups);
+    const sycl::range<3> block_nums(
+        (unsigned) ncols_dst, 1, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_dense_dual_mmvq_reorder<reorder_vec_dot_q_sycl>(
+                    vx_a, vx_b, vy, dst_a, dst_b, ncols, nrows_a, nrows_b,
+                    src1_col_stride_bytes, dst_a_col_stride, dst_b_col_stride,
+                    item);
+            });
+    });
+}
+
+// Dual F32 GEMV: one workgroup-row per output row index (shared across both
+// destinations when nrows match). Loads activation once; dots both weight rows.
+static void mul_mat_vec_f32_dense_dual_kernel(
+    const float * __restrict__ wa,
+    const float * __restrict__ wb,
+    const float * __restrict__ x_base,
+    float * __restrict__ dst_a_base,
+    float * __restrict__ dst_b_base,
+    const int ncols, const int nrows_a, const int nrows_b,
+    const size_t x_col_stride,
+    const size_t dst_a_col_stride, const size_t dst_b_col_stride,
+    const size_t wa_row_stride, const size_t wb_row_stride,
+    const sycl::nd_item<3> & item) {
+    const auto sg  = item.get_sub_group();
+    const int  col = item.get_group(0);
+    const int  row = item.get_group(2) * sg.get_group_linear_range() +
+                     sg.get_group_linear_id();
+    const bool do_a = row < nrows_a;
+    const bool do_b = row < nrows_b;
+    if (!do_a && !do_b) {
+        return;
+    }
+
+    const float * x     = x_base + (size_t) col * x_col_stride;
+    float *       dst_a = dst_a_base + (size_t) col * dst_a_col_stride;
+    float *       dst_b = dst_b_base + (size_t) col * dst_b_col_stride;
+    const float * ra    = do_a ? wa + (size_t) row * wa_row_stride : nullptr;
+    const float * rb    = do_b ? wb + (size_t) row * wb_row_stride : nullptr;
+
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    const int lane  = sg.get_local_linear_id();
+    // Vectorized path when K is a multiple of 4.
+    if ((ncols & 3) == 0) {
+        const int n4 = ncols >> 2;
+        for (int i = lane; i < n4; i += WARP_SIZE) {
+            const sycl::float4 xv = *reinterpret_cast<const sycl::float4 *>(x + (i << 2));
+            if (do_a) {
+                const sycl::float4 wv = *reinterpret_cast<const sycl::float4 *>(ra + (i << 2));
+                partial_a += xv.x() * wv.x() + xv.y() * wv.y() + xv.z() * wv.z() + xv.w() * wv.w();
+            }
+            if (do_b) {
+                const sycl::float4 wv = *reinterpret_cast<const sycl::float4 *>(rb + (i << 2));
+                partial_b += xv.x() * wv.x() + xv.y() * wv.y() + xv.z() * wv.z() + xv.w() * wv.w();
+            }
+        }
+    } else {
+        for (int i = lane; i < ncols; i += WARP_SIZE) {
+            const float xv = x[i];
+            if (do_a) {
+                partial_a += ra[i] * xv;
+            }
+            if (do_b) {
+                partial_b += rb[i] * xv;
+            }
+        }
+    }
+
+    if (do_a) {
+        const float sum = sycl::reduce_over_group(sg, partial_a, std::plus<>());
+        if (sg.leader()) {
+            dst_a[row] = sum;
+        }
+    }
+    if (do_b) {
+        const float sum = sycl::reduce_over_group(sg, partial_b, std::plus<>());
+        if (sg.leader()) {
+            dst_b[row] = sum;
+        }
+    }
+}
+
+bool ggml_sycl_mul_mat_vec_f32_dense_dual(
+    const float * wa, const float * wb, const float * x,
+    float * dst_a, float * dst_b, int ncols, int nrows_a, int nrows_b,
+    int ncols_dst, size_t x_col_stride, size_t dst_a_col_stride,
+    size_t dst_b_col_stride, size_t wa_row_stride, size_t wb_row_stride,
+    dpct::queue_ptr stream) {
+    // Decode-first. Cap multi-col modestly: prefill uses oneDNN for these shapes
+    // already (gemm-route); dual is for tiny MKL GEMV pairs on the decode path.
+    if (ncols_dst < 1 || ncols_dst > 8 || nrows_a < 1 || nrows_b < 1 || ncols < 1) {
+        return false;
+    }
+    const int nrows_max = nrows_a > nrows_b ? nrows_a : nrows_b;
+    const int num_subgroups = ggml_sycl_mmid_wg_subgroups(2 * nrows_max);
+    const int block_num_y   = ceil_div(nrows_max, num_subgroups);
+    const sycl::range<3> block_nums(
+        (unsigned) ncols_dst, 1, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_f32_dense_dual_kernel(
+                    wa, wb, x, dst_a, dst_b, ncols, nrows_a, nrows_b,
+                    x_col_stride, dst_a_col_stride, dst_b_col_stride,
+                    wa_row_stride, wb_row_stride, item);
+            });
+    });
+    return true;
+}
+
+bool ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
+    enum ggml_type src0_type, const void * vx_a, const void * vx_b,
+    const void * vy, float * dst_a, float * dst_b, int ncols,
+    int nrows_a, int nrows_b, int ncols_dst,
+    size_t src1_col_stride_bytes, size_t dst_a_col_stride,
+    size_t dst_b_col_stride, dpct::queue_ptr stream) {
+    if (ncols_dst < 1 || ncols_dst > 4 || nrows_a < 1 || nrows_b < 1) {
+        return false;
+    }
+    switch (src0_type) {
+        case GGML_TYPE_Q8_0:
+            launch_mul_mat_vec_q_dense_dual_mmvq_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+                    vx_a, vx_b, vy, dst_a, dst_b, ncols, nrows_a, nrows_b,
+                    ncols_dst, src1_col_stride_bytes, dst_a_col_stride,
+                    dst_b_col_stride, stream);
+            return true;
+        case GGML_TYPE_Q4_K:
+            launch_mul_mat_vec_q_dense_dual_mmvq_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                    vx_a, vx_b, vy, dst_a, dst_b, ncols, nrows_a, nrows_b,
+                    ncols_dst, src1_col_stride_bytes, dst_a_col_stride,
+                    dst_b_col_stride, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            launch_mul_mat_vec_q_dense_dual_mmvq_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(
+                    vx_a, vx_b, vy, dst_a, dst_b, ncols, nrows_a, nrows_b,
+                    ncols_dst, src1_col_stride_bytes, dst_a_col_stride,
+                    dst_b_col_stride, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            launch_mul_mat_vec_q_dense_dual_mmvq_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
+                    vx_a, vx_b, vy, dst_a, dst_b, ncols, nrows_a, nrows_b,
+                    ncols_dst, src1_col_stride_bytes, dst_a_col_stride,
+                    dst_b_col_stride, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const void * __restrict__ vx_gate_base,
