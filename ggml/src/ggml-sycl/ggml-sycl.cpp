@@ -2536,9 +2536,14 @@ inline void ggml_sycl_op_mul_mat_sycl(
             // repeated graph executions. Tiny router drift can change the selected
             // experts and amplify into large output differences. Keep this semantic
             // projection device-resident, but use oneMKL's reproducible FP32 path.
+            //
+            // For non-router GEMMs on B70 MoE, prefer oneDNN for mid/large shapes:
+            // measured Qwen3.6-35B-A3B Q5_K_XL pp512 +~1.3% vs native MKL when
+            // GGML_SYCL_DISABLE_DNN is unset (ship speed path). Keep a smaller
+            // FLOP cutoff so only tiny mats stay on the direct MKL path.
             const bool is_moe_router = src0->type == GGML_TYPE_F32 &&
                     std::strstr(src0->name, ".ffn_gate_inp.weight") != nullptr;
-            const bool use_mkl_direct = is_moe_router || gemm_flops < 256 * 256 * 256;
+            const bool use_mkl_direct = is_moe_router || gemm_flops < 128 * 128 * 128;
 #if GGML_SYCL_DNNL
             if (!g_ggml_sycl_disable_dnn && !use_mkl_direct) {
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
@@ -6665,12 +6670,21 @@ static int ggml_sycl_try_fuse(
         }
     }
 
-    // Glue fusion (RMS_NORM+MUL[+ADD]) is opt-in: measured-inert on this matmul-bound workload (the glue
-    // already overlaps under matmul execution). Kept for archs/shapes where glue is NOT hidden. Enable
-    // with GGML_SYCL_ENABLE_FUSION=1.
+    // Glue fusion (RMS_NORM+MUL[+ADD]): collapse norm-weight MUL and residual ADD into one kernel.
+    // On B70 Qwen3.6-35B-A3B (hybrid MoE + SSM/GDN) with the ship speed path (oneDNN + f16 KV),
+    // measured 2026-07-20: tg128 +~5% vs unfused glue (80.87 -> 85.05 t/s, r=3). Prefill flat.
+    // Default ON. Disable with GGML_SYCL_DISABLE_FUSION=1, or GGML_SYCL_ENABLE_FUSION=0.
     static const bool enable_glue_fusion = []() {
-        const char * env = getenv("GGML_SYCL_ENABLE_FUSION");
-        return env != nullptr && std::atoi(env) != 0;
+        const char * disable = getenv("GGML_SYCL_DISABLE_FUSION");
+        if (disable != nullptr && std::atoi(disable) != 0) {
+            return false;
+        }
+        const char * enable = getenv("GGML_SYCL_ENABLE_FUSION");
+        // Explicit 0 disables; unset or non-zero keeps default ON.
+        if (enable != nullptr && std::atoi(enable) == 0) {
+            return false;
+        }
+        return true;
     }();
     if (!enable_glue_fusion) {
         return 0;
