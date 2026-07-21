@@ -1163,14 +1163,15 @@ static void mul_mat_vec_q5_1_q8_1_sycl_switch_ncols(
 }
 
 static int ggml_sycl_q8_mmvq_subgroups() {
-    // Default 16 matches multi-col Q8 reorder. Override: GGML_SYCL_Q8_MMVQ_SUBGROUPS=1|2|4|8|16|32.
-    // Prior single-col used WARP_SIZE=32; 16 is denser for product decode rows (n_embd-class).
+    // Default 32: B70 product A/B (2026-07-20 post-reboot ABA) beat 16 by ~+0.9% tg128
+    // on Qwen3.6-35B-A3B Q5_K_XL short-ctx. Multi-col Q8 reorder still hardcodes 16.
+    // Override: GGML_SYCL_Q8_MMVQ_SUBGROUPS=1|2|4|8|16|32.
     static const int n = []() {
         const char * env = getenv("GGML_SYCL_Q8_MMVQ_SUBGROUPS");
-        const int value = env == nullptr ? 16 : atoi(env);
+        const int value = env == nullptr ? 32 : atoi(env);
         switch (value) {
             case 1: case 2: case 4: case 8: case 16: case 32: return value;
-            default: return 16;
+            default: return 32;
         }
     }();
     return n;
