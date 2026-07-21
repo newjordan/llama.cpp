@@ -1,6 +1,6 @@
 # B70 heavy push - next wave prereg (2026-07-20)
 
-Status: #1 dense MUL_MAT PARKED; #2 dense Q8 shared-expert dual-SwiGLU **PROMOTED** (tg +2.14%). See results/treebeard-b70-heavy-push-mmvq-20260720/RESULTS.md.
+Status: #1 dense MUL_MAT PARKED; #2 dense Q8 shared-expert dual-SwiGLU **PROMOTED** (tg +2.14%); #3 dual-MMVQ Q8 PARKED flat; #4 dual F32 PARKED (−2.7% tg / MKL-batch hang). Single-token integrated MOE_DOWN weighted **KEPT** (e2e flat). See results/treebeard-b70-heavy-push-dual-f32-20260720/RESULTS.md.
 Post-reboot handoff: results/treebeard-b70-heavy-push-mulmat-20260720/HANDOFF-after-reboot.md.
 
 ## Shipped this session (do not re-litigate)
@@ -46,14 +46,21 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
    MoE dual + down-reduce already hit on ship path. Residual ID work is low priority vs named `attn_qkv`.
 
 4. **Named residual dense dual-MMVQ (`attn_qkv`+`attn_gate`) — PARKED (flat)**  
-   Non-adjacent Q8 dual-MMVQ implemented; hits fire; r=3 tg **−0.07%** (flat). Prefill@64 regresses if uncapped. Opt-in `GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ=1`. Evidence: `results/treebeard-b70-heavy-push-attn-qkv-20260720/`.  
-   **ssm_alpha/beta are F32** (need dual-GEMM, not MMVQ). Next residual targets: FUSED_MOE_DOWN micro-opt, F32 dual-GEMM alpha/beta, linear_attn_out.
+   Non-adjacent Q8 dual-MMVQ implemented; hits fire; r=3 tg **−0.07%** (flat). Prefill@64 regresses if uncapped. Opt-in `GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ=1`. Evidence: `results/treebeard-b70-heavy-push-attn-qkv-20260720/`.
 
-5. **Submit / graph launch for single-token decode**  
+5. **Dense dual F32 (`ssm_alpha`+`ssm_beta`) — PARKED (−2.68% tg / batch hang)**  
+   Equal-shape partner search hits alpha+beta on decode. Custom dual GEMV r=3: control tg **89.63** → cand **87.23** (−2.68%). oneMKL gemm_batch(2) hung on product decode after hits. Opt-in `GGML_SYCL_ENABLE_DENSE_DUAL_F32=1` (default OFF). Evidence: `results/treebeard-b70-heavy-push-dual-f32-20260720/`.
+
+6. **Single-token integrated MOE_DOWN weighted — KEPT (e2e flat)**  
+   Decode down now prefers `mul_mat_id_mmvq_weighted` (detail=0x10); falls back to mul_mat_id+weighted_sum. Activation green; short-ctx tg still ~89.6. Not a ship gate win alone.
+
+7. **Submit / graph launch for single-token decode**  
    Clean retest under new ship: GRAPH alone was flat (+0.4% tg) this session — park unless new profile.
 
-6. **Product-shape multi-agent confirmation of stacked ship**  
-   Required before package/service flip: oneDNN + glue + dense dual + f16 short / q8_0 long.
+8. **Product-shape multi-agent confirmation of stacked ship**  
+   Required before package/service flip: oneDNN + glue + dense dual-SwiGLU + f16 short / q8_0 long.
+
+**Next residual targets:** linear_attn_out / ssm_out Q8 MMVQ micro-opts; FUSED_MOE_DOWN subgroup A/B; multi-agent ABA.
 
 ## Non-goals for next wave
 

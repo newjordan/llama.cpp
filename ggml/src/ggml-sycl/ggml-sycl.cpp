@@ -5020,79 +5020,24 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
     const size_t wa_row_stride     = wa->nb[1] / sizeof(float);
     const size_t wb_row_stride     = wb->nb[1] / sizeof(float);
 
-    // Backend choice (default MKL-batch; custom kernel measured −2.7% tg):
-    //   GGML_SYCL_DENSE_DUAL_F32_KERNEL=1  → custom dual GEMV
-    //   otherwise (default)                 → oneMKL gemm_batch of 2 (equal nrows)
-    static const bool use_custom_kernel = []() {
-        const char * env = getenv("GGML_SYCL_DENSE_DUAL_F32_KERNEL");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
-
-    bool ok = false;
-    if (use_custom_kernel) {
-        ok = ggml_sycl_mul_mat_vec_f32_dense_dual(
-            (const float *) wa->data, (const float *) wb->data,
-            (const float *) src1->data,
-            (float *) mm_a->data, (float *) mm_b->data,
-            (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
-            x_col_stride, dst_a_col_stride, dst_b_col_stride,
-            wa_row_stride, wb_row_stride, ctx.stream());
-    } else if (nrows_a == nrows_b && wa_row_stride == (size_t) ncols &&
-               wb_row_stride == (size_t) ncols &&
-               x_col_stride == (size_t) ncols &&
-               dst_a_col_stride == (size_t) nrows_a &&
-               dst_b_col_stride == (size_t) nrows_b) {
-        // Contiguous equal-shape pair: one gemm_batch of 2 (same B, two As).
-        // Matches column-major gemm(trans A): C = A^T * B with lda=K.
-        const float alpha = 1.0f;
-        const float beta  = 0.0f;
-        const void * a_ptrs[2] = { wa->data, wb->data };
-        const void * b_ptrs[2] = { src1->data, src1->data };
-        void *       c_ptrs[2] = { mm_a->data, mm_b->data };
-        // Host-side matrix_info for the pointer-array gemm_batch path.
-        matrix_info_t<float> matrix_info;
-        try {
-            dpct::gemm_batch(
-                *ctx.stream(),
-                oneapi::mkl::transpose::trans,
-                oneapi::mkl::transpose::nontrans,
-                (int) nrows_a, (int) ncols_dst, (int) ncols,
-                &alpha,
-                a_ptrs, dpct::library_data_t::real_float, (int) ncols,
-                b_ptrs, dpct::library_data_t::real_float, (int) ncols,
-                &beta,
-                c_ptrs, dpct::library_data_t::real_float, (int) nrows_a,
-                /*batch_size=*/2,
-                dpct::library_data_t::real_float,
-                &matrix_info);
-            ok = true;
-        } catch (const sycl::exception & e) {
-            if (trace) {
-                fprintf(stderr, "[treebeard-dense-dual-f32] mkl-batch-fail: %s\n",
-                        e.what());
-            }
-            ok = false;
-        }
-    } else {
-        // Unequal / non-contiguous: fall back to custom dual kernel.
-        ok = ggml_sycl_mul_mat_vec_f32_dense_dual(
-            (const float *) wa->data, (const float *) wb->data,
-            (const float *) src1->data,
-            (float *) mm_a->data, (float *) mm_b->data,
-            (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
-            x_col_stride, dst_a_col_stride, dst_b_col_stride,
-            wa_row_stride, wb_row_stride, ctx.stream());
-    }
+    // Custom dual GEMV only. oneMKL gemm_batch(2) pointer-array path was tried
+    // 2026-07-20 and hung on product decode after activation hits — do not re-enable
+    // without a new bound. Custom kernel completes but measured −2.7% tg (park).
+    const bool ok = ggml_sycl_mul_mat_vec_f32_dense_dual(
+        (const float *) wa->data, (const float *) wb->data,
+        (const float *) src1->data,
+        (float *) mm_a->data, (float *) mm_b->data,
+        (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
+        x_col_stride, dst_a_col_stride, dst_b_col_stride,
+        wa_row_stride, wb_row_stride, ctx.stream());
     if (ok && trace) {
         static std::atomic<int> hits{0};
         if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
             fprintf(stderr,
                     "[treebeard-dense-dual-f32] hit rows_a=%" PRId64
                     " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
-                    " mode=%s wa=%s wb=%s\n",
-                    nrows_a, nrows_b, ncols, ncols_dst,
-                    use_custom_kernel ? "kernel" : "mkl-batch",
-                    wa->name, wb->name);
+                    " wa=%s wb=%s\n",
+                    nrows_a, nrows_b, ncols, ncols_dst, wa->name, wb->name);
         }
     }
     return ok;
