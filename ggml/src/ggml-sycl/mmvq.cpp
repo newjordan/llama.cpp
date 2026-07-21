@@ -3123,6 +3123,107 @@ static void mul_mat_vec_q_moe_weighted_reorder(
     }
 }
 
+// Parallel-expert weighted MoE down for product top-k=8.
+//
+// Product Qwen3.6 down is nrows=2048, ncols=512 (2 QK_K blocks) with 8 routed
+// experts. The serial expert loop spends most of its time on 8× subgroup
+// reductions over almost no k-work. This kernel maps the 8 experts onto the 8
+// subgroups of one workgroup (one output row per WG) so the expert MMVQs run
+// concurrently; leaders then form the ordered weighted sum (same volatile
+// left-to-right contract as the serial path).
+//
+// Opt-in only (flat e2e on B70 short-ctx 2026-07-21): GGML_SYCL_ENABLE_MOE_DOWN_PAR8=1
+// Disable remains accepted as GGML_SYCL_DISABLE_MOE_DOWN_PAR8=1.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_weighted_reorder_par8(
+    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    const int32_t * __restrict__ ids_dev, const float * __restrict__ weights,
+    float * __restrict__ dst_base, float * __restrict__ shared_vals,
+    float * __restrict__ shared_w, const int ncols, const int nrows,
+    const size_t expert_weight_stride, const size_t src1_row_stride,
+    const size_t weights_slot_stride, const int ids_row_stride,
+    const size_t src1_token_stride, const size_t weights_token_stride,
+    const size_t dst_token_stride, const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    constexpr int n_experts = 8;
+    const auto sg          = item_ct1.get_sub_group();
+    const int  token       = item_ct1.get_group(0);
+    const int  row         = item_ct1.get_group(2);
+    const int  expert_idx  = sg.get_group_linear_id();
+    if (row >= nrows || expert_idx >= n_experts) {
+        return;
+    }
+
+    const int     blocks_per_row              = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    const int     nblocks                     = nrows * (ncols / block_traits::qk);
+
+    static_assert(blocks_per_subgroup > 0);
+    static_assert(block_elements_per_subgroup > 0);
+
+    const int    i02 = ids_dev[token * ids_row_stride + expert_idx];
+    const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+    const char * vy  = (const char *) vy_base + (size_t) token * src1_token_stride +
+                      (size_t) expert_idx * src1_row_stride;
+
+    float partial_sum = 0.0f;
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+         i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx = row * blocks_per_row + i;
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int           iby            = i * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *)
+            ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq *
+                (sg.get_local_linear_id() % block_elements_per_subgroup);
+            partial_sum += reorder_vec_dot_q_sycl()(
+                vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        }
+    }
+
+    const float expert_value = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
+    if (sg.leader()) {
+        shared_vals[expert_idx] = expert_value;
+        shared_w[expert_idx] = *(const float *) ((const char *) weights +
+            (size_t) token * weights_token_stride +
+            (size_t) expert_idx * weights_slot_stride);
+    }
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    // Ordered weighted sum in expert-slot order (matches serial path / ADD chain).
+    if (item_ct1.get_local_linear_id() == 0) {
+        float reduced = 0.0f;
+#pragma unroll
+        for (int e = 0; e < n_experts; ++e) {
+            volatile float weighted = shared_vals[e] * shared_w[e];
+            reduced += weighted;
+        }
+        float * dst = (float *) ((char *) dst_base + (size_t) token * dst_token_stride);
+        dst[row] = reduced;
+    }
+}
+
+static bool ggml_sycl_moe_down_par8_enabled() {
+    // Default OFF: measured flat on tg128 and regressed pp64 when always-on.
+    // Keep kernel behind ENABLE for future multi-token / multi-agent bounds.
+    static const bool enabled = []() {
+        const char * dis = getenv("GGML_SYCL_DISABLE_MOE_DOWN_PAR8");
+        if (dis != nullptr && std::atoi(dis) != 0) {
+            return false;
+        }
+        const char * en = getenv("GGML_SYCL_ENABLE_MOE_DOWN_PAR8");
+        return en != nullptr && std::atoi(en) != 0;
+    }();
+    return enabled;
+}
+
 template <typename reorder_vec_dot_q_sycl>
 static void launch_mul_mat_vec_q_moe_weighted_reorder(
     const void * vx_base, const void * vy, const int32_t * ids_dev,
@@ -3132,6 +3233,32 @@ static void launch_mul_mat_vec_q_moe_weighted_reorder(
     const int n_tokens, const int ids_row_stride, const size_t src1_token_stride,
     const size_t weights_token_stride, const size_t dst_token_stride,
     dpct::queue_ptr stream) {
+    // Product top-k=8 + tiny-k down (ncols≈512): parallelize experts across
+    // subgroups instead of serializing them on each row subgroup.
+    // Decode-only (n_tokens<=2): full-batch prefill regressed ~4% pp64 when
+    // launching nrows WGs × n_tokens (measured 2026-07-21).
+    if (n_experts_used == 8 && n_tokens <= 2 && ggml_sycl_moe_down_par8_enabled()) {
+        constexpr int num_subgroups = 8;
+        const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) nrows);
+        const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<float, 1> shared_vals(sycl::range<1>(num_subgroups), cgh);
+            sycl::local_accessor<float, 1> shared_w(sycl::range<1>(num_subgroups), cgh);
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_weighted_reorder_par8<reorder_vec_dot_q_sycl>(
+                        vx_base, vy, ids_dev, weights, dst_base,
+                        shared_vals.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        shared_w.get_multi_ptr<sycl::access::decorated::no>().get(),
+                        ncols, nrows, expert_weight_stride, src1_row_stride,
+                        weights_slot_stride, ids_row_stride, src1_token_stride,
+                        weights_token_stride, dst_token_stride, item);
+                });
+        });
+        return;
+    }
+
     const int            num_subgroups = ggml_sycl_mmid_wg_subgroups(nrows);
     const int            block_num_y   = ceil_div(nrows, num_subgroups);
     const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) block_num_y);

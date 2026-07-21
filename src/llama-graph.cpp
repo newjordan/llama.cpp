@@ -1855,8 +1855,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_weighted", il);
     }
 
-    ggml_build_forward_expand(gf, experts);
-
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
     assert(n_expert_used > 0);
@@ -1864,12 +1862,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * moe_out;
     // Single-token decode is per-op-submit bound and the n_expert_used-1 add chain dominates
     // the node count; reduce over the expert dim in one op. Larger batch keeps the chain.
+    //
+    // Important: do NOT early-expand `experts` on this path. Expanding here materializes
+    // MUL_MAT_ID+MUL in the middle of graph construction, while PERMUTE/CONT/SUM/RESHAPE
+    // only appear at final expand — non-adjacent, so SYCL moe-down-reduce fuse misses
+    // almost every decode layer (B70 product Qwen3.6: FUSED_MOE_DOWN ~1.8/eval vs ~40 dual).
+    // Leaving the chain unexpanded keeps the 6-node pattern contiguous for fusion.
     if (n_tokens == 1 && hparams.n_expert_used > 1) {
         // [n_embd, n_expert_used, 1] -> [n_expert_used, n_embd, 1] -> sum over dim0
         moe_out = ggml_cont(ctx0, ggml_permute(ctx0, experts, 1, 0, 2, 3));
         moe_out = ggml_sum_rows(ctx0, moe_out);
         moe_out = ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
     } else {
+        // Batched path: views need `experts` in the graph first.
+        ggml_build_forward_expand(gf, experts);
+
         // order the views before the adds
         for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
             cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);

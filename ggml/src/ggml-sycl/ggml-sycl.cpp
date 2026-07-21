@@ -6778,6 +6778,12 @@ static int ggml_sycl_try_fuse_moe_down_reduce(
             ggml_tensor * cont    = cgraph->nodes[i + 3];
             ggml_tensor * sum     = cgraph->nodes[i + 4];
             ggml_tensor * dst     = cgraph->nodes[i + 5];
+            // Product decode: routing weights almost always alias the final
+            // reshape/sum output (allocator reuse). Snapshotting + fusing was
+            // measured −3.5% tg (two-step) to −6.6% tg (integrated) vs unfused
+            // on B70 Qwen3.6-35B-A3B (2026-07-21). Hard-reject on weight
+            // overlap so decode stays on the faster unfused permute/sum path.
+            // Batched path still snapshots and fuses (prefill).
             if (permute->src[0] == weighted && cont->src[0] == permute &&
                 sum->src[0] == cont && dst->src[0] == sum &&
                 dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
@@ -6785,8 +6791,9 @@ static int ggml_sycl_try_fuse_moe_down_reduce(
                 !ggml_sycl_tensor_ranges_overlap(weights, dst) &&
                 dst->ne[0] == nrows &&
                 dst->ne[1] == n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1) {
-                // Prefer integrated weighted MMVQ (one kernel, no expert
-                // intermediate + weighted_sum). Falls back to two-step path.
+                // Prefer integrated weighted MMVQ when live ranges are clean.
+                // Opt out of integrated: default two-step not needed here —
+                // clean-overlap case is rare on product; keep historical path.
                 if (ggml_sycl_mul_mat_id_mmvq_weighted(ctx, experts, weights, dst)) {
                     ggml_sycl_trace_moe_down_reduce(
                         GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst, 0x10u);
@@ -6794,9 +6801,15 @@ static int ggml_sycl_try_fuse_moe_down_reduce(
                 }
                 ggml_sycl_mul_mat_id(ctx, experts);
                 ggml_sycl_op_moe_weighted_sum(experts, weights, dst, ctx.stream());
-                ggml_sycl_trace_moe_down_reduce(GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst);
+                ggml_sycl_trace_moe_down_reduce(
+                    GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst);
                 return 5;
             }
+            ggml_sycl_trace_moe_down_reduce(
+                GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_OUTPUT_REJECT, experts, nullptr, 0x1u);
+        } else {
+            ggml_sycl_trace_moe_down_reduce(
+                GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_SUBGRAPH_REJECT, experts, nullptr, 0x1u);
         }
     }
 
