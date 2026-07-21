@@ -3780,6 +3780,129 @@ bool ggml_sycl_mul_mat_vec_q_id_dual_swiglu_reorder(
     }
 }
 
+// Dense (non-ID) dual-SwiGLU: shared-expert gate/up are ordinary MUL_MATs that
+// share one activation vector. Pair both projections per row and store
+// silu(gate)*up — collapses two MMVQ submits + GLU into one kernel. Decode
+// (ncols_dst=1) is the ship target; multi-col is supported for prefill microbatch.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_dense_dual_swiglu_reorder(
+    const void * __restrict__ vx_gate,
+    const void * __restrict__ vx_up,
+    const void * __restrict__ vy_base,
+    float * __restrict__ dst_base,
+    const int ncols, const int nrows,
+    const size_t src1_col_stride_bytes, const size_t dst_col_stride,
+    const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const auto sg  = item_ct1.get_sub_group();
+    const int  col = item_ct1.get_group(0);
+    const int  row = item_ct1.get_group(2) * sg.get_group_linear_range() +
+                     sg.get_group_linear_id();
+    if (row >= nrows) {
+        return;
+    }
+
+    const char * vy = (const char *) vy_base + (size_t) col * src1_col_stride_bytes;
+    float * dst = dst_base + (size_t) col * dst_col_stride;
+
+    const int blocks_per_row = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup =
+        ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup =
+        block_traits::qi / block_traits::vdr_mmvq;
+    const int nblocks = nrows * blocks_per_row;
+
+    float gate_partial = 0.0f;
+    float up_partial   = 0.0f;
+    for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+         i < blocks_per_row; i += blocks_per_subgroup) {
+        const int ibx = row * blocks_per_row + i;
+        const auto bx = block_type::get_block_offset(ibx, nblocks);
+        const auto d  = block_type::get_d_offset(nrows, ncols, ibx);
+        const int iby = i * block_type::block_to_q8_1_ratio();
+        const int8_t * q8 = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * q8_ds = (const sycl::half2 *)
+            ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+            const int iqs = elem + block_traits::vdr_mmvq *
+                (sg.get_local_linear_id() % block_elements_per_subgroup);
+            gate_partial += reorder_vec_dot_q_sycl()(vx_gate, bx, d, q8, q8_ds, iqs);
+            up_partial   += reorder_vec_dot_q_sycl()(vx_up,   bx, d, q8, q8_ds, iqs);
+        }
+    }
+
+    const float gate = sycl::reduce_over_group(sg, gate_partial, std::plus<>());
+    const float up   = sycl::reduce_over_group(sg, up_partial,   std::plus<>());
+    if (sg.leader()) {
+        dst[row] = (gate / (1.0f + sycl::native::exp(-gate))) * up;
+    }
+}
+
+template <typename reorder_vec_dot_q_sycl>
+static void launch_mul_mat_vec_q_dense_dual_swiglu_reorder(
+    const void * vx_gate, const void * vx_up, const void * vy,
+    float * dst, const int ncols, const int nrows, const int ncols_dst,
+    const size_t src1_col_stride_bytes, const size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    const int num_subgroups = ggml_sycl_mmid_wg_subgroups(2 * nrows);
+    const int block_num_y   = ceil_div(nrows, num_subgroups);
+    const sycl::range<3> block_nums(
+        (unsigned) ncols_dst, 1, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_dense_dual_swiglu_reorder<reorder_vec_dot_q_sycl>(
+                    vx_gate, vx_up, vy, dst, ncols, nrows,
+                    src1_col_stride_bytes, dst_col_stride, item);
+            });
+    });
+}
+
+bool ggml_sycl_mul_mat_vec_q_dense_dual_swiglu_reorder(
+    enum ggml_type src0_type, const void * vx_gate, const void * vx_up,
+    const void * vy, float * dst, int ncols, int nrows, int ncols_dst,
+    size_t src1_col_stride_bytes, size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    if (ncols_dst < 1 || ncols_dst > 32) {
+        return false;
+    }
+    switch (src0_type) {
+        case GGML_TYPE_Q8_0:
+            // UD-Q5_K_XL stores shared-expert gate/up as Q8_0 (measured 2026-07-20).
+            launch_mul_mat_vec_q_dense_dual_swiglu_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
+                    vx_gate, vx_up, vy, dst, ncols, nrows, ncols_dst,
+                    src1_col_stride_bytes, dst_col_stride, stream);
+            return true;
+        case GGML_TYPE_Q4_K:
+            launch_mul_mat_vec_q_dense_dual_swiglu_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                    vx_gate, vx_up, vy, dst, ncols, nrows, ncols_dst,
+                    src1_col_stride_bytes, dst_col_stride, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            launch_mul_mat_vec_q_dense_dual_swiglu_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(
+                    vx_gate, vx_up, vy, dst, ncols, nrows, ncols_dst,
+                    src1_col_stride_bytes, dst_col_stride, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            launch_mul_mat_vec_q_dense_dual_swiglu_reorder<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
+                    vx_gate, vx_up, vy, dst, ncols, nrows, ncols_dst,
+                    src1_col_stride_bytes, dst_col_stride, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const void * __restrict__ vx_gate_base,

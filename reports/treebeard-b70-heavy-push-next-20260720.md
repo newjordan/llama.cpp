@@ -1,6 +1,7 @@
 # B70 heavy push - next wave prereg (2026-07-20)
 
-Status: #1 dense MUL_MAT PARKED (2026-07-20) — see results/treebeard-b70-heavy-push-mulmat-20260720/RESULTS.md. OPEN for #2+.
+Status: #1 dense MUL_MAT PARKED; #2 dense Q8 shared-expert dual-SwiGLU **PROMOTED** (tg +2.14%). See results/treebeard-b70-heavy-push-mmvq-20260720/RESULTS.md.
+Post-reboot handoff: results/treebeard-b70-heavy-push-mulmat-20260720/HANDOFF-after-reboot.md.
 
 ## Shipped this session (do not re-litigate)
 
@@ -29,30 +30,29 @@ Measured decode tg128 (short-ctx f16): ~71 (native+q8) -> ~82 (oneDNN+f16) -> ~8
 
 ## Next heavy-push candidates (priority)
 
-1. **Dense MUL_MAT family — PARKED (no win)**  
+1. **Dense MUL_MAT family — PARKED for FLOP-cutoff/MMQ (no win)**  
    Profile confirms MUL_MAT ~43% serialized; heat is named `attn_qkv` / shared-expert / SSM MMVQ, not FP32 cutoff leftovers.  
    Measured: MKL cutoff 64^3 flat; cutoff 0 → tg −14%; ENABLE_MMQ hung GPU.  
    Env knobs retained: `GGML_SYCL_MKL_FLOP_CUTOFF` (default 128^3), `TREEBEARD_SYCL_GEMM_ROUTE=1`.  
-   Evidence: `results/treebeard-b70-heavy-push-mulmat-20260720/`.  
-   Residual dense work → MMVQ kernel on top named families (not FLOP-cutoff).
+   Evidence: `results/treebeard-b70-heavy-push-mulmat-20260720/`.
 
-2. **Remaining MUL_MAT_ID (~12-17% of same profile) not covered by dual/down fuse**  
-   Q8_0 down layers / shape rejects from dual-swiglu debug.  
-   Hypothesis: type or n_tokens eligibility leaves unfused expert downs.  
-   Gate: activation hit counts + e2e; park if only microbench wins.
+2. **Dense Q8 shared-expert dual-SwiGLU — PROMOTED (2026-07-20 post-reboot)**  
+   Product `ffn_gate_shexp` / `ffn_up_shexp` are **Q8_0**. Fuse `MUL_MAT+MUL_MAT+GLU` → one reorder dual kernel.  
+   Same-binary r=3: control tg **87.69** → candidate **89.57** (**+2.14%**); pp flat.  
+   Default ON; `GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU=1` to off.  
+   Evidence: `results/treebeard-b70-heavy-push-mmvq-20260720/`.
 
-3. **Submit / graph launch for single-token decode**  
-   SYCL graph retest alone (prior concurrent OOM may have poisoned load).  
-   GGML_SYCL_GRAPH with MMID graph policy; only if clean load + no multi-agent regress.
+3. **Remaining MUL_MAT_ID (~3% serialized now; older notes 12–17%)**  
+   MoE dual + down-reduce already hit on ship path. Residual ID work is low priority vs named `attn_qkv`.
 
-4. **Attention / hybrid SSM path**  
-   Model is qwen35moe with SSM + full_attention_interval.  
-   Profile GATED_DELTA_NET / SSM_CONV share under TREEBEARD_SYCL_PROF; only fuse if share >5% serialized.
+4. **Named residual dense MMVQ (`attn_qkv`, SSM linear, logits)**  
+   Still the bulk of MUL_MAT time after shexp dual. Kernel micro-opts / further fusions only.
 
-5. **Product-shape multi-agent confirmation of stacked ship**  
-   Not a new kernel - promotion gate for the stacked env:  
-   oneDNN ON + glue ON + f16 (short) / q8_0 (long) vs rc8 production midpoint.  
-   Required before any package/service flip.
+5. **Submit / graph launch for single-token decode**  
+   Clean retest under new ship: GRAPH alone was flat (+0.4% tg) this session — park unless new profile.
+
+6. **Product-shape multi-agent confirmation of stacked ship**  
+   Required before package/service flip: oneDNN + glue + dense dual + f16 short / q8_0 long.
 
 ## Non-goals for next wave
 

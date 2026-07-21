@@ -155,6 +155,21 @@ bool ggml_sycl_mul_mat_vec_q_id_dual_swiglu_reorder(
     size_t             dst_token_stride,
     dpct::queue_ptr    stream);
 
+// Dense shared-expert gate/up (ordinary MUL_MAT, not MUL_MAT_ID). Same SwiGLU
+// fusion as the MoE dual path; ncols_dst is the activation batch (1 for decode).
+bool ggml_sycl_mul_mat_vec_q_dense_dual_swiglu_reorder(
+    enum ggml_type     src0_type,
+    const void *       vx_gate,
+    const void *       vx_up,
+    const void *       vy,
+    float *            dst,
+    int                ncols,
+    int                nrows,
+    int                ncols_dst,
+    size_t             src1_col_stride_bytes,
+    size_t             dst_col_stride,
+    dpct::queue_ptr    stream);
+
 bool ggml_sycl_mul_mat_vec_q_id_dual_swiglu_grouped_reorder(
     enum ggml_type     src0_type,
     const void *       vx_gate_base,

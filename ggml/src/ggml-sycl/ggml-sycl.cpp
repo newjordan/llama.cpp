@@ -4682,6 +4682,148 @@ static bool ggml_sycl_mul_mat_id_dual_swiglu_fused(
         src1_token_stride, glu->nb[2], stream);
 }
 
+// Shared-expert dense path: MUL_MAT gate + MUL_MAT up + GLU(SwiGLU). CUDA already
+// fuses this; SYCL only had the MUL_MAT_ID dual. Target: Q5_K/Q6_K reorder MMVQ,
+// decode ncols_dst=1 and small prefill batches. Disable:
+// GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU=1. Debug: GGML_SYCL_DENSE_DUAL_SWIGLU_DEBUG=1.
+static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * gate,
+    const ggml_tensor * up, ggml_tensor * glu) {
+    const ggml_tensor * gate_weights = gate->src[0];
+    const ggml_tensor * up_weights   = up->src[0];
+    const ggml_tensor * src1         = gate->src[1];
+    static const bool trace_reject = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_SWIGLU_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    const bool type_ok =
+        gate_weights->type == up_weights->type &&
+        (gate_weights->type == GGML_TYPE_Q8_0 ||
+         gate_weights->type == GGML_TYPE_Q4_K ||
+         gate_weights->type == GGML_TYPE_Q5_K ||
+         gate_weights->type == GGML_TYPE_Q6_K);
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        gate->src[1] != up->src[1] || !type_ok ||
+        src1->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        if (trace_reject) {
+            static std::atomic<int> tr{0};
+            if (tr.fetch_add(1, std::memory_order_relaxed) < 12) {
+                fprintf(stderr,
+                        "[treebeard-dense-dual-swiglu] dispatcher=type-reject"
+                        " gate_op=%s up_op=%s same_src1=%d"
+                        " wgate=%s wup=%s src1=%s gate=%s up=%s glu=%s"
+                        " wgate_name=%s wup_name=%s\n",
+                        ggml_op_name(gate->op), ggml_op_name(up->op),
+                        gate->src[1] == up->src[1],
+                        ggml_type_name(gate_weights->type),
+                        ggml_type_name(up_weights->type),
+                        ggml_type_name(src1->type),
+                        ggml_type_name(gate->type), ggml_type_name(up->type),
+                        ggml_type_name(glu->type),
+                        gate_weights->name, up_weights->name);
+            }
+        }
+        return false;
+    }
+
+    // MMVQ shapes only: 2D weights, activation batch in ne[1], no higher dims.
+    const int64_t ncols     = src1->ne[0];
+    const int64_t ncols_dst = src1->ne[1];
+    const int64_t nrows     = gate_weights->ne[1];
+    if (ncols_dst < 1 || ncols_dst > 32 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        gate_weights->ne[0] != ncols || up_weights->ne[0] != ncols ||
+        up_weights->ne[1] != nrows ||
+        gate_weights->ne[2] != 1 || gate_weights->ne[3] != 1 ||
+        up_weights->ne[2] != 1 || up_weights->ne[3] != 1 ||
+        ncols % QK8_1 != 0 ||
+        !ggml_is_contiguous(src1) || !ggml_is_contiguous(glu) ||
+        !ggml_is_contiguous(gate_weights) || !ggml_is_contiguous(up_weights) ||
+        gate->ne[0] != nrows || up->ne[0] != nrows ||
+        gate->ne[1] != ncols_dst || up->ne[1] != ncols_dst ||
+        !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(gate, glu) ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 /* swapped */) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-swiglu] dispatcher=shape-reject"
+                    " ncols=%" PRId64 " ncols_dst=%" PRId64 " rows=%" PRId64 "\n",
+                    ncols, ncols_dst, nrows);
+        }
+        return false;
+    }
+
+    // Shared-expert Q8_0 needs MMVQ reorder (opt_for_reorder_id is K-quants only).
+    auto ensure_reorder_mmvq = [&](const ggml_tensor * w) {
+        if (g_ggml_sycl_disable_optimize || !ctx.opt_feature.reorder) {
+            return false;
+        }
+        if (!ggml_sycl_supports_reorder_mmvq(w->type)) {
+            return false;
+        }
+        ggml_tensor_extra_gpu * extra =
+            static_cast<ggml_tensor_extra_gpu *>(w->extra);
+        if (!extra) {
+            return false;
+        }
+        if (extra->optimized_feature.reorder) {
+            return true;
+        }
+        if (reorder_qw(w, ctx.stream())) {
+            extra->optimized_feature.reorder = true;
+            return true;
+        }
+        return false;
+    };
+    if (!ensure_reorder_mmvq(gate_weights) || !ensure_reorder_mmvq(up_weights)) {
+        if (trace_reject) {
+            const ggml_tensor_extra_gpu * ge =
+                static_cast<const ggml_tensor_extra_gpu *>(gate_weights->extra);
+            const ggml_tensor_extra_gpu * ue =
+                static_cast<const ggml_tensor_extra_gpu *>(up_weights->extra);
+            fprintf(stderr,
+                    "[treebeard-dense-dual-swiglu] dispatcher=reorder-reject"
+                    " gate_reorder=%d up_reorder=%d type=%s\n",
+                    ge != nullptr && ge->optimized_feature.reorder,
+                    ue != nullptr && ue->optimized_feature.reorder,
+                    ggml_type_name(gate_weights->type));
+        }
+        return false;
+    }
+
+    const queue_ptr stream = ctx.stream();
+    const int src1_padded_cols = GGML_PAD((int) ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(),
+        (size_t) ncols_dst * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_q8 = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_q8, (int) ncols, (int) ncols_dst,
+        src1_padded_cols, stream);
+
+    const size_t bytes_per_qrow =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t dst_col_stride = glu->nb[1] / sizeof(float);
+
+    const bool ok = ggml_sycl_mul_mat_vec_q_dense_dual_swiglu_reorder(
+        gate_weights->type, gate_weights->data, up_weights->data, src1_q8,
+        (float *) glu->data, (int) ncols, (int) nrows, (int) ncols_dst,
+        bytes_per_qrow, dst_col_stride, stream);
+    if (ok && trace_reject) {
+        static std::atomic<int> hits{0};
+        const int n = hits.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-swiglu] hit type=%s rows=%" PRId64
+                    " cols=%" PRId64 " ncols_dst=%" PRId64 "\n",
+                    ggml_type_name(gate_weights->type), nrows, ncols, ncols_dst);
+        }
+    }
+    return ok;
+}
+
 // MoE down-projection specialization: compute routed expert dots, multiply by
 // routing weights in slot order, and write only the final token output.
 static bool ggml_sycl_mul_mat_id_mmvq_weighted(
@@ -6577,6 +6719,7 @@ enum ggml_sycl_fusion_profile_kind {
     GGML_SYCL_FUSION_PROFILE_STATE_IO,
     GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD,
     GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL,
+    GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_SWIGLU,
     GGML_SYCL_FUSION_PROFILE_COUNT,
 };
 
@@ -6641,6 +6784,41 @@ static int ggml_sycl_try_fuse(
             } else {
                 ggml_sycl_trace_moe_dual_swiglu(
                     "dispatch-reject", gate, glu);
+            }
+        }
+    }
+
+    // Dense shared-expert dual-SwiGLU (MUL_MAT + MUL_MAT + GLU). Default ON.
+    // A/B off: GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU=1.
+    static const bool disable_dense_dual = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_dense_dual &&
+        i + 2 < cgraph->n_nodes && node->op == GGML_OP_MUL_MAT &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+        cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+        ggml_tensor * mm0 = node;
+        ggml_tensor * mm1 = cgraph->nodes[i + 1];
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        const int output = i + 2;
+        const bool edges_ok =
+            ((glu->src[0] == mm0 && glu->src[1] == mm1) ||
+             (glu->src[0] == mm1 && glu->src[1] == mm0)) &&
+            mm0->src[1] == mm1->src[1];
+        const bool subgraph_ok = ggml_can_fuse_subgraph(
+            cgraph, i,
+            { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU },
+            { output });
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            subgraph_ok && edges_ok) {
+            ggml_tensor * gate = glu->src[0];
+            ggml_tensor * up   = glu->src[1];
+            ggml_tensor * activations = gate->src[1];
+            if (!ggml_sycl_tensor_ranges_overlap(activations, glu) &&
+                ggml_sycl_mul_mat_dense_dual_swiglu_fused(ctx, gate, up, glu)) {
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_SWIGLU;
+                return 2;
             }
         }
     }
@@ -7108,6 +7286,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             "FUSED_STATE_IO",
             "FUSED_RMS_ADD",
             "FUSED_RMS",
+            "FUSED_DENSE_DUAL",
         };
         for (int kind = GGML_SYCL_FUSION_PROFILE_NONE + 1;
              kind < GGML_SYCL_FUSION_PROFILE_COUNT; ++kind) {
