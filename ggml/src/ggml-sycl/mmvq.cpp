@@ -4141,6 +4141,29 @@ static int ggml_sycl_moe_dual_rows_per_sg() {
     return value;
 }
 
+// Dual WG subgroup count. Historical: ggml_sycl_mmid_wg_subgroups(2*nrows)
+// → 4 for product intermediate nrows=512. Opt-in override for packing sweeps
+// without changing MoE-down's mmid default. GGML_SYCL_MOE_DUAL_WG_SUBGROUPS=1|2|4|8|16.
+static int ggml_sycl_moe_dual_wg_subgroups(const int nrows) {
+    static const int override_sg = []() {
+        const char * env = getenv("GGML_SYCL_MOE_DUAL_WG_SUBGROUPS");
+        if (env == nullptr) {
+            return 0;
+        }
+        const int v = std::atoi(env);
+        switch (v) {
+            case 1: case 2: case 4: case 8: case 16: case 32:
+                return v;
+            default:
+                return 0;
+        }
+    }();
+    if (override_sg != 0) {
+        return override_sg;
+    }
+    return ggml_sycl_mmid_wg_subgroups(2 * nrows);
+}
+
 template <typename reorder_vec_dot_q_sycl>
 static void launch_mul_mat_vec_q_moe_dual_swiglu_reorder(
     const void * vx_gate_base, const void * vx_up_base, const void * vy,
@@ -4151,17 +4174,17 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_reorder(
     const int n_tokens, const int ids_row_stride,
     const size_t src1_token_stride, const size_t dst_token_stride,
     dpct::queue_ptr stream) {
-    const int num_subgroups = ggml_sycl_mmid_wg_subgroups(2 * nrows);
+    const int num_subgroups = ggml_sycl_moe_dual_wg_subgroups(nrows);
     const int rows_per_sg   = ggml_sycl_moe_dual_rows_per_sg();
     const int block_num_y   = ceil_div(nrows, num_subgroups * rows_per_sg);
     const sycl::range<3> block_nums(
         (unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
-    if (rows_per_sg > 1) {
+    {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            fprintf(stderr, "[treebeard-moe-dual-rows-per-sg] rows_per_sg=%d n_tokens=%d nrows=%d (first entry)\n",
-                    rows_per_sg, n_tokens, nrows);
+            fprintf(stderr, "[treebeard-moe-dual-launch] n_tokens=%d n_experts=%d nrows=%d ncols=%d sg=%d rps=%d (first entry)\n",
+                    n_tokens, n_experts_used, nrows, ncols, num_subgroups, rows_per_sg);
         }
     }
     stream->submit([&](sycl::handler & cgh) {
@@ -4592,6 +4615,7 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const size_t gate_expert_stride, const size_t up_expert_stride,
     const size_t dst_row_stride, const size_t src1_row_stride,
     const size_t src1_token_stride, const size_t dst_token_stride,
+    const int rows_per_sg,
     const sycl::nd_item<3> & item_ct1) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
@@ -4609,9 +4633,11 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const int start  = offsets[expert];
     const int count  = offsets[expert + 1] - start;
     const auto sg    = item_ct1.get_sub_group();
-    const int row    = item_ct1.get_group(2) * sg.get_group_linear_range() +
-                       sg.get_group_linear_id();
-    if (row >= nrows) {
+    const int sg_range = (int) sg.get_group_linear_range();
+    const int rps      = rows_per_sg < 1 ? 1 : rows_per_sg;
+    const int row0     = item_ct1.get_group(2) * (sg_range * rps) +
+                         sg.get_group_linear_id() * rps;
+    if (row0 >= nrows) {
         return;
     }
 
@@ -4639,6 +4665,12 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
             dsts[j] = (float *) ((char *) dst_base +
                                  (size_t) token * dst_token_stride +
                                  (size_t) slot * dst_row_stride);
+        }
+
+        for (int r = 0; r < rps; ++r) {
+        const int row = row0 + r;
+        if (row >= nrows) {
+            break;
         }
 
         float gate_partial[MMID_GROUP_TCHUNK] = { 0.0f };
@@ -4675,6 +4707,7 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                 dsts[j][row] = (gate / (1.0f + sycl::native::exp(-gate))) * up;
             }
         }
+        } // rows_per_sg
     }
 }
 
@@ -4687,10 +4720,19 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const size_t dst_row_stride, const size_t src1_row_stride,
     const size_t src1_token_stride, const size_t dst_token_stride,
     dpct::queue_ptr stream) {
-    const int num_subgroups = ggml_sycl_mmid_wg_subgroups(2 * nrows);
-    const int block_num_y   = ceil_div(nrows, num_subgroups);
+    // Reuse dual multi-row env so one knob covers the hot grouped path at n_tokens>=4.
+    const int num_subgroups = ggml_sycl_moe_dual_wg_subgroups(nrows);
+    const int rows_per_sg   = ggml_sycl_moe_dual_rows_per_sg();
+    const int block_num_y   = ceil_div(nrows, num_subgroups * rows_per_sg);
     const sycl::range<3> block_nums(1, (unsigned) max_groups, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+    {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            fprintf(stderr, "[treebeard-moe-dual-grouped-launch] max_groups=%d nrows=%d ncols=%d sg=%d rps=%d (first entry)\n",
+                    max_groups, nrows, ncols, num_subgroups, rows_per_sg);
+        }
+    }
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
@@ -4700,7 +4742,7 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                         vx_gate_base, vx_up_base, vy, dst_base, scratch,
                         ncols, nrows, n_as, gate_expert_stride,
                         up_expert_stride, dst_row_stride, src1_row_stride,
-                        src1_token_stride, dst_token_stride, item);
+                        src1_token_stride, dst_token_stride, rows_per_sg, item);
             });
     });
 }
