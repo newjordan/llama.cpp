@@ -177,9 +177,23 @@ worth 20.4%) and the Q6_K `result_output` head (540 MB Q8_0, 1477-1481 us/op).
 1. Q6_K -> F32 -> Q5_K is *double* quantization, strictly worse than Q5_K from
    source. The speed delta measured that way is honest; the quality delta is
    pessimistic, so a null result would not be conclusive.
-2. Unsloth chose those types on purpose and CLAUDE.md makes quality the product.
-   This needs a real capability gate, not a greedy diff - and **spark-bench is
-   still not on this box**. Get a source or a substitute before spending GPU time.
+2. Unsloth chose those types on purpose and CLAUDE.md makes quality the product,
+   so this needs a real quality gate, not a greedy diff.
+   **The gate is local - build it here, do not go looking for spark-bench.**
+   spark-bench is a DGX Spark bench and is not the B70 quality gate; earlier
+   handoffs wrongly cited "spark-bench is not on this box" as a blocker and that
+   framing should be dropped. What this box actually has:
+   - `llama-perplexity` (in the build) over a held-out corpus - the direct,
+     sensitive measure of a quantization quality change, and the right primary
+     gate for anything that alters weights.
+   - `results/treebeard-b70-gdn-out-flat-20260725/analyze-logprob.py` - top-8
+     logprob KL per position, with calibration already established (shipped
+     subgroup knob 5.21e-05 nats, GDN fix 7.03e-04). Right for kernel changes
+     that only perturb FP reduction order.
+   - `held-out-probe/` (scenarios + runner.py) for behavioural spot checks.
+   Perplexity plus the KL harness is a stronger gate for a weight change than a
+   capability leaderboard anyway, because it is sensitive to small distributional
+   shifts rather than to task-score flutter.
 
 ### 4b. The ~192 us pair-count floor
 
@@ -200,10 +214,12 @@ it), MMID workgroup sizing (flat over an 8x sweep), MoE pipeline (-13.6%), dual
 reuse (cache already serves it).
 
 Also still unshipped from the prior session and unrelated to MoE: the **GDN 2D
-output projection** (+15% p50, real) remains blocked on a capability eval because
-it is *not* bit-exact - 1 greedy flip, mean KL 7.03e-04 nats, ~13.5x the most
-recent shipped tuning. Production stays pinned `TREEBEARD_GDN_OUT_FLAT=0`. Same
-spark-bench blocker as 4a - solving that unblocks both.
+output projection** (+15% p50, real) remains unshipped because it is *not*
+bit-exact - 1 greedy flip, mean KL 7.03e-04 nats, ~13.5x the most recent shipped
+tuning. Production stays pinned `TREEBEARD_GDN_OUT_FLAT=0`. It needs the same
+local gate as 4a (perplexity + the KL harness), NOT spark-bench - it is worth
++15% p50, far more than anything else open, so building that gate is the
+highest-value unblock available.
 
 ---
 
