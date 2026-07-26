@@ -1177,6 +1177,31 @@ static int ggml_sycl_q8_mmvq_subgroups() {
     return n;
 }
 
+static int ggml_sycl_q8_mmvq_ncols_subgroups() {
+    // Workgroup packing for the multi-column (ncols_dst > 1) Q8_0 reorder MMVQ
+    // launchers. Defaults to the historical 16, so this is behavior-preserving
+    // until an arm is selected explicitly.
+    //
+    // Why this exists: ggml_sycl_q8_mmvq_subgroups() (default 32, measured
+    // +0.9% tg128 on 2026-07-20) only reaches the ncols_dst=1 launcher, which
+    // is the shape llama-bench tg128 exercises. Production np12 decode carries
+    // one token per active slot, so ne11 = active slots and every dense Q8_0
+    // projection (attn_qkv, attn_gate, ssm_out, ffn_*_shexp, output) lands on
+    // the multi-column path below instead. That path was never swept.
+    //
+    // Override: GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS=1|2|4|8|16|32|64.
+    // 64 * WARP_SIZE(16) = 1024 = the B70 max workgroup size, so 64 is the cap.
+    static const int n = []() {
+        const char * env   = getenv("GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS");
+        const int    value = env == nullptr ? 16 : atoi(env);
+        switch (value) {
+            case 1: case 2: case 4: case 8: case 16: case 32: case 64: return value;
+            default: return 16;
+        }
+    }();
+    return n;
+}
+
 static void reorder_mul_mat_vec_q8_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                     const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
@@ -1203,9 +1228,11 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
-    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
-    constexpr size_t num_subgroups = 16;
-    GGML_ASSERT(block_num_y % num_subgroups == 0);
+    // Round up to a whole number of subgroup-sized workgroups; out-of-range rows
+    // are skipped inside the kernel by its row >= nrows guard. This replaces the
+    // old exact-fit grid + divisibility assert so num_subgroups can be swept.
+    const size_t num_subgroups = (size_t) ggml_sycl_q8_mmvq_ncols_subgroups();
+    const int    block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups) * (int) num_subgroups;
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
     stream->submit([&](sycl::handler & cgh) {
@@ -1224,9 +1251,11 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols_hoisted(
         const int stride_col_y_bytes, const int stride_col_dst,
         dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK8_0 == 0);
-    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
-    constexpr size_t num_subgroups = 16;
-    GGML_ASSERT(block_num_y % num_subgroups == 0);
+    // Round up to a whole number of subgroup-sized workgroups; out-of-range rows
+    // are skipped inside the kernel by its row >= nrows guard. This replaces the
+    // old exact-fit grid + divisibility assert so num_subgroups can be swept.
+    const size_t num_subgroups = (size_t) ggml_sycl_q8_mmvq_ncols_subgroups();
+    const int    block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups) * (int) num_subgroups;
     const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
     stream->submit([&](sycl::handler & cgh) {
