@@ -3029,7 +3029,7 @@ static void launch_mul_mat_vec_q_moe_reorder(
     });
 }
 
-template <typename reorder_vec_dot_q_sycl>
+template <typename reorder_vec_dot_q_sycl, bool deferred_reduce = false>
 static void mul_mat_vec_q_moe_weighted_reorder(
     const void * __restrict__ vx_base, const void * __restrict__ vy_base,
     const int32_t * __restrict__ ids_dev, const float * __restrict__ weights,
@@ -3077,6 +3077,55 @@ static void mul_mat_vec_q_moe_weighted_reorder(
     // Product top-k is 8: fully unroll that case so the compiler can schedule
     // eight expert MMVQs inside the serial ordered-sum loop.
     if (n_experts_used == 8) {
+        // Deferred reduction (GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE=1). The default
+        // path below separates each expert's loads from the next by a dependent
+        // subgroup reduction plus a leader-only volatile accumulate, so the eight
+        // experts' memory requests cannot all be in flight. Measured 2026-07-25:
+        // MoE-down GEMV sits on a ~192 us floor that survives forcing distinct
+        // experts to 1 (i.e. it is not weight traffic), and this chain is the
+        // prime suspect. BIT-IDENTICAL to the default: same per-expert dot order,
+        // same per-expert reduce_over_group, same ordered volatile accumulation.
+        if constexpr (deferred_reduce) {
+            float partial[8];
+#pragma unroll
+            for (int expert_idx = 0; expert_idx < 8; ++expert_idx) {
+                const int i02 = expert_ids_local[expert_idx];
+                const char * vx = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+                const char * vy = (const char *) vy_base + (size_t) token * src1_token_stride +
+                                  (size_t) expert_idx * src1_row_stride;
+                float partial_sum = 0.0f;
+                for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+                     i < blocks_per_row; i += blocks_per_subgroup) {
+                    const int ibx = row * blocks_per_row + i;
+                    const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+                    const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+                    const int           iby            = i * block_type::block_to_q8_1_ratio();
+                    const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+                    const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *)
+                        ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+#pragma unroll
+                    for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                        const int iqs = elem + block_traits::vdr_mmvq *
+                            (sg.get_local_linear_id() % block_elements_per_subgroup);
+                        partial_sum += reorder_vec_dot_q_sycl()(
+                            vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                    }
+                }
+                partial[expert_idx] = partial_sum;
+            }
+            float expert_value[8];
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                expert_value[e] = sycl::reduce_over_group(sg, partial[e], std::plus<>());
+            }
+            if (sg.leader()) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    volatile float weighted = expert_value[e] * expert_w_local[e];
+                    reduced += weighted;
+                }
+            }
+        } else {
 #pragma unroll
         for (int expert_idx = 0; expert_idx < 8; ++expert_idx) {
             const int i02 = expert_ids_local[expert_idx];
@@ -3106,6 +3155,7 @@ static void mul_mat_vec_q_moe_weighted_reorder(
                 volatile float weighted = expert_value * expert_w_local[expert_idx];
                 reduced += weighted;
             }
+        }
         }
     } else {
         for (int expert_idx = 0; expert_idx < n_experts_used; ++expert_idx) {
@@ -3239,6 +3289,16 @@ static void mul_mat_vec_q_moe_weighted_reorder_par8(
     }
 }
 
+// Default OFF pending an A/B. Bit-identical to the default path by construction,
+// so if it wins it can ship without a numerical gate.
+static bool ggml_sycl_moe_down_deferred_reduce_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool ggml_sycl_moe_down_par8_enabled() {
     // Default OFF: measured flat on tg128 and regressed pp64 when always-on.
     // Keep kernel behind ENABLE for future multi-token / multi-agent bounds.
@@ -3292,11 +3352,25 @@ static void launch_mul_mat_vec_q_moe_weighted_reorder(
     const int            block_num_y   = ceil_div(nrows, num_subgroups);
     const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+    if (ggml_sycl_moe_down_deferred_reduce_enabled()) {
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_weighted_reorder<reorder_vec_dot_q_sycl, true>(
+                        vx_base, vy, ids_dev, weights, dst_base, ncols, nrows,
+                        n_experts_used, expert_weight_stride, src1_row_stride,
+                        weights_slot_stride, ids_row_stride, src1_token_stride,
+                        weights_token_stride, dst_token_stride, item);
+                });
+        });
+        return;
+    }
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::nd_range<3>(block_nums * block_dims, block_dims),
             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_moe_weighted_reorder<reorder_vec_dot_q_sycl>(
+                mul_mat_vec_q_moe_weighted_reorder<reorder_vec_dot_q_sycl, false>(
                     vx_base, vy, ids_dev, weights, dst_base, ncols, nrows,
                     n_experts_used, expert_weight_stride, src1_row_stride,
                     weights_slot_stride, ids_row_stride, src1_token_stride,

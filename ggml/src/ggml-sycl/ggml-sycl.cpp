@@ -5098,6 +5098,39 @@ static void ggml_sycl_moe_route_hist(const ggml_tensor * ids, const ggml_tensor 
             call, src0->name, (int) n_tokens, draws, distinct, top_count);
 }
 
+// Controlled reuse probe (TREEBEARD_MOE_ROUTE_FORCE=N, N>0): overwrite the ids
+// buffer so the layer touches exactly N distinct experts while the (token,slot)
+// PAIR count stays at n_tokens*n_experts_used. That is the one experiment that
+// separates the two live explanations for why the grouped reuse kernel ties:
+//   - if MoE-down time is flat in N, the redundant weight reads were already
+//     being absorbed by cache and there is no DRAM traffic for reuse to save;
+//   - if time scales with N, DRAM traffic IS the cost, the 2.4x is real, and
+//     the grouped kernel is merely an inefficient way to collect it.
+// DESTROYS OUTPUT - the model emits garbage under this flag. Perf probe only.
+static void ggml_sycl_moe_route_force(const ggml_tensor * ids, int64_t n_tokens,
+                                      int n_experts_used, int n_as,
+                                      const queue_ptr & stream) {
+    static const int force_n = []() {
+        const char * env = getenv("TREEBEARD_MOE_ROUTE_FORCE");
+        return env == nullptr ? 0 : std::atoi(env);
+    }();
+    if (force_n <= 0) {
+        return;
+    }
+    const int n_distinct = std::min(force_n, n_as);
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids)).wait()));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int s = 0; s < n_experts_used; ++s) {
+            const int32_t e = (int32_t) ((t * n_experts_used + s) % n_distinct);
+            *(int32_t *) (ids_host.data() + t * ids->nb[1] + s * ids->nb[0]) = e;
+        }
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids->data, ids_host.data(), ggml_nbytes(ids)).wait()));
+}
+
 // Phase attribution (TREEBEARD_MOE_DOWN_PHASE_PROF=1) for the MoE-down op.
 // The op is not just the GEMV: it also runs the reorder check and a src1
 // quantize launch. The npl scaling fit leaves a ~188 us/op intercept at np12
@@ -5135,21 +5168,37 @@ static std::chrono::steady_clock::time_point ggml_sycl_moe_phase_mark(
     return now;
 }
 
+// Reports the WINDOW delta, not the running mean. A cumulative mean keeps warmup
+// (JIT, cold caches, first-touch of ~30 GB of weights) in every later report -
+// that is exactly how a nonexistent "188 us/op fixed cost" got published once.
 static void ggml_sycl_moe_phase_report(int64_t n_tokens) {
+    constexpr long window = 2000;
     const long calls = g_moe_phase_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     g_moe_phase_tokens.fetch_add((long) n_tokens, std::memory_order_relaxed);
-    if (calls % 2000 != 0) {
+    if (calls % window != 0) {
         return;
     }
-    const double r = g_moe_phase_ns[GGML_SYCL_MOE_PHASE_REORDER].load() / 1e3 / calls;
-    const double q = g_moe_phase_ns[GGML_SYCL_MOE_PHASE_QUANTIZE].load() / 1e3 / calls;
-    const double g = g_moe_phase_ns[GGML_SYCL_MOE_PHASE_GEMV].load() / 1e3 / calls;
+    static long long prev[GGML_SYCL_MOE_PHASE_COUNT] = { 0 };
+    static long      prev_tokens = 0;
+    const long long  cur[GGML_SYCL_MOE_PHASE_COUNT] = {
+        g_moe_phase_ns[GGML_SYCL_MOE_PHASE_REORDER].load(),
+        g_moe_phase_ns[GGML_SYCL_MOE_PHASE_QUANTIZE].load(),
+        g_moe_phase_ns[GGML_SYCL_MOE_PHASE_GEMV].load(),
+    };
+    const long cur_tokens = g_moe_phase_tokens.load();
+    const double r = (cur[0] - prev[0]) / 1e3 / window;
+    const double q = (cur[1] - prev[1]) / 1e3 / window;
+    const double g = (cur[2] - prev[2]) / 1e3 / window;
     fprintf(stderr,
-            "[treebeard-moe-phase] calls=%ld mean_tokens=%.1f"
+            "[treebeard-moe-phase] window_end=%ld mean_tokens=%.1f"
             " reorder=%.2f quantize=%.2f gemv=%.2f total=%.2f us/op"
             " (gemv %.1f%%)\n",
-            calls, (double) g_moe_phase_tokens.load() / calls, r, q, g, r + q + g,
+            calls, (double) (cur_tokens - prev_tokens) / window, r, q, g, r + q + g,
             100.0 * g / (r + q + g));
+    for (int i = 0; i < GGML_SYCL_MOE_PHASE_COUNT; ++i) {
+        prev[i] = cur[i];
+    }
+    prev_tokens = cur_tokens;
 }
 
 // MoE down-projection specialization: compute routed expert dots, multiply by
@@ -5185,6 +5234,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
     const int       n_experts_used   = (int) n_ids_per_group;
     const int       nrows            = (int) src0->ne[1];
 
+    ggml_sycl_moe_route_force(ids, ne12, n_experts_used, (int) src0->ne[2], stream);
     ggml_sycl_moe_route_hist(ids, src0, ne12, n_experts_used, stream);
 
     const bool phase_prof = ggml_sycl_moe_phase_prof_enabled();

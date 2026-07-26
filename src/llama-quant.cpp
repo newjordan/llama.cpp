@@ -285,9 +285,30 @@ static void llama_tensor_dequantize_impl(
 // do we allow this tensor to be quantized?
 //
 
+// Does this tensor carry an explicit --tensor-type override?
+// Only consulted on the only_copy path, so the per-call regex build is paid at
+// most once per tensor on a run that is already minutes long.
+static bool tensor_has_type_override(const llama_model_quantize_params * params, const ggml_tensor * tensor) {
+    if (params->tt_overrides == nullptr) {
+        return false;
+    }
+    const std::string name(ggml_get_name(tensor));
+    for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+        if (std::regex_search(name, std::regex(p->pattern))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    // COPY + an explicit --tensor-type is single-tensor surgery: every tensor is
+    // copied verbatim except the ones the user named. Without this exemption the
+    // override is silently ignored in copy mode, and the only alternative is a
+    // full requantize, which rewrites every tensor of a hand-tuned per-tensor
+    // mixture (e.g. Unsloth UD) and confounds any A/B on the one tensor at issue.
+    if (params->only_copy && !tensor_has_type_override(params, tensor)) return false;
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -660,6 +681,21 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+        return tensor->type;
+    }
+    // Copy mode: the ftype-derived mixture below is meaningless (COPY maps to
+    // ALL_F32, so default_type is not quantized and the override path is never
+    // reached). The explicit override IS the whole instruction here.
+    if (params->only_copy) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                LLAMA_LOG_WARN("%s: %-36s - surgery: %s -> %s\n", __func__,
+                               tensor_name.c_str(), ggml_type_name(tensor->type),
+                               ggml_type_name(qtype));
+                return tensor_type_fallback(qs, tensor, qtype);
+            }
+        }
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
