@@ -4567,7 +4567,9 @@ bool ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
     int nrows_a, int nrows_b, int ncols_dst,
     size_t src1_col_stride_bytes, size_t dst_a_col_stride,
     size_t dst_b_col_stride, dpct::queue_ptr stream) {
-    if (ncols_dst < 1 || ncols_dst > 4 || nrows_a < 1 || nrows_b < 1) {
+    // Must match ggml_sycl_mul_mat_dense_dual_mmvq_fused's serving-shape gate
+    // (default max 16 for np12). Historical cap of 4 made the fuse inert there.
+    if (ncols_dst < 1 || ncols_dst > 16 || nrows_a < 1 || nrows_b < 1) {
         return false;
     }
     switch (src0_type) {

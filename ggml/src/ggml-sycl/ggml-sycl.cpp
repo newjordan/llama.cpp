@@ -4861,9 +4861,23 @@ static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
     const int64_t ncols_dst = src1->ne[1];
     const int64_t nrows_a   = wa->ne[1];
     const int64_t nrows_b   = wb->ne[1];
-    // Decode-first: ncols_dst=1 is the ship path. Small multi-col kept for
-    // microbatch; large prefill batches (64+) measured regress (pp -38%).
-    if (ncols_dst < 1 || ncols_dst > 4 ||
+    // Production np12 decode presents ncols_dst=12 (one token × 12 seqs). The
+    // original cap of 4 made this fuse *structurally inert* at serving shape
+    // (remeasured 2026-07-26: only shape-reject). Allow up to 16 for np12 +
+    // small headroom; still reject large prefill (64+ regressed pp historically).
+    // Override: GGML_SYCL_DENSE_DUAL_MMVQ_MAX_NCOLS_DST (1..64).
+    static const int max_ncols_dst = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_MMVQ_MAX_NCOLS_DST");
+        if (env == nullptr) {
+            return 16;
+        }
+        const int v = std::atoi(env);
+        if (v < 1) {
+            return 16;
+        }
+        return v > 64 ? 64 : v;
+    }();
+    if (ncols_dst < 1 || ncols_dst > max_ncols_dst ||
         src1->ne[2] != 1 || src1->ne[3] != 1 ||
         wa->ne[0] != ncols || wb->ne[0] != ncols ||
         wa->ne[2] != 1 || wa->ne[3] != 1 ||
