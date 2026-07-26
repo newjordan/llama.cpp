@@ -5098,6 +5098,60 @@ static void ggml_sycl_moe_route_hist(const ggml_tensor * ids, const ggml_tensor 
             call, src0->name, (int) n_tokens, draws, distinct, top_count);
 }
 
+// Phase attribution (TREEBEARD_MOE_DOWN_PHASE_PROF=1) for the MoE-down op.
+// The op is not just the GEMV: it also runs the reorder check and a src1
+// quantize launch. The npl scaling fit leaves a ~188 us/op intercept at np12
+// and this splits that intercept across the sub-steps. Inserts a stream wait
+// after each phase, so it inflates the op - use it for attribution shares,
+// never as a perf arm.
+static bool ggml_sycl_moe_phase_prof_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("TREEBEARD_MOE_DOWN_PHASE_PROF");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+enum ggml_sycl_moe_phase {
+    GGML_SYCL_MOE_PHASE_REORDER = 0,
+    GGML_SYCL_MOE_PHASE_QUANTIZE,
+    GGML_SYCL_MOE_PHASE_GEMV,
+    GGML_SYCL_MOE_PHASE_COUNT,
+};
+
+static std::atomic<long long> g_moe_phase_ns[GGML_SYCL_MOE_PHASE_COUNT];
+static std::atomic<long>      g_moe_phase_calls{ 0 };
+static std::atomic<long>      g_moe_phase_tokens{ 0 };
+
+// returns the timestamp to hand to the next phase
+static std::chrono::steady_clock::time_point ggml_sycl_moe_phase_mark(
+    ggml_sycl_moe_phase phase, std::chrono::steady_clock::time_point prev,
+    const queue_ptr & stream) {
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    const auto now = std::chrono::steady_clock::now();
+    g_moe_phase_ns[phase].fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - prev).count(),
+        std::memory_order_relaxed);
+    return now;
+}
+
+static void ggml_sycl_moe_phase_report(int64_t n_tokens) {
+    const long calls = g_moe_phase_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_moe_phase_tokens.fetch_add((long) n_tokens, std::memory_order_relaxed);
+    if (calls % 2000 != 0) {
+        return;
+    }
+    const double r = g_moe_phase_ns[GGML_SYCL_MOE_PHASE_REORDER].load() / 1e3 / calls;
+    const double q = g_moe_phase_ns[GGML_SYCL_MOE_PHASE_QUANTIZE].load() / 1e3 / calls;
+    const double g = g_moe_phase_ns[GGML_SYCL_MOE_PHASE_GEMV].load() / 1e3 / calls;
+    fprintf(stderr,
+            "[treebeard-moe-phase] calls=%ld mean_tokens=%.1f"
+            " reorder=%.2f quantize=%.2f gemv=%.2f total=%.2f us/op"
+            " (gemv %.1f%%)\n",
+            calls, (double) g_moe_phase_tokens.load() / calls, r, q, g, r + q + g,
+            100.0 * g / (r + q + g));
+}
+
 // MoE down-projection specialization: compute routed expert dots, multiply by
 // routing weights in slot order, and write only the final token output.
 static bool ggml_sycl_mul_mat_id_mmvq_weighted(
@@ -5133,7 +5187,18 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
 
     ggml_sycl_moe_route_hist(ids, src0, ne12, n_experts_used, stream);
 
+    const bool phase_prof = ggml_sycl_moe_phase_prof_enabled();
+    if (phase_prof) {
+        // Drain everything the graph queued BEFORE this op, otherwise the first
+        // phase mark charges all of that pipeline depth to the reorder check.
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    }
+    auto phase_t = std::chrono::steady_clock::now();
+
     opt_for_reorder_id(&ctx, src0);
+    if (phase_prof) {
+        phase_t = ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_REORDER, phase_t, stream);
+    }
     const ggml_tensor_extra_gpu * src0_extra =
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool reorder_type = src0->type == GGML_TYPE_Q4_K ||
@@ -5156,6 +5221,9 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
         quantize_row_q8_1_sycl<quantize_q8_1>(
             (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
+    }
+    if (phase_prof) {
+        phase_t = ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_QUANTIZE, phase_t, stream);
     }
 
     const size_t bytes_per_qrow =
@@ -5196,10 +5264,14 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
                             " rows=%d experts=%d tokens=%" PRId64 "\n",
                             nrows, n_experts_used, ne12);
                 }
+                if (phase_prof) {
+                    ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+                    ggml_sycl_moe_phase_report(ne12);
+                }
                 return true;
             }
         }
-        return ggml_sycl_mul_mat_vec_q_id_weighted_reorder(
+        const bool ok_reorder = ggml_sycl_mul_mat_vec_q_id_weighted_reorder(
             src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
             (const float *) weights->data, (float *) dst->data,
             (int) ne10, nrows, n_experts_used,
@@ -5207,8 +5279,13 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
             /*weights_slot_stride=*/ weights->nb[1], (int) ne12, ids_row_stride,
             src1_token_stride, /*weights_token_stride=*/ weights->nb[2],
             /*dst_token_stride=*/ dst->nb[1], stream);
+        if (phase_prof) {
+            ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+            ggml_sycl_moe_phase_report(ne12);
+        }
+        return ok_reorder;
     }
-    return ggml_sycl_mul_mat_vec_q_id_weighted(
+    const bool ok_weighted = ggml_sycl_mul_mat_vec_q_id_weighted(
         src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
         (const float *) weights->data, (float *) dst->data,
         (int) ne10, nrows, n_experts_used,
@@ -5216,6 +5293,11 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
         /*weights_slot_stride=*/ weights->nb[1], (int) ne12, ids_row_stride,
         src1_token_stride, /*weights_token_stride=*/ weights->nb[2],
         /*dst_token_stride=*/ dst->nb[1], stream);
+    if (phase_prof) {
+        ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+        ggml_sycl_moe_phase_report(ne12);
+    }
+    return ok_weighted;
 }
 
 // Complete batched MoE expert pipeline. The graph still exposes separate
