@@ -13,7 +13,12 @@ stub links to its archived location.
 
 ## Active (top level)
 
-- `treebeard-moe-handoff-20260726.md` - **CURRENT handoff; read first.** MoE-down
+- `treebeard-quality-gate-handoff-20260726.md` - **NEXT WORK; read first.** Build
+  the local quality gate (`llama-perplexity --kl-divergence`, hellaswag,
+  multiple-choice; wikitext-2 is on the box). It unblocks the GDN 2D fix at
+  +15% p50 plus the quantization byte levers. spark-bench is DGX Spark-scoped and
+  is NOT this gate. Includes the n_seqs=1 blindness trap that would waste a session.
+- `treebeard-moe-handoff-20260726.md` - **CURRENT state handoff.** MoE-down
   closed (cost model, measured 13.5% reuse ceiling), deferred-reduce kernel
   shipped default-ON 2026-07-26, remaining levers + the three measurement rules
   these sessions cost.
