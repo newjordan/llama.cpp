@@ -13,8 +13,14 @@ stub links to its archived location.
 
 ## Active (top level)
 
-- `treebeard-fresh-session-handoff-20260716-rc8.md` - CURRENT handoff; read
-  first. Production state through RC8, what changed today, next moves.
+- `treebeard-moe-handoff-20260726.md` - **CURRENT handoff; read first.** MoE-down
+  closed (cost model, measured 13.5% reuse ceiling), deferred-reduce kernel
+  shipped default-ON 2026-07-26, remaining levers + the three measurement rules
+  these sessions cost.
+- `treebeard-moe-kernel-handoff-20260725.md` - RESOLVED, superseded by the above.
+  Its absolute us/op figures are warmup-inflated; its shares are fine.
+- `treebeard-fresh-session-handoff-20260716-rc8.md` - prior handoff. Production
+  state through RC8, PCBT/StateTree threads, next moves.
 - `treebeard-fresh-session-handoff-20260716.md` - prior handoff (stops at RC6);
   superseded, kept for provenance.
 - `treebeard-b4-arbitration-protocol-20260716.md` - frozen B4 slot-arbitration
