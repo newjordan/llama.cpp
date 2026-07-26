@@ -1,7 +1,7 @@
-# Handoff: MoE-down is finished. One unshipped win, two open levers.
+# Handoff: MoE-down is finished. One win shipped, two open levers.
 
 Status: ACTIVE. Written 2026-07-26 (end of the 2026-07-25 kernel sessions).
-Branch `agent/treebeard-single-wavefront` @ `a7dc94ce0`, pushed to `turbo-private`.
+Branch `agent/treebeard-single-wavefront`, pushed to `turbo-private`.
 Supersedes `reports/treebeard-moe-kernel-handoff-20260725.md` (marked RESOLVED).
 
 Read sections 0 and 1 before touching anything. Section 1 exists because this
@@ -11,18 +11,22 @@ session published a conclusion that was an artifact of how a number was read.
 
 ## 0. State of the box
 
-Production is UP and untouched by any of this work: `treebeard-b70-ship`
-(:8093, Angel X), 12 slots, ctx 262144, `TREEBEARD_GDN_OUT_FLAT=0` pinned via
-drop-in. Every experiment below took a bench window and restored it with
+Production is UP: `treebeard-b70-ship` (:8093, Angel X), 12 slots, ctx 262144,
+`TREEBEARD_GDN_OUT_FLAT=0` pinned via drop-in. Every experiment took a bench
+window and restored it with
 `results/treebeard-b70-gdn-out-flat-20260725/restore-and-verify.sh 0`.
 
-Nothing was flipped into production this session. Three commits, all pushed:
+**One change WAS flipped into production on 2026-07-26** - the deferred-reduce
+MoE-down kernel is now the default (section 3). It is bit-exact, so production
+output is unchanged; only speed moved. Rollback is one env var.
 
 | commit | what |
 |---|---|
 | `78284f41f` | `TREEBEARD_MOE_ROUTE_HIST` diagnostic; parked expert reuse |
 | `753b4f9cc` | `TREEBEARD_MOE_DOWN_PHASE_PROF`; corrected the cost model |
 | `a7dc94ce0` | deferred-reduce kernel; `TREEBEARD_MOE_ROUTE_FORCE`; quantize surgery |
+| `fda833103` | this handoff |
+| HEAD | default the deferred kernel ON + ship gates (see `git log -1`) |
 
 ---
 
@@ -86,7 +90,26 @@ known to be near-roofline streaming.
 
 ---
 
-## 3. The unshipped win - decide this first
+## 3. SHIPPED 2026-07-26 - deferred reduction is now the default
+
+**Status update:** this section originally read "unshipped, decide this first".
+It shipped on 2026-07-26 by user decision. `..._deferred_reduce_enabled()` now
+defaults ON; `GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE=0` is the rollback. Gates passed
+on the shipped build: `test-backend-ops -o MUL_MAT_ID` **721/721**, `-o MUL_MAT`
+**921/921**, greedy parity **4/4 identical** post-rebuild, production smoke clean.
+Record: `results/treebeard-moe-deferred-reduce-20260725/SHIPPED.md`.
+
+**One retraction:** the "+0.89% aggregate" quoted below is NOT evidence -
+per-round aggregates show B's mean equal to A1's, with A-to-A spread of 1.8%
+swamping the effect. Only **p50 +0.68%** separated (every B round above every A
+round, 9 rounds, no overlap, p ~ 0.012, drift-corrected). Use the p50 number.
+
+Note `treebeard-b70-ship.service` execs the build tree directly, so rebuilding
+`build-treebeard-single-wavefront` IS the production flip for this unit - there is
+no copy-install step in the way. Its alias still carries the stale build hash
+`7fffe5cb2` (stale since 2026-07-21); cosmetic, left alone, worth a packaging pass.
+
+## 3b. Original pre-ship assessment (kept for the record)
 
 `GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE=1` (default OFF), `mmvq.cpp`. Computes all
 eight experts' per-lane partial sums, then the eight reductions, then the ordered
@@ -107,13 +130,11 @@ call it decisively. What makes it credible is that three independent
 measurements agree in direction and magnitude, and parity is exact, so the
 downside of shipping is essentially zero.
 
-**To ship it** you still need: `test-backend-ops test -o MUL_MAT_ID -b SYCL0`
-and `-o MUL_MAT` (not run this session - the change is bit-exact by construction
-and passed 4/4 greedy parity, but the ladder asks for it); optionally a second
-ABA to tighten the number; then packaging by pin-by-hash + copy-install
-(`scripts/treebeard-rc5-package.sh`) and the unit flip with the rollback chain
-intact. **This is a user decision, not an agent one** - it is a production
-change worth <1%.
+**Done 2026-07-26:** both `test-backend-ops` gates run and clean, parity
+re-verified on the shipped build, default flipped ON, production restarted and
+smoked. A second ABA was NOT run - the p50 separation was already clean (no
+overlap across 9 rounds) and the change is bit-exact, so the marginal value was
+low. See section 3 and `SHIPPED.md`.
 
 ---
 
@@ -186,12 +207,11 @@ those and ignore the console summary.
 
 ## 6. The one-paragraph version
 
-MoE-down is done: it runs at ~82% of roofline, its cost is `43.5 us + 2.445 us/MB`,
+MoE-down is done and the one win in it has shipped (deferred reduction, default
+ON since 2026-07-26, rollback `GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE=0`). It runs at
+~82% of roofline, its cost is `43.5 us + 2.445 us/MB`,
 and expert reuse has a measured ceiling of 13.5% of the GEMV that no kernel in
-that family can reach - stop trying. One bit-exact win is sitting unshipped
-(`GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE=1`, +0.67% p50 on a real 12-agent ABA,
-4/4 parity) and needs a `test-backend-ops` run plus a human decision to package
-and flip. The remaining levers are fewer bytes - now unblocked by single-tensor
+that family can reach - stop trying. The remaining levers are fewer bytes - now unblocked by single-tensor
 GGUF surgery, but gated on a capability eval this box does not have - and the
 ~192 us pair-count floor, which is a subgroup-reduction question, not a
 bandwidth one. And whatever you measure, read the profiler's last window and

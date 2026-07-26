@@ -3289,12 +3289,19 @@ static void mul_mat_vec_q_moe_weighted_reorder_par8(
     }
 }
 
-// Default OFF pending an A/B. Bit-identical to the default path by construction,
-// so if it wins it can ship without a numerical gate.
+// Default ON as of 2026-07-26. Bit-identical to the serialized-reduction path by
+// construction, and gates passed at the serving shape (np12): GEMV -4.9%,
+// batched-bench screen +0.80%, 12-agent ABA at ctx 262144 +0.68% p50/agent with
+// every B round above every A round (9 rounds, no overlap), A-drift -0.35%,
+// greedy parity 4/4 identical at n_seqs>1.
+// NOTE the ABA aggregate figure is NOT evidence - within-arm aggregate spread
+// (1.8% A-to-A) swamps the effect. p50 is the number that separated.
+// Set GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE=0 to restore the serialized chain
+// (rollback, and the control arm for any future A/B).
 static bool ggml_sycl_moe_down_deferred_reduce_enabled() {
     static const bool enabled = []() {
         const char * env = getenv("GGML_SYCL_MOE_DOWN_DEFERRED_REDUCE");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     return enabled;
 }
