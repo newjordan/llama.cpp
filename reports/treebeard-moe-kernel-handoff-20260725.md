@@ -1,6 +1,19 @@
 # Handoff: the MoE expert kernel. Explicit instructions.
 
-Status: ACTIVE. Written 2026-07-25 after the GDN shape fix landed.
+Status: RESOLVED 2026-07-25. The section-2 number was measured (distinct = 39.54
+of 96 draws, upside 2.57x -> GO), the section-3 investigation was carried out,
+and the premise was falsified: the existing grouped reuse kernel provably
+executes at np12 and ties, an 8x workgroup sweep is flat, and MoE-down's cost
+scales with (token,slot) PAIR count, not with distinct-expert weight bytes.
+Project parked with a mechanism. Verdict, evidence and the re-ranked residual:
+`results/treebeard-moe-route-hist-20260725/decision.md`.
+The new top item is the ~188 us/op FIXED cost in MoE-down (50% of the op at
+np12) - an attribution problem, not a bandwidth one. Sections 5 (operating the
+box) and 6 (residual) below remain accurate; section 3's build plan does not.
+
+Original text follows.
+
+Written 2026-07-25 after the GDN shape fix landed.
 Branch `agent/treebeard-single-wavefront` @ `00dd22275`, pushed to `turbo-private`.
 Evidence: `results/treebeard-b70-gdn-out-flat-20260725/` (119 files).
 

@@ -5043,6 +5043,61 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
     return ok;
 }
 
+// Diagnostic (TREEBEARD_MOE_ROUTE_HIST=1): how many DISTINCT experts does a layer
+// actually touch per decode step? The default MoE-down path serializes the routed
+// experts per token with no cross-token reuse, so the entire upside of any
+// expert-reuse kernel is bounded by draws/distinct. Nothing else measures this.
+// Host-syncs on the ids buffer, so it is a measurement build only - never a perf arm.
+static void ggml_sycl_moe_route_hist(const ggml_tensor * ids, const ggml_tensor * src0,
+                                     int64_t n_tokens, int n_experts_used,
+                                     const queue_ptr & stream) {
+    static const bool enabled = []() {
+        const char * env = getenv("TREEBEARD_MOE_ROUTE_HIST");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+    const int n_as = (int) src0->ne[2];
+    if (n_as <= 0) {
+        return;
+    }
+
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids)).wait()));
+
+    std::vector<int> counts((size_t) n_as, 0);
+    int draws = 0;
+    int distinct = 0;
+    int top_count = 0;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int s = 0; s < n_experts_used; ++s) {
+            const int32_t e = *(const int32_t *) (ids_host.data() + t * ids->nb[1] + s * ids->nb[0]);
+            if (e < 0 || e >= n_as) {
+                continue;
+            }
+            ++draws;
+            if (counts[(size_t) e]++ == 0) {
+                ++distinct;
+            }
+            if (counts[(size_t) e] > top_count) {
+                top_count = counts[(size_t) e];
+            }
+        }
+    }
+
+    // Global monotonic call index; the aggregator buckets by tensor name and
+    // recovers per-layer step order from the emission order.
+    static std::atomic<long> call_index{0};
+    const long call = call_index.fetch_add(1, std::memory_order_relaxed);
+
+    fprintf(stderr,
+            "[treebeard-moe-route] call=%ld tensor=%s n_tokens=%d draws=%d"
+            " distinct=%d top_expert_count=%d\n",
+            call, src0->name, (int) n_tokens, draws, distinct, top_count);
+}
+
 // MoE down-projection specialization: compute routed expert dots, multiply by
 // routing weights in slot order, and write only the final token output.
 static bool ggml_sycl_mul_mat_id_mmvq_weighted(
@@ -5075,6 +5130,8 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
     const int       n_experts_used   = (int) n_ids_per_group;
     const int       nrows            = (int) src0->ne[1];
+
+    ggml_sycl_moe_route_hist(ids, src0, ne12, n_experts_used, stream);
 
     opt_for_reorder_id(&ctx, src0);
     const ggml_tensor_extra_gpu * src0_extra =
