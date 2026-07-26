@@ -1330,6 +1330,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
         case 7: reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols<7>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
         case 8: reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols<8>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
         case 12: reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols<12>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
+        case 16: reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols<16>(vx, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, stream); break;
         default: GGML_ABORT("unsupported ncols_dst=%d for Q8_0 reorder multi-col MMVQ", ncols_dst);
     }
 }
@@ -4572,14 +4573,30 @@ bool ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
     if (ncols_dst < 1 || ncols_dst > 16 || nrows_a < 1 || nrows_b < 1) {
         return false;
     }
+    // Serving-shape dual (qkv+z at ncols_dst=12/16): the fused dual kernel
+    // regressed ~28% TG (2026-07-26). Instead: one shared quantize (caller) +
+    // two proven single-matrix multi-col MMVQs. Wins activation quant reuse
+    // without the unequal-nrows dual-kernel pathology.
+    if (src0_type == GGML_TYPE_Q8_0) {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] shared-q path ncols_dst=%d rows_a=%d rows_b=%d (first entry)\n",
+                    ncols_dst, nrows_a, nrows_b);
+        }
+        reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
+            vx_a, vy, dst_a, ncols, nrows_a, ncols_dst,
+            (int) src1_col_stride_bytes, (int) dst_a_col_stride, stream);
+        reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
+            vx_b, vy, dst_b, ncols, nrows_b, ncols_dst,
+            (int) src1_col_stride_bytes, (int) dst_b_col_stride, stream);
+        return true;
+    }
+    // K-quants: keep fused dual kernel only for tiny ncols_dst (original regime).
+    if (ncols_dst > 4) {
+        return false;
+    }
     switch (src0_type) {
-        case GGML_TYPE_Q8_0:
-            launch_mul_mat_vec_q_dense_dual_mmvq_reorder<
-                reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
-                    vx_a, vx_b, vy, dst_a, dst_b, ncols, nrows_a, nrows_b,
-                    ncols_dst, src1_col_stride_bytes, dst_a_col_stride,
-                    dst_b_col_stride, stream);
-            return true;
         case GGML_TYPE_Q4_K:
             launch_mul_mat_vec_q_dense_dual_mmvq_reorder<
                 reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
