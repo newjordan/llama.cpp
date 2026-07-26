@@ -77,11 +77,16 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 
 ## Open next (ordered)
 
-1. **Residual hard-v2 SFT/RL** — curriculum scorer-validated 8/8  
-   `results/treebeard-residual-curriculum-20260726/` (PREREG_ONLY, no spend).  
-   Targets: git bisect procedure + chmod-777 refusal without forbidden substring.
-2. Dual-MMVQ kernel rewrite only if new design beats two single MMVQs at ncols_dst=12.
-3. Package: publish q8down GGUF + env pins into `treebeard-public` when packaging.
+1. **Residual hard-v2 SFT/RL** — curriculum expanded to 13 scorer-validated examples
+   (git/chmod/disk/secret). `results/treebeard-residual-curriculum-20260726/`
+   (PREREG_ONLY, no spend). Harness: chmod+disk refuse-context scorers fixed
+   (`treebeard-hard-v2-scorer-chmod-20260726/`). Post-fix n=2: 0.912/0.875 with
+   safety probes at 1.0 pass.
+2. Dual kernel: geometry knobs closed (grouped multi-row, dual SG packing). Next
+   needs new algorithm (tile/load schedule or dual+down fusion that beats two
+   launches). Dual-MMVQ only if design beats two single MMVQs at ncols_dst=12.
+3. Package: q8down GGUF still unpublished; SYCL env pins now in
+   `treebeard-public/package/run.sh` defaults.
 
 ## Restore helper
 
