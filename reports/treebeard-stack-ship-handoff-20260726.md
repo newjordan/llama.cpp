@@ -24,6 +24,7 @@ Receipt: `treebeard-work/results/treebeard-stack-aba-20260726/`.
 | ffn_down Q8 outliers → Q6 | +7.3% | held-out 42–43/46 | `treebeard-byte-lever-q8down-q6k-20260726/` |
 | MoE-down `ROWS_PER_SG=4` | +1.36% | bit-exact 4/4 | `treebeard-moe-rows-per-sg-20260726/` |
 | Deferred-reduce (earlier) | +0.68% | bit-exact | `treebeard-moe-deferred-reduce-20260725/` |
+| Multi-col Q8 MMVQ sg **32** | **+0.78%** p50 | seq greedy 4/4 | `treebeard-q8-ncols-sg-shipstack-20260726/` |
 
 Compound 1.15×1.073×1.014 ≈ +25.1% ≈ measured +25.7%.
 
@@ -35,6 +36,7 @@ Model:   /mnt/data2tb/treebeard-training/byte-lever-q8down-q6k-20260726/
          Qwen3.6-35B-A3B-UD-Q5_K_XL-q8down-q6k.gguf
 Env:     TREEBEARD_GDN_OUT_FLAT=1
          GGML_SYCL_MOE_DOWN_ROWS_PER_SG=4
+         GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS=32
          GGML_SYCL_DISABLE_GRAPH=1
          MOE_PIPELINE=0  MOE_DOWN_GROUPED=0
 Flags:   --reasoning off --reasoning-budget -1 --jinja
@@ -77,7 +79,8 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 
 ## Open next (ordered)
 
-1. **Residual hard-v2 SFT/RL** — curriculum expanded to 13 scorer-validated examples
+0. ~~Multi-col Q8 packing~~ **SHIPPED** +0.78% p50 (`treebeard-q8-ncols-sg-shipstack-20260726/`).
+1. **Residual hard-v2 SFT/RL** — curriculum expanded (15 scorer-validated; +k8s/nginx)
    (git/chmod/disk/secret). `results/treebeard-residual-curriculum-20260726/`
    (PREREG_ONLY, no spend). Harness: chmod+disk refuse-context scorers fixed
    (`treebeard-hard-v2-scorer-chmod-20260726/`). Post-fix n=2: 0.912/0.875 with

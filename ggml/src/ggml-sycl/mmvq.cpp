@@ -1178,25 +1178,20 @@ static int ggml_sycl_q8_mmvq_subgroups() {
 }
 
 static int ggml_sycl_q8_mmvq_ncols_subgroups() {
-    // Workgroup packing for the multi-column (ncols_dst > 1) Q8_0 reorder MMVQ
-    // launchers. Defaults to the historical 16, so this is behavior-preserving
-    // until an arm is selected explicitly.
-    //
-    // Why this exists: ggml_sycl_q8_mmvq_subgroups() (default 32, measured
-    // +0.9% tg128 on 2026-07-20) only reaches the ncols_dst=1 launcher, which
-    // is the shape llama-bench tg128 exercises. Production np12 decode carries
-    // one token per active slot, so ne11 = active slots and every dense Q8_0
-    // projection (attn_qkv, attn_gate, ssm_out, ffn_*_shexp, output) lands on
-    // the multi-column path below instead. That path was never swept.
+    // Workgroup packing for multi-column (ncols_dst > 1) Q8_0 reorder MMVQ.
+    // Default 32: ship-stack re-sweep 2026-07-26 under GDN+q8down+rps4 measured
+    // +0.47% batched-bench S_TG (3 reps, no overlap vs 16) and +0.78% p50 on
+    // 12-agent ABA at ctx 262144 (A-drift +0.04%). Sequential greedy 4/4
+    // identical. Aligns multi-col packing with single-col Q8 MMVQ default 32.
     //
     // Override: GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS=1|2|4|8|16|32|64.
     // 64 * WARP_SIZE(16) = 1024 = the B70 max workgroup size, so 64 is the cap.
     static const int n = []() {
         const char * env   = getenv("GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS");
-        const int    value = env == nullptr ? 16 : atoi(env);
+        const int    value = env == nullptr ? 32 : atoi(env);
         switch (value) {
             case 1: case 2: case 4: case 8: case 16: case 32: case 64: return value;
-            default: return 16;
+            default: return 32;
         }
     }();
     return n;
