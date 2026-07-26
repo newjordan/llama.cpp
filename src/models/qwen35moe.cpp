@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -481,8 +483,23 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs]
+    //
+    // Collapse to 2D rather than 3D. attn_out_norm is contiguous, so [X, T, S] and [X, T*S]
+    // are byte-identical and the projection below computes the same dot products either way.
+    // The 3D form is much slower once n_seqs > 1: src1 then has ne2 = n_seqs, and the SYCL
+    // mul_mat batch loop (ggml-sycl.cpp, "for i0 < ne13*ne12") issues one dispatch per
+    // sequence, re-reading the whole ssm_out weight n_seqs times per layer. Flattening turns
+    // those n_seqs GEMVs into a single ne11 = n_tokens*n_seqs GEMM that reads the weight once
+    // and lands on the reorder MMVQ multi-column path.
+    // A/B gate: TREEBEARD_GDN_OUT_FLAT=0 restores the historical 3D form.
+    static const bool gdn_out_flat = []() {
+        const char * env = getenv("TREEBEARD_GDN_OUT_FLAT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    ggml_tensor * final_output = gdn_out_flat
+        ? ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs)
+        : ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection
