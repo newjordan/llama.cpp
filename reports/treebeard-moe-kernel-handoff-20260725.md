@@ -1,6 +1,12 @@
 # Handoff: the MoE expert kernel. Explicit instructions.
 
-Status: RESOLVED 2026-07-25. The section-2 number was measured (distinct = 39.54
+Status: RESOLVED 2026-07-25. SUPERSEDED BY
+`reports/treebeard-moe-handoff-20260726.md` - read that first.
+NOTE: the absolute us/op figures quoted below come from the profiler's FIRST
+50-eval window, which is warmup, and overstate MoE-down by ~55% (239.86 us/op at
+np12, not 371.93). The SHARES are unaffected. See the new handoff, section 1.
+
+The section-2 number was measured (distinct = 39.54
 of 96 draws, upside 2.57x -> GO), the section-3 investigation was carried out,
 and the premise was falsified: the existing grouped reuse kernel provably
 executes at np12 and ties, an 8x workgroup sweep is flat, and MoE-down's cost
