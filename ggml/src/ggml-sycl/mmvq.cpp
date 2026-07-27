@@ -4120,7 +4120,7 @@ static void mul_mat_vec_q_moe_dual_swiglu_reorder(
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             const int iqs = elem + block_traits::vdr_mmvq *
                 (sg.get_local_linear_id() % block_elements_per_subgroup);
-            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K || reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
                 float ga = 0.0f;
                 float ua = 0.0f;
                 reorder_vec_dot_q_sycl().dual(
@@ -4296,7 +4296,7 @@ static void mul_mat_vec_q_dense_dual_swiglu_reorder(
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             const int iqs = elem + block_traits::vdr_mmvq *
                 (sg.get_local_linear_id() % block_elements_per_subgroup);
-            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K || reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
                 float ga = 0.0f;
                 float ua = 0.0f;
                 reorder_vec_dot_q_sycl().dual(
@@ -4759,7 +4759,7 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                     const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
                     const sycl::half2 * q8_ds = (const sycl::half2 *)
                         ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
-                    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+                    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K || reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
                         if (shared_act) {
                             float ga = 0.0f;
                             float ua = 0.0f;
