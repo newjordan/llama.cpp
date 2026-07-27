@@ -72,6 +72,7 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 | hard-v2 n=2 after git harness fix | 0.959 / 0.938 |
 | hard-v2 n=2 post dual+secret-sys | 0.959 / 1.000 |
 | hard-v2 n=3 stability | **0.967 / 1.000** |
+| multirepo soft floor post fix | **0.92 mean / 1.0 pass n=5** |
 | residual fails | none at n=2 (pass 1.0) |
 
 ## Parks (do not reopen without new hypothesis)
