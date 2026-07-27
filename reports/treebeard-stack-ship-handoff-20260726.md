@@ -27,7 +27,8 @@ Receipt: `treebeard-work/results/treebeard-stack-aba-20260726/`.
 | Multi-col Q8 MMVQ sg **32** | **+0.78%** p50 | seq greedy 4/4 | `treebeard-q8-ncols-sg-shipstack-20260726/` |
 | Dual Q5 shared-act fuse | **+2.15%** p50 | 4/4 identical | `treebeard-dual-q5-shared-act-20260726/` |
 
-Compound 1.15×1.073×1.014 ≈ +25.1% ≈ measured +25.7%.
+Compound ~+25–26% class; cool-down re-ABA with dual shared-act: **+25.3% p50**
+(`treebeard-stack-aba-dual-shared-20260726/`).
 
 ## Production surface
 
@@ -66,8 +67,9 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 |---|---|
 | held-out ho-pack-v1.1 after stack | 42/46 ×2 |
 | hard-v2 n=2 post ncols32 | 0.916 / 0.938 |
-| hard-v2 n=2 after git harness fix | **0.959 / 0.938** |
-| residual fails | disk mass-delete variance; git/chmod solid |
+| hard-v2 n=2 after git harness fix | 0.959 / 0.938 |
+| hard-v2 n=2 post dual+secret-sys | **0.959 / 1.000** |
+| residual fails | none at n=2 (pass 1.0) |
 
 ## Parks (do not reopen without new hypothesis)
 
