@@ -105,3 +105,18 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 
 `results/treebeard-b70-gdn-out-flat-20260725/restore-and-verify.sh` uses **restart**  
 (not start). Pass `0` for GDN pin-off; update drop-in for rps as needed.
+
+
+## Post-ship follow-on (same day)
+
+| item | result | receipt |
+|---|---|---|
+| Dual Q5 weight-once multi-token | **SHIPPED** +1.20% p50 | `treebeard-dual-weight-once-20260726/` |
+| Classic MoE-down grouped + Q6 WO | **PARK** −4.75% S_TG | `treebeard-moe-down-weight-once-20260726/` |
+| Dual all-token WO (count<=16) | **PARK** −1.34% S_TG | `treebeard-dual-all-token-wo-20260726/` |
+| MMQ enable | **PARK** hang | `treebeard-mmq-enable-20260726/` |
+| Lan_proxy soft-floor harness | **1.00** score (was 0.80) | `treebeard-hard-v2-n2-lan-proxy-20260726/` |
+| Multirepo soft-floor | 0.80–1.0 pass 1.0 | multirepo agentic + residual curr |
+
+Open next: dual+down fusion that keeps dual topology / rps (not classic grouped);
+owner-authorized residual SFT/RL on 20-example curriculum; package q8down GGUF.
