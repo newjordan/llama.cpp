@@ -3719,13 +3719,31 @@ static void mul_mat_vec_q_moe_weighted_grouped_reorder(
                 for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
                     const int iqs = elem + block_traits::vdr_mmvq *
                         (sg.get_local_linear_id() % block_elements_per_subgroup);
-                    for (int j = 0; j < tc; ++j) {
-                        const int8_t * q8_1_quant_ptr =
-                            (const int8_t *) vys[j] + iby * QK8_1;
-                        const sycl::half2 * q8_1_ds_ptr = (const sycl::half2 *)
-                            ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
-                        partial[j] += reorder_vec_dot_q_sycl()(
-                            vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                    // Weight-once multi-token: dequant expert weight once per
+                    // (row,block,iqs), then dot each token's Q8 activation.
+                    // Mirrors dual Q5 weight-once (2026-07-26). Q4/Q5/Q6_K.
+                    if constexpr (
+                            reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K ||
+                            reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q6_K) {
+                        const auto w = reorder_vec_dot_q_sycl().load_weight(
+                            vx, bx_offset, d_offset, iqs);
+                        for (int j = 0; j < tc; ++j) {
+                            const int8_t * q8_1_quant_ptr =
+                                (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * q8_1_ds_ptr = (const sycl::half2 *)
+                                ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                                w, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                        }
+                    } else {
+                        for (int j = 0; j < tc; ++j) {
+                            const int8_t * q8_1_quant_ptr =
+                                (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * q8_1_ds_ptr = (const sycl::half2 *)
+                                ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += reorder_vec_dot_q_sycl()(
+                                vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                        }
                     }
                 }
             }
@@ -3908,11 +3926,24 @@ static void mul_mat_vec_q_moe_grouped_reorder(
 #pragma unroll
             for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
                 const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
-                // one weight-block fetch feeds every routed token in the chunk
-                for (int j = 0; j < tc; ++j) {
-                    const int8_t *      q8_1_quant_ptr = (const int8_t *) vys[j] + iby * QK8_1;
-                    const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
-                    partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                // Weight-once multi-token: one dequant feeds every token in chunk.
+                if constexpr (
+                        reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K ||
+                        reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q6_K) {
+                    const auto w = reorder_vec_dot_q_sycl().load_weight(
+                        vx, bx_offset, d_offset, iqs);
+                    for (int j = 0; j < tc; ++j) {
+                        const int8_t *      q8_1_quant_ptr = (const int8_t *) vys[j] + iby * QK8_1;
+                        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                        partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                            w, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                    }
+                } else {
+                    for (int j = 0; j < tc; ++j) {
+                        const int8_t *      q8_1_quant_ptr = (const int8_t *) vys[j] + iby * QK8_1;
+                        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                        partial[j] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                    }
                 }
             }
         }
@@ -4672,6 +4703,18 @@ static bool ggml_sycl_moe_dual_shared_act_enabled() {
     return enabled;
 }
 
+// All-token weight-once: one dequant per (row,block,iqs) for every token of the
+// expert (count<=16), not per dual_tchunk. PARKED default OFF after -1.34% S_TG
+// (register pressure on partial[16]). Enable for experiments:
+// GGML_SYCL_ENABLE_MOE_DUAL_ALL_TOKEN_WO=1.
+static bool ggml_sycl_moe_dual_all_token_wo_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MOE_DUAL_ALL_TOKEN_WO");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 template <typename reorder_vec_dot_q_sycl, int dual_tchunk>
 static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const void * __restrict__ vx_gate_base,
@@ -4683,7 +4726,7 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const size_t gate_expert_stride, const size_t up_expert_stride,
     const size_t dst_row_stride, const size_t src1_row_stride,
     const size_t src1_token_stride, const size_t dst_token_stride,
-    const int rows_per_sg, const int shared_act,
+    const int rows_per_sg, const int shared_act, const int all_token_wo,
     const sycl::nd_item<3> & item_ct1) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
@@ -4720,6 +4763,76 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     constexpr int block_elements_per_subgroup =
         block_traits::qi / block_traits::vdr_mmvq;
     const int nblocks = nrows * blocks_per_row;
+
+    // All-token weight-once (Q5 shared_act): when an expert's route count fits in
+    // k_all_tok, dequant gate/up once per (row,block,iqs) for EVERY token in the
+    // expert group - not once per dual_tchunk. Prior weight-once still reloaded
+    // weights for each tchunk pass over the same blocks. Cap covers np12 decode
+    // (count typically <=12); larger groups fall back to tchunk path.
+    constexpr int k_all_tok = 16;
+    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+    if (shared_act && all_token_wo && count > 0 && count <= k_all_tok) {
+        const char * vys[k_all_tok];
+        float * dsts[k_all_tok];
+        for (int j = 0; j < count; ++j) {
+            const int32_t pair = pairs[start + j];
+            const int token = pair >> 16;
+            const int slot  = pair & 0xffff;
+            vys[j] = (const char *) vy_base + (size_t) token * src1_token_stride +
+                     (size_t) slot * src1_row_stride;
+            dsts[j] = (float *) ((char *) dst_base +
+                                 (size_t) token * dst_token_stride +
+                                 (size_t) slot * dst_row_stride);
+        }
+        for (int r = 0; r < rps; ++r) {
+            const int row = row0 + r;
+            if (row >= nrows) {
+                break;
+            }
+            float gate_partial[k_all_tok];
+            float up_partial[k_all_tok];
+            for (int j = 0; j < count; ++j) {
+                gate_partial[j] = 0.0f;
+                up_partial[j]   = 0.0f;
+            }
+            for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+                 i < blocks_per_row; i += blocks_per_subgroup) {
+                const int ibx = row * blocks_per_row + i;
+                const auto bx = block_type::get_block_offset(ibx, nblocks);
+                const auto d  = block_type::get_d_offset(nrows, ncols, ibx);
+                const int iby = i * block_type::block_to_q8_1_ratio();
+#pragma unroll
+                for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                    const int iqs = elem + block_traits::vdr_mmvq *
+                        (sg.get_local_linear_id() % block_elements_per_subgroup);
+                    const auto w_gate = reorder_vec_dot_q_sycl().load_weight(
+                        vx_gate, bx, d, iqs);
+                    const auto w_up = reorder_vec_dot_q_sycl().load_weight(
+                        vx_up, bx, d, iqs);
+                    for (int j = 0; j < count; ++j) {
+                        const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                        const sycl::half2 * q8_ds = (const sycl::half2 *)
+                            ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                        gate_partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                            w_gate, q8, q8_ds, iqs);
+                        up_partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                            w_up, q8, q8_ds, iqs);
+                    }
+                }
+            }
+            for (int j = 0; j < count; ++j) {
+                const float gate = sycl::reduce_over_group(
+                    sg, gate_partial[j], std::plus<>());
+                const float up = sycl::reduce_over_group(
+                    sg, up_partial[j], std::plus<>());
+                if (sg.leader()) {
+                    dsts[j][row] = (gate / (1.0f + sycl::native::exp(-gate))) * up;
+                }
+            }
+        }
+        return;
+    }
+    } // if constexpr Q5_K
 
     for (int t0 = 0; t0 < count; t0 += dual_tchunk) {
         const int tc = sycl::min(count - t0, dual_tchunk);
@@ -4843,14 +4956,15 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const int rows_per_sg   = ggml_sycl_moe_dual_rows_per_sg();
     const int dual_tchunk   = ggml_sycl_moe_dual_tchunk();
     const int shared_act    = ggml_sycl_moe_dual_shared_act_enabled() ? 1 : 0;
+    const int all_token_wo  = ggml_sycl_moe_dual_all_token_wo_enabled() ? 1 : 0;
     const int block_num_y   = ceil_div(nrows, num_subgroups * rows_per_sg);
     const sycl::range<3> block_nums(1, (unsigned) max_groups, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
     {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            fprintf(stderr, "[treebeard-moe-dual-grouped-launch] max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tchunk=%d shared_act=%d (first entry)\n",
-                    max_groups, nrows, ncols, num_subgroups, rows_per_sg, dual_tchunk, shared_act);
+            fprintf(stderr, "[treebeard-moe-dual-grouped-launch] max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tchunk=%d shared_act=%d all_token_wo=%d (first entry)\n",
+                    max_groups, nrows, ncols, num_subgroups, rows_per_sg, dual_tchunk, shared_act, all_token_wo);
         }
     }
     stream->submit([&](sycl::handler & cgh) {
@@ -4864,7 +4978,7 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                             ncols, nrows, n_as, gate_expert_stride,
                             up_expert_stride, dst_row_stride, src1_row_stride,
                             src1_token_stride, dst_token_stride, rows_per_sg,
-                            shared_act, item);
+                            shared_act, all_token_wo, item);
                 } else {
                     mul_mat_vec_q_moe_dual_swiglu_grouped_reorder<
                         reorder_vec_dot_q_sycl, 4>(
@@ -4872,7 +4986,7 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                             ncols, nrows, n_as, gate_expert_stride,
                             up_expert_stride, dst_row_stride, src1_row_stride,
                             src1_token_stride, dst_token_stride, rows_per_sg,
-                            shared_act, item);
+                            shared_act, all_token_wo, item);
                 }
             });
     });
