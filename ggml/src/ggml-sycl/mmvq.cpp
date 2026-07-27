@@ -3860,6 +3860,284 @@ bool ggml_sycl_mul_mat_vec_q_id_weighted_grouped_reorder(
     }
 }
 
+// Dual-topology expert-grouped MoE-down (opt-in).
+// Classic grouped put ALL experts in one row-owning WG and lost ROWS_PER_SG.
+// This matches dual SwiGLU launch geometry: one WG per active expert, multi-token
+// weight-once, rows_per_sg ownership, then a cheap ordered slot reduce.
+// contrib layout: [n_tokens * n_experts_used * nrows] floats, zeroed by caller.
+template <typename reorder_vec_dot_q_sycl>
+static void mul_mat_vec_q_moe_weighted_expert_grouped_gemv(
+    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    const float * __restrict__ weights, float * __restrict__ contrib,
+    const int32_t * __restrict__ scratch,
+    const int ncols, const int nrows, const int n_experts_used, const int n_as,
+    const int rows_per_sg,
+    const size_t expert_weight_stride, const size_t src1_row_stride,
+    const size_t weights_slot_stride, const size_t src1_token_stride,
+    const size_t weights_token_stride,
+    const sycl::nd_item<3> & item_ct1) {
+    using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
+    using block_traits = typename block_type::traits;
+
+    const int32_t * offsets  = scratch;
+    const int32_t * active   = scratch + n_as + 1;
+    const int32_t   n_active = scratch[2 * n_as + 1];
+    const int32_t * pairs    = scratch + 2 * n_as + 2;
+    const int group = item_ct1.get_group(1);
+    if (group >= n_active) {
+        return;
+    }
+
+    const int expert = active[group];
+    const int start  = offsets[expert];
+    const int count  = offsets[expert + 1] - start;
+    const auto sg    = item_ct1.get_sub_group();
+    const int sg_range = (int) sg.get_group_linear_range();
+    const int rps      = rows_per_sg < 1 ? 1 : rows_per_sg;
+    const int row0     = item_ct1.get_group(2) * (sg_range * rps) +
+                         sg.get_group_linear_id() * rps;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    const char * vx = (const char *) vx_base + (size_t) expert * expert_weight_stride;
+    const int blocks_per_row = ncols / block_traits::qk;
+    constexpr int blocks_per_subgroup =
+        ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup =
+        block_traits::qi / block_traits::vdr_mmvq;
+    const int nblocks = nrows * blocks_per_row;
+
+    for (int t0 = 0; t0 < count; t0 += MMID_GROUP_TCHUNK) {
+        const int tc = sycl::min(count - t0, MMID_GROUP_TCHUNK);
+        const char * vys[MMID_GROUP_TCHUNK];
+        int tokens[MMID_GROUP_TCHUNK];
+        int slots[MMID_GROUP_TCHUNK];
+        for (int j = 0; j < tc; ++j) {
+            const int32_t pair = pairs[start + t0 + j];
+            tokens[j] = pair >> 16;
+            slots[j]  = pair & 0xffff;
+            vys[j] = (const char *) vy_base +
+                (size_t) tokens[j] * src1_token_stride +
+                (size_t) slots[j] * src1_row_stride;
+        }
+
+        for (int r = 0; r < rps; ++r) {
+            const int row = row0 + r;
+            if (row >= nrows) {
+                break;
+            }
+            float partial[MMID_GROUP_TCHUNK] = { 0.0f };
+            for (int i = sg.get_local_linear_id() / block_elements_per_subgroup;
+                 i < blocks_per_row; i += blocks_per_subgroup) {
+                const int ibx = row * blocks_per_row + i;
+                const auto bx = block_type::get_block_offset(ibx, nblocks);
+                const auto d  = block_type::get_d_offset(nrows, ncols, ibx);
+                const int iby = i * block_type::block_to_q8_1_ratio();
+#pragma unroll
+                for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                    const int iqs = elem + block_traits::vdr_mmvq *
+                        (sg.get_local_linear_id() % block_elements_per_subgroup);
+                    if constexpr (
+                            reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K ||
+                            reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q6_K) {
+                        const auto w = reorder_vec_dot_q_sycl().load_weight(
+                            vx, bx, d, iqs);
+                        for (int j = 0; j < tc; ++j) {
+                            const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * q8_ds = (const sycl::half2 *)
+                                ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                                w, q8, q8_ds, iqs);
+                        }
+                    } else {
+                        for (int j = 0; j < tc; ++j) {
+                            const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * q8_ds = (const sycl::half2 *)
+                                ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                            partial[j] += reorder_vec_dot_q_sycl()(
+                                vx, bx, d, q8, q8_ds, iqs);
+                        }
+                    }
+                }
+            }
+            for (int j = 0; j < tc; ++j) {
+                const float expert_value =
+                    sycl::reduce_over_group(sg, partial[j], std::plus<>());
+                if (sg.leader()) {
+                    const float weight = *(const float *) ((const char *) weights +
+                        (size_t) tokens[j] * weights_token_stride +
+                        (size_t) slots[j] * weights_slot_stride);
+                    volatile float weighted = expert_value * weight;
+                    // contrib[token][slot][row]
+                    contrib[((size_t) tokens[j] * n_experts_used + slots[j]) * nrows + row] =
+                        weighted;
+                }
+            }
+        }
+    }
+}
+
+static void moe_down_ordered_slot_reduce(
+    const float * __restrict__ contrib, float * __restrict__ dst_base,
+    const int nrows, const int n_experts_used, const int n_tokens,
+    const size_t dst_token_stride, const int rows_per_sg,
+    const sycl::nd_item<3> & item_ct1) {
+    const auto sg = item_ct1.get_sub_group();
+    const int sg_range = (int) sg.get_group_linear_range();
+    const int rps = rows_per_sg < 1 ? 1 : rows_per_sg;
+    const int token = item_ct1.get_group(0);
+    if (token >= n_tokens) {
+        return;
+    }
+    const int row0 = item_ct1.get_group(2) * (sg_range * rps) +
+                     sg.get_group_linear_id() * rps;
+    if (row0 >= nrows || !sg.leader()) {
+        return;
+    }
+    float * dst = (float *) ((char *) dst_base + (size_t) token * dst_token_stride);
+    for (int r = 0; r < rps; ++r) {
+        const int row = row0 + r;
+        if (row >= nrows) {
+            break;
+        }
+        float reduced = 0.0f;
+#pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            if (slot >= n_experts_used) {
+                break;
+            }
+            volatile float w =
+                contrib[((size_t) token * n_experts_used + slot) * nrows + row];
+            reduced += w;
+        }
+        if (n_experts_used > 8) {
+            for (int slot = 8; slot < n_experts_used; ++slot) {
+                volatile float w =
+                    contrib[((size_t) token * n_experts_used + slot) * nrows + row];
+                reduced += w;
+            }
+        }
+        dst[row] = reduced;
+    }
+}
+
+template <typename reorder_vec_dot_q_sycl>
+static void launch_mul_mat_vec_q_moe_weighted_expert_grouped(
+    const void * vx_base, const void * vy, const float * weights,
+    const int32_t * scratch, float * contrib, float * dst_base,
+    const int ncols, const int nrows, const int n_experts_used,
+    const int n_tokens, const int n_as, const int max_groups,
+    const size_t expert_weight_stride, const size_t src1_row_stride,
+    const size_t weights_slot_stride, const size_t src1_token_stride,
+    const size_t weights_token_stride, const size_t dst_token_stride,
+    dpct::queue_ptr stream) {
+    const int num_subgroups = ggml_sycl_mmid_wg_subgroups(nrows);
+    const int rows_per_sg   = ggml_sycl_moe_down_rows_per_sg();
+    const int block_num_y   = ceil_div(nrows, num_subgroups * rows_per_sg);
+    {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            fprintf(stderr,
+                    "[treebeard-moe-down-expert-grouped] max_groups=%d nrows=%d ncols=%d "
+                    "sg=%d rps=%d tokens=%d experts_used=%d (first entry)\n",
+                    max_groups, nrows, ncols, num_subgroups, rows_per_sg,
+                    n_tokens, n_experts_used);
+        }
+    }
+    // Phase 1: expert-grouped weight-once GEMV into contrib
+    {
+        const sycl::range<3> block_nums(1, (unsigned) max_groups, (unsigned) block_num_y);
+        const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_weighted_expert_grouped_gemv<reorder_vec_dot_q_sycl>(
+                        vx_base, vy, weights, contrib, scratch, ncols, nrows,
+                        n_experts_used, n_as, rows_per_sg, expert_weight_stride,
+                        src1_row_stride, weights_slot_stride, src1_token_stride,
+                        weights_token_stride, item);
+                });
+        });
+    }
+    // Phase 2: ordered slot reduce per (token, row)
+    {
+        const sycl::range<3> block_nums(
+            (unsigned) n_tokens, 1, (unsigned) block_num_y);
+        const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    moe_down_ordered_slot_reduce(
+                        contrib, dst_base, nrows, n_experts_used, n_tokens,
+                        dst_token_stride, rows_per_sg, item);
+                });
+        });
+    }
+}
+
+bool ggml_sycl_mul_mat_vec_q_id_weighted_expert_grouped_reorder(
+    enum ggml_type src0_type, const void * vx_base, const void * vy,
+    const int32_t * ids_dev, const float * weights, int32_t * scratch,
+    float * contrib, float * dst_base, int ncols, int nrows,
+    int n_experts_used, int n_as, size_t expert_weight_stride,
+    size_t src1_row_stride, size_t weights_slot_stride, int n_tokens,
+    int ids_row_stride, size_t src1_token_stride, size_t weights_token_stride,
+    size_t dst_token_stride, dpct::queue_ptr stream) {
+    if (n_as > MMID_GROUP_WG || n_tokens > 0xffff ||
+        n_experts_used > 0xffff || n_tokens < 1 || contrib == nullptr) {
+        return false;
+    }
+    switch (src0_type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+
+    launch_mmid_group_pairs(
+        ids_dev, scratch, n_tokens, n_experts_used, ids_row_stride, n_as, stream);
+
+    // Zero contrib so unused slots do not poison the ordered sum.
+    const size_t n_contrib =
+        (size_t) n_tokens * (size_t) n_experts_used * (size_t) nrows;
+    stream->memset(contrib, 0, n_contrib * sizeof(float));
+
+    const int max_groups = std::min(n_tokens * n_experts_used, n_as);
+    switch (src0_type) {
+        case GGML_TYPE_Q4_K:
+            launch_mul_mat_vec_q_moe_weighted_expert_grouped<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
+                vx_base, vy, weights, scratch, contrib, dst_base, ncols, nrows,
+                n_experts_used, n_tokens, n_as, max_groups, expert_weight_stride,
+                src1_row_stride, weights_slot_stride, src1_token_stride,
+                weights_token_stride, dst_token_stride, stream);
+            return true;
+        case GGML_TYPE_Q5_K:
+            launch_mul_mat_vec_q_moe_weighted_expert_grouped<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K>>(
+                vx_base, vy, weights, scratch, contrib, dst_base, ncols, nrows,
+                n_experts_used, n_tokens, n_as, max_groups, expert_weight_stride,
+                src1_row_stride, weights_slot_stride, src1_token_stride,
+                weights_token_stride, dst_token_stride, stream);
+            return true;
+        case GGML_TYPE_Q6_K:
+            launch_mul_mat_vec_q_moe_weighted_expert_grouped<
+                reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K>>(
+                vx_base, vy, weights, scratch, contrib, dst_base, ncols, nrows,
+                n_experts_used, n_tokens, n_as, max_groups, expert_weight_stride,
+                src1_row_stride, weights_slot_stride, src1_token_stride,
+                weights_token_stride, dst_token_stride, stream);
+            return true;
+        default:
+            return false;
+    }
+}
+
 template <typename reorder_vec_dot_q_sycl>
 static void mul_mat_vec_q_moe_grouped_reorder(
     const void * __restrict__ vx_base, const void * __restrict__ vy_base,

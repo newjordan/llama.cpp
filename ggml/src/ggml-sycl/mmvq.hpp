@@ -254,6 +254,33 @@ bool ggml_sycl_mul_mat_vec_q_id_weighted_reorder(
     size_t             dst_token_stride,
     dpct::queue_ptr    stream);
 
+// Dual-topology expert-grouped MoE-down (opt-in via
+// GGML_SYCL_ENABLE_MOE_DOWN_EXPERT_GROUPED). One WG per active expert, multi-
+// token weight-once, rows_per_sg ownership, global contrib + ordered reduce.
+// contrib must hold n_tokens * n_experts_used * nrows floats (zeroed by callee).
+bool ggml_sycl_mul_mat_vec_q_id_weighted_expert_grouped_reorder(
+    enum ggml_type     src0_type,
+    const void *       vx_base,
+    const void *       vy,
+    const int32_t *    ids_dev,
+    const float *      weights,
+    int32_t *          scratch,
+    float *            contrib,
+    float *            dst_base,
+    int                ncols,
+    int                nrows,
+    int                n_experts_used,
+    int                n_as,
+    size_t             expert_weight_stride,
+    size_t             src1_row_stride,
+    size_t             weights_slot_stride,
+    int                n_tokens,
+    int                ids_row_stride,
+    size_t             src1_token_stride,
+    size_t             weights_token_stride,
+    size_t             dst_token_stride,
+    dpct::queue_ptr    stream);
+
 // Batched ordered down projection with cross-token expert weight reuse. A
 // routing pre-pass groups token/slot pairs by expert; the main row workgroup
 // retains weighted contributions in local memory and reduces slots in their

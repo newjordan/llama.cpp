@@ -5297,6 +5297,47 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
     const int    ids_row_stride    = (int) (ids->nb[1] / sizeof(int32_t));
 
     if (use_reorder) {
+        // Dual-topology expert-grouped down: keeps rows_per_sg + weight-once.
+        // Opt-in only (classic all-experts-in-WG grouped remains separate park).
+        static const bool enable_expert_grouped = []() {
+            const char * enable = getenv("GGML_SYCL_ENABLE_MOE_DOWN_EXPERT_GROUPED");
+            return enable != nullptr && std::atoi(enable) != 0;
+        }();
+        if (enable_expert_grouped && ne12 >= 4) {
+            const int n_as = (int) src0->ne[2];
+            const size_t n_contrib =
+                (size_t) ne12 * (size_t) n_experts_used * (size_t) nrows;
+            // Guard pathological prefill sizes (e.g. 192 tokens * 8 * 2048).
+            if (n_contrib <= (size_t) 16 * 1024 * 1024) {
+                ggml_sycl_pool_alloc<int32_t> scratch(
+                    ctx.pool(), (size_t) (2 * n_as + 2 + ne12 * n_experts_used));
+                ggml_sycl_pool_alloc<float> contrib(ctx.pool(), n_contrib);
+                if (ggml_sycl_mul_mat_vec_q_id_weighted_expert_grouped_reorder(
+                        src0->type, src0->data, src1_ddq,
+                        (const int32_t *) ids->data, (const float *) weights->data,
+                        scratch.get(), contrib.get(), (float *) dst->data,
+                        (int) ne10, nrows, n_experts_used, n_as, src0->nb[2],
+                        src1_row_stride, weights->nb[1], (int) ne12, ids_row_stride,
+                        src1_token_stride, weights->nb[2], dst->nb[1], stream)) {
+                    static const bool trace_eg = []() {
+                        const char * env = getenv("GGML_SYCL_MOE_DOWN_REDUCE_DEBUG");
+                        return env != nullptr && std::atoi(env) != 0;
+                    }();
+                    static std::atomic<int> once{0};
+                    if (trace_eg && once.fetch_add(1) < 4) {
+                        fprintf(stderr,
+                                "[treebeard-moe-down-reduce] event=expert-grouped-hit"
+                                " rows=%d experts=%d tokens=%" PRId64 "\n",
+                                nrows, n_experts_used, ne12);
+                    }
+                    if (phase_prof) {
+                        ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+                        ggml_sycl_moe_phase_report(ne12);
+                    }
+                    return true;
+                }
+            }
+        }
         static const bool enable_grouped = []() {
             const char * enable = getenv("GGML_SYCL_ENABLE_MOE_DOWN_GROUPED");
             const char * disable_all = getenv("GGML_SYCL_DISABLE_MMID_GROUPED");
