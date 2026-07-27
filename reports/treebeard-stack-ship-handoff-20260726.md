@@ -67,6 +67,7 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 | gate | result |
 |---|---|
 | held-out ho-pack-v1.1 after stack | 42/46 ×2 |
+| held-out post dual shared-act | **43/46 ×2** |
 | hard-v2 n=2 post ncols32 | 0.916 / 0.938 |
 | hard-v2 n=2 after git harness fix | 0.959 / 0.938 |
 | hard-v2 n=2 post dual+secret-sys | 0.959 / 1.000 |
