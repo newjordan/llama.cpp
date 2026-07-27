@@ -4120,8 +4120,17 @@ static void mul_mat_vec_q_moe_dual_swiglu_reorder(
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             const int iqs = elem + block_traits::vdr_mmvq *
                 (sg.get_local_linear_id() % block_elements_per_subgroup);
-            gate_partial += reorder_vec_dot_q_sycl()(vx_gate, bx, d, q8, q8_ds, iqs);
-            up_partial   += reorder_vec_dot_q_sycl()(vx_up,   bx, d, q8, q8_ds, iqs);
+            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+                float ga = 0.0f;
+                float ua = 0.0f;
+                reorder_vec_dot_q_sycl().dual(
+                    vx_gate, vx_up, bx, d, q8, q8_ds, iqs, ga, ua);
+                gate_partial += ga;
+                up_partial   += ua;
+            } else {
+                gate_partial += reorder_vec_dot_q_sycl()(vx_gate, bx, d, q8, q8_ds, iqs);
+                up_partial   += reorder_vec_dot_q_sycl()(vx_up,   bx, d, q8, q8_ds, iqs);
+            }
         }
     }
 
@@ -4287,8 +4296,17 @@ static void mul_mat_vec_q_dense_dual_swiglu_reorder(
         for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
             const int iqs = elem + block_traits::vdr_mmvq *
                 (sg.get_local_linear_id() % block_elements_per_subgroup);
-            gate_partial += reorder_vec_dot_q_sycl()(vx_gate, bx, d, q8, q8_ds, iqs);
-            up_partial   += reorder_vec_dot_q_sycl()(vx_up,   bx, d, q8, q8_ds, iqs);
+            if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+                float ga = 0.0f;
+                float ua = 0.0f;
+                reorder_vec_dot_q_sycl().dual(
+                    vx_gate, vx_up, bx, d, q8, q8_ds, iqs, ga, ua);
+                gate_partial += ga;
+                up_partial   += ua;
+            } else {
+                gate_partial += reorder_vec_dot_q_sycl()(vx_gate, bx, d, q8, q8_ds, iqs);
+                up_partial   += reorder_vec_dot_q_sycl()(vx_up,   bx, d, q8, q8_ds, iqs);
+            }
         }
     }
 
@@ -4644,6 +4662,16 @@ static int ggml_sycl_moe_dual_tchunk() {
     return value;
 }
 
+// Q5_K dual shared-activation fuse (load q8 once for gate+up). Default ON after
+// +1.24% S_TG screen 2026-07-26. Disable: GGML_SYCL_DISABLE_MOE_DUAL_SHARED_ACT=1.
+static bool ggml_sycl_moe_dual_shared_act_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MOE_DUAL_SHARED_ACT");
+        return env == nullptr || std::atoi(env) == 0;
+    }();
+    return enabled;
+}
+
 template <typename reorder_vec_dot_q_sycl, int dual_tchunk>
 static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const void * __restrict__ vx_gate_base,
@@ -4655,7 +4683,7 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const size_t gate_expert_stride, const size_t up_expert_stride,
     const size_t dst_row_stride, const size_t src1_row_stride,
     const size_t src1_token_stride, const size_t dst_token_stride,
-    const int rows_per_sg,
+    const int rows_per_sg, const int shared_act,
     const sycl::nd_item<3> & item_ct1) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
@@ -4731,10 +4759,26 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                     const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
                     const sycl::half2 * q8_ds = (const sycl::half2 *)
                         ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
-                    gate_partial[j] += reorder_vec_dot_q_sycl()(
-                        vx_gate, bx, d, q8, q8_ds, iqs);
-                    up_partial[j] += reorder_vec_dot_q_sycl()(
-                        vx_up, bx, d, q8, q8_ds, iqs);
+                    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+                        if (shared_act) {
+                            float ga = 0.0f;
+                            float ua = 0.0f;
+                            reorder_vec_dot_q_sycl().dual(
+                                vx_gate, vx_up, bx, d, q8, q8_ds, iqs, ga, ua);
+                            gate_partial[j] += ga;
+                            up_partial[j]   += ua;
+                        } else {
+                            gate_partial[j] += reorder_vec_dot_q_sycl()(
+                                vx_gate, bx, d, q8, q8_ds, iqs);
+                            up_partial[j] += reorder_vec_dot_q_sycl()(
+                                vx_up, bx, d, q8, q8_ds, iqs);
+                        }
+                    } else {
+                        gate_partial[j] += reorder_vec_dot_q_sycl()(
+                            vx_gate, bx, d, q8, q8_ds, iqs);
+                        up_partial[j] += reorder_vec_dot_q_sycl()(
+                            vx_up, bx, d, q8, q8_ds, iqs);
+                    }
                 }
             }
         }
@@ -4765,14 +4809,15 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     const int num_subgroups = ggml_sycl_moe_dual_wg_subgroups(nrows);
     const int rows_per_sg   = ggml_sycl_moe_dual_rows_per_sg();
     const int dual_tchunk   = ggml_sycl_moe_dual_tchunk();
+    const int shared_act    = ggml_sycl_moe_dual_shared_act_enabled() ? 1 : 0;
     const int block_num_y   = ceil_div(nrows, num_subgroups * rows_per_sg);
     const sycl::range<3> block_nums(1, (unsigned) max_groups, (unsigned) block_num_y);
     const sycl::range<3> block_dims(1, 1, (unsigned) num_subgroups * WARP_SIZE);
     {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            fprintf(stderr, "[treebeard-moe-dual-grouped-launch] max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tchunk=%d (first entry)\n",
-                    max_groups, nrows, ncols, num_subgroups, rows_per_sg, dual_tchunk);
+            fprintf(stderr, "[treebeard-moe-dual-grouped-launch] max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tchunk=%d shared_act=%d (first entry)\n",
+                    max_groups, nrows, ncols, num_subgroups, rows_per_sg, dual_tchunk, shared_act);
         }
     }
     stream->submit([&](sycl::handler & cgh) {
@@ -4785,14 +4830,16 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                             vx_gate_base, vx_up_base, vy, dst_base, scratch,
                             ncols, nrows, n_as, gate_expert_stride,
                             up_expert_stride, dst_row_stride, src1_row_stride,
-                            src1_token_stride, dst_token_stride, rows_per_sg, item);
+                            src1_token_stride, dst_token_stride, rows_per_sg,
+                            shared_act, item);
                 } else {
                     mul_mat_vec_q_moe_dual_swiglu_grouped_reorder<
                         reorder_vec_dot_q_sycl, 4>(
                             vx_gate_base, vx_up_base, vy, dst_base, scratch,
                             ncols, nrows, n_as, gate_expert_stride,
                             up_expert_stride, dst_row_stride, src1_row_stride,
-                            src1_token_stride, dst_token_stride, rows_per_sg, item);
+                            src1_token_stride, dst_token_stride, rows_per_sg,
+                            shared_act, item);
                 }
             });
     });

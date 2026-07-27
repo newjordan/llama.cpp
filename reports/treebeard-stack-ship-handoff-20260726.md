@@ -25,6 +25,7 @@ Receipt: `treebeard-work/results/treebeard-stack-aba-20260726/`.
 | MoE-down `ROWS_PER_SG=4` | +1.36% | bit-exact 4/4 | `treebeard-moe-rows-per-sg-20260726/` |
 | Deferred-reduce (earlier) | +0.68% | bit-exact | `treebeard-moe-deferred-reduce-20260725/` |
 | Multi-col Q8 MMVQ sg **32** | **+0.78%** p50 | seq greedy 4/4 | `treebeard-q8-ncols-sg-shipstack-20260726/` |
+| Dual Q5 shared-act fuse | **+2.15%** p50 | 4/4 identical | `treebeard-dual-q5-shared-act-20260726/` |
 
 Compound 1.15×1.073×1.014 ≈ +25.1% ≈ measured +25.7%.
 
