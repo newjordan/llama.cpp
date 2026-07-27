@@ -26,6 +26,7 @@ Receipt: `treebeard-work/results/treebeard-stack-aba-20260726/`.
 | Deferred-reduce (earlier) | +0.68% | bit-exact | `treebeard-moe-deferred-reduce-20260725/` |
 | Multi-col Q8 MMVQ sg **32** | **+0.78%** p50 | seq greedy 4/4 | `treebeard-q8-ncols-sg-shipstack-20260726/` |
 | Dual Q5 shared-act fuse | **+2.15%** p50 | 4/4 identical | `treebeard-dual-q5-shared-act-20260726/` |
+| Dual Q5 weight-once multi-token | **+1.20%** p50 | 4/4 identical | `treebeard-dual-weight-once-20260726/` |
 | Dual Q8 dense shexp shared-act | ~flat | 4/4 self | `treebeard-dual-q8-dense-shared-20260726/` |
 
 Compound ~+25–26% class; cool-down re-ABA with dual shared-act: **+25.3% p50**

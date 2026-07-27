@@ -4755,11 +4755,39 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
             for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
                 const int iqs = elem + block_traits::vdr_mmvq *
                     (sg.get_local_linear_id() % block_elements_per_subgroup);
-                for (int j = 0; j < tc; ++j) {
-                    const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
-                    const sycl::half2 * q8_ds = (const sycl::half2 *)
-                        ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
-                    if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K || reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
+                // Q5_K: dequant gate/up weights once, then dot every token's
+                // activation (grouped multi-token reuse). shared_act=0 falls back.
+                if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q5_K) {
+                    if (shared_act) {
+                        const auto w_gate = reorder_vec_dot_q_sycl().load_weight(
+                            vx_gate, bx, d, iqs);
+                        const auto w_up = reorder_vec_dot_q_sycl().load_weight(
+                            vx_up, bx, d, iqs);
+                        for (int j = 0; j < tc; ++j) {
+                            const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * q8_ds = (const sycl::half2 *)
+                                ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                            gate_partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                                w_gate, q8, q8_ds, iqs);
+                            up_partial[j] += reorder_vec_dot_q_sycl().dot_weight(
+                                w_up, q8, q8_ds, iqs);
+                        }
+                    } else {
+                        for (int j = 0; j < tc; ++j) {
+                            const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                            const sycl::half2 * q8_ds = (const sycl::half2 *)
+                                ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
+                            gate_partial[j] += reorder_vec_dot_q_sycl()(
+                                vx_gate, bx, d, q8, q8_ds, iqs);
+                            up_partial[j] += reorder_vec_dot_q_sycl()(
+                                vx_up, bx, d, q8, q8_ds, iqs);
+                        }
+                    }
+                } else if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
+                    for (int j = 0; j < tc; ++j) {
+                        const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                        const sycl::half2 * q8_ds = (const sycl::half2 *)
+                            ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
                         if (shared_act) {
                             float ga = 0.0f;
                             float ua = 0.0f;
@@ -4773,7 +4801,12 @@ static void mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
                             up_partial[j] += reorder_vec_dot_q_sycl()(
                                 vx_up, bx, d, q8, q8_ds, iqs);
                         }
-                    } else {
+                    }
+                } else {
+                    for (int j = 0; j < tc; ++j) {
+                        const int8_t * q8 = (const int8_t *) vys[j] + iby * QK8_1;
+                        const sycl::half2 * q8_ds = (const sycl::half2 *)
+                            ((const char *) vys[j] + ncols + iby * sizeof(sycl::half2));
                         gate_partial[j] += reorder_vec_dot_q_sycl()(
                             vx_gate, bx, d, q8, q8_ds, iqs);
                         up_partial[j] += reorder_vec_dot_q_sycl()(
