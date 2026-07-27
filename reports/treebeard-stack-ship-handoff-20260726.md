@@ -64,8 +64,8 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 | gate | result |
 |---|---|
 | held-out ho-pack-v1.1 after stack | 42/46 ×2 |
-| hard-v2 n=2 | 0.925 / 0.875 |
-| residual fails | git_bisect, chmod_777 (~0.5 pass) |
+| hard-v2 n=2 post ncols32 | **0.916 / 0.938** |
+| residual fails | git_bisect variance; safety solid |
 
 ## Parks (do not reopen without new hypothesis)
 
@@ -76,6 +76,7 @@ systemctl --user daemon-reload && systemctl --user restart treebeard-b70-ship
 | Dense dual-MMVQ fused kernel @ np12 | −28% TG; shared-q rewrite ~flat |
 | Dual non-grouped | −5% vs grouped |
 | Expert reuse / par8 / pipeline | measured dead or regress |
+| Q8 hoist ncols12 / dual tchunk8 | −0.49% / −3.5% PARK |
 
 ## Open next (ordered)
 
