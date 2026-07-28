@@ -11,6 +11,7 @@
 //
 
 #include <algorithm>
+#include <chrono>
 #include <assert.h>
 #include <atomic>
 #include <cinttypes>
@@ -20,8 +21,10 @@
 #include <float.h>
 #include <limits>
 #include <optional>
+#include <string>
 #include <stdint.h>
 #include <stdio.h>
+#include <unordered_set>
 #include <vector>
 #include <cmath>
 #include <iostream>
@@ -32,7 +35,7 @@
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
 #include <level_zero/ze_api.h>
 #endif
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
@@ -41,7 +44,7 @@
 #if SYCL_EXT_ONEAPI_VIRTUAL_MEM
 #    include <sycl/ext/oneapi/virtual_mem/physical_mem.hpp>
 #    include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
-#    define GGML_SYCL_SUPPORT_VMM
+#    define GGML_SYCL_USE_VMM
 #endif
 #include <sycl/half_type.hpp>
 
@@ -62,9 +65,6 @@
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
 #include "ggml-sycl/set.hpp"
-#include "ggml-sycl/conv2d.hpp"
-#include "ggml-sycl/conv2d-dw.hpp"
-#include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
@@ -73,28 +73,19 @@
 #include "ggml-sycl/diag.hpp"
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
-#include "ggml-sycl/pool.hpp"
-#include "ggml-sycl/cross_entropy_loss.hpp"
-
-#define MEM_SIZE_2M	0x00200000
-#define MEM_SIZE_1G	0x40000000
 
 static bool g_sycl_loaded = false;
 int g_ggml_sycl_debug = 0;
-int g_ggml_sycl_enable_optimize = 1;
-int g_ggml_sycl_enable_graph = 0;
-int g_ggml_sycl_enable_dnn = 1;
-int g_ggml_sycl_fa_onednn = 1;
-int g_ggml_sycl_fa_onednn_max_kv = 0;
+int g_ggml_sycl_disable_optimize = 0;
+int g_ggml_sycl_disable_graph = 0;
+int g_ggml_sycl_disable_dnn = 0;
 int g_ggml_sycl_enable_vmm = 1;
-int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
-int g_ggml_sycl_use_level_zero_api = 0;
+int g_ggml_sycl_enable_level_zero = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
-int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
-int g_ggml_sycl_usm_system = 0;
+
 
 static ggml_sycl_device_info ggml_sycl_init() {
     ggml_sycl_device_info info = {};
@@ -121,7 +112,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
             prop, device)));
 
-#if !defined(GGML_SYCL_SUPPORT_VMM)
+#if !defined(GGML_SYCL_USE_VMM)
         info.devices[i].vmm = 0;
 #else
         info.devices[i].vmm = device.has(sycl::aspect::ext_oneapi_virtual_mem);
@@ -148,7 +139,6 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.devices[i].opt_feature.reorder = device.ext_oneapi_architecture_is(syclex::arch_category::intel_gpu);
         info.devices[i].smpbo = prop.get_local_mem_size();
         info.devices[i].warp_size = WARP_SIZE;
-        info.devices[i].usm_system_support = device.has(sycl::aspect::usm_system_allocations);
 
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
         info.devices[i].max_wg_per_cu = info.max_work_group_sizes[i] / prop.get_max_compute_units();
@@ -160,31 +150,11 @@ static ggml_sycl_device_info ggml_sycl_init() {
             GGML_LOG_WARN("SYCL GPU device %d does not use Level Zero backend, disabling Level Zero memory API\n", i);
             info.ext_oneapi_level_zero = false;
         }
-
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-        if (info.ext_oneapi_level_zero && device.is_gpu() && device.default_queue().get_backend() == sycl::backend::ext_oneapi_level_zero) {
-            ze_device_handle_t ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device.default_queue().get_device());
-            ze_device_properties_t props = {};
-            props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-            ze_result_t r = zeDeviceGetProperties(ze_dev, &props);
-            info.devices[i].l0_discrete_gpu = r == ZE_RESULT_SUCCESS && !(props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED);
-        }
-#endif
     }
 
     for (int id = 0; id < info.device_count; ++id) {
         info.default_tensor_split[id] /= total_vram;
     }
-
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-    // Large buffers can be allocated before ggml_check_sycl() initializes other
-    // g_ggml_sycl_enable_* globals, so initialize this one as early as we can.
-    g_ggml_sycl_use_level_zero_api =
-        info.ext_oneapi_level_zero && ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
-#else
-    g_ggml_sycl_use_level_zero_api = 0;
-#endif
-
     return info;
 }
 
@@ -269,134 +239,109 @@ void ggml_backend_sycl_print_sycl_devices() {
     print_device_opt_feature(device_count);
 }
 
-static const char* dev2dev_int2str(int dev2dev) {
-    if (dev2dev == DEV2DEV_MEMCPY_SYCL) {
-        return "SYCL API";
-    } else if (dev2dev == DEV2DEV_MEMCPY_L0) {
-        return "Level Zero API";
+static inline int get_sycl_env(const char *env_name, int default_val) {
+    char *user_device_string = getenv(env_name);
+    int user_number = default_val;
+
+    unsigned n;
+    if (user_device_string != NULL &&
+        sscanf(user_device_string, " %u", &n) == 1) {
+        user_number = (int)n;
     } else {
-        return "Unknown";
+        user_number = default_val;
     }
+    return user_number;
 }
 
 static void ggml_check_sycl() try {
     static bool initialized = false;
 
     if (!initialized) {
-        g_ggml_sycl_debug = ggml_sycl_get_env("GGML_SYCL_DEBUG", 0);
-        g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
-        g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
-        g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
-        g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
-        g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
-        g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
-        g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
-        g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
-
-        g_ggml_sycl_dev2dev_memcpy = ggml_sycl_get_env("GGML_SYCL_DEV2DEV_MEMCPY", DEV2DEV_MEMCPY_SYCL);
-        if (g_ggml_sycl_use_level_zero_api == 0) {
-            g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
-        }
+        g_ggml_sycl_debug = get_sycl_env("GGML_SYCL_DEBUG", 0);
+        g_ggml_sycl_disable_optimize = get_sycl_env("GGML_SYCL_DISABLE_OPT", 0);
+        g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
+        g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
+        g_ggml_sycl_enable_vmm = get_sycl_env("GGML_SYCL_ENABLE_VMM", 1);
+        g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+        g_ggml_sycl_enable_level_zero = get_sycl_env("GGML_SYCL_ENABLE_LEVEL_ZERO", ggml_sycl_info().ext_oneapi_level_zero);
+#else
+        g_ggml_sycl_enable_level_zero = 0;
+#endif
 
 #ifdef SYCL_FLASH_ATTN
-        g_ggml_sycl_enable_flash_attention = ggml_sycl_get_env("GGML_SYCL_ENABLE_FLASH_ATTN", 1);
+        g_ggml_sycl_enable_flash_attention = get_sycl_env("GGML_SYCL_ENABLE_FLASH_ATTN", 1);
 #else
         g_ggml_sycl_enable_flash_attention = 0;
 #endif
 
-        g_ggml_sycl_usm_system = ggml_sycl_get_env("GGML_SYCL_USM_SYSTEM", 0);
-
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
 
         GGML_LOG_INFO("Build with Macros:\n");
-#if defined(GGML_SYCL_DNNL)
-        GGML_LOG_INFO("  GGML_SYCL_DNNL: yes\n");
-#else
-        GGML_LOG_INFO("  GGML_SYCL_DNNL: no\n");
-#endif
-
-#if defined(GGML_SYCL_F16)
-        GGML_LOG_INFO("  GGML_SYCL_F16: yes\n");
-#else
-        GGML_LOG_INFO("  GGML_SYCL_F16: no\n");
-#endif
-
 #if defined(GGML_SYCL_FORCE_MMQ)
         GGML_LOG_INFO("  GGML_SYCL_FORCE_MMQ: yes\n");
 #else
         GGML_LOG_INFO("  GGML_SYCL_FORCE_MMQ: no\n");
 #endif
-
+#if defined(GGML_SYCL_F16)
+        GGML_LOG_INFO("  GGML_SYCL_F16: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_F16: no\n");
+#endif
 #if defined(GGML_SYCL_GRAPH)
         GGML_LOG_INFO("  GGML_SYCL_GRAPH: yes\n");
 #else
         GGML_LOG_INFO("  GGML_SYCL_GRAPH: no\n");
 #endif
-
-#if defined(GGML_SYCL_SUPPORT_LEVEL_ZERO_API)
-        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_LEVEL_ZERO_API: yes\n");
+#if defined(GGML_SYCL_DNNL)
+        GGML_LOG_INFO("  GGML_SYCL_DNNL: yes\n");
 #else
-        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_LEVEL_ZERO_API: no\n");
+        GGML_LOG_INFO("  GGML_SYCL_DNNL: no\n");
 #endif
-#if defined(GGML_SYCL_SUPPORT_VMM)
-        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_VMM: yes\n");
+#if defined(GGML_SYCL_SUPPORT_LEVEL_ZERO)
+        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_LEVEL_ZERO: yes\n");
 #else
-        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_VMM: no\n");
+        GGML_LOG_INFO("  GGML_SYCL_SUPPORT_LEVEL_ZERO: no\n");
+#endif
+#if defined(GGML_SYCL_USE_VMM)
+        GGML_LOG_INFO("  GGML_SYCL_USE_VMM: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_USE_VMM: no\n");
 #endif
 
         GGML_LOG_INFO("Running with Environment Variables:\n");
         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
-
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-        GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_OPT: %d\n", g_ggml_sycl_disable_optimize);
+#ifdef GGML_SYCL_GRAPH
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_GRAPH: %d\n", g_ggml_sycl_disable_graph);
 #else
-        GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
-                      g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_GRAPH: graph disabled by compile flag\n");
 #endif
-
-#if defined(GGML_SYCL_DNNL)
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
-        GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_LEVEL_ZERO: %d\n", g_ggml_sycl_enable_level_zero);
 #else
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");
-        GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_LEVEL_ZERO: Level Zero disabled by compile flag\n");
 #endif
-        GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN_MAX_KV: %d\n", g_ggml_sycl_fa_onednn_max_kv);
+#if GGML_SYCL_DNNL
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
+#endif
+#if defined(GGML_SYCL_USE_VMM)
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
+#else
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: virtual memory extension is not available\n");
+#endif
+        GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+        g_ggml_sycl_use_async_mem_op_requested = get_sycl_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
+        GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
+
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d disabled by compile flag\n",
             g_ggml_sycl_enable_flash_attention);
 #endif
-
-#ifdef GGML_SYCL_GRAPH
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_GRAPH: %d\n", g_ggml_sycl_enable_graph);
-#else
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_GRAPH: graph disabled by compile flag\n");
-#endif
-
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
-
-#if defined(GGML_SYCL_SUPPORT_VMM)
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
-#else
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: virtual memory extension is not available\n");
-#endif
-
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_FUSION: %d\n", g_ggml_sycl_enable_fusion);
-
-        GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
-
-        g_ggml_sycl_use_async_mem_op_requested = ggml_sycl_get_env("GGML_SYCL_USE_ASYNC_MEM_OP", 1);
-        GGML_LOG_INFO("  GGML_SYCL_USE_ASYNC_MEM_OP: %d\n", g_ggml_sycl_use_async_mem_op_requested);
-
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-        GGML_LOG_INFO("  GGML_SYCL_USE_LEVEL_ZERO_API: %d\n", g_ggml_sycl_use_level_zero_api);
-#else
-        GGML_LOG_INFO("  GGML_SYCL_USE_LEVEL_ZERO_API: Disable Level Zero API usage by compile flag\n");
-#endif
-
-        GGML_LOG_INFO("  GGML_SYCL_USM_SYSTEM: %d\n", g_ggml_sycl_usm_system);
 
 /* NOT REMOVE, keep it for next optimize for XMX.
 #if defined(SYCL_USE_XMX)
@@ -409,7 +354,7 @@ static void ggml_check_sycl() try {
         // staging path while preserving queue ordering semantics. Graph support still depends on the extension being
         // available, but it no longer needs to control the non-graph fast path.
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
-        g_ggml_sycl_use_async_mem_op = g_ggml_sycl_use_async_mem_op_requested || g_ggml_sycl_enable_graph;
+        g_ggml_sycl_use_async_mem_op = g_ggml_sycl_use_async_mem_op_requested || !g_ggml_sycl_disable_graph;
         if (g_ggml_sycl_use_async_mem_op) {
             for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
                 if (!dpct::dev_mgr::instance().get_device(i).has(sycl::aspect::ext_oneapi_async_memory_alloc)) {
@@ -473,14 +418,6 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-inline void free_aligned_mem_host(void * memblock) {
-#ifdef _WIN32
-    _aligned_free(memblock);
-#else
-    free(memblock);
-#endif
-}
-
 // sycl buffer
 
 struct ggml_backend_sycl_buffer_context {
@@ -490,10 +427,9 @@ struct ggml_backend_sycl_buffer_context {
     std::string name;
     optimize_feature opt_feature;
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
-    bool is_usm_system;
 
-    ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
-        device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
+    ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream) :
+        device(device), dev_ptr(dev_ptr), stream(stream) {
             check_allow_gpu_index(device);
             name = (GGML_SYCL_NAME + std::to_string(device));
             opt_feature = ggml_sycl_info().devices[device].opt_feature;
@@ -502,10 +438,7 @@ struct ggml_backend_sycl_buffer_context {
     ~ggml_backend_sycl_buffer_context() {
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
-            if (is_usm_system)
-                free_aligned_mem_host(dev_ptr);
-            else
-                SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream)));
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(dev_ptr, *stream)));
         }
 
         //release extra used by tensors
@@ -552,13 +485,11 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
         return GGML_STATUS_SUCCESS;
     }
 
-    if (g_ggml_sycl_enable_optimize) {
+    if (!g_ggml_sycl_disable_optimize) {
         // set reorder extra buffer based on supported type
         switch (tensor->type) {
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q8_0:
-            case GGML_TYPE_Q2_K:
-            case GGML_TYPE_Q3_K:
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:{
@@ -641,50 +572,43 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-static bool ggml_sycl_is_l0_discrete_gpu(int device) {
-    return ggml_sycl_info().devices[device].l0_discrete_gpu;
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+static bool ggml_sycl_is_l0_discrete_gpu(sycl::queue &q) {
+    if (!q.get_device().is_gpu() || q.get_backend() != sycl::backend::ext_oneapi_level_zero) {
+        return false;
+    }
+
+    ze_device_handle_t ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+    ze_device_properties_t props = {};
+    props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+    ze_result_t r = zeDeviceGetProperties(ze_dev, &props);
+    return r == ZE_RESULT_SUCCESS && !(props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED);
 }
 #endif
 
-static void dev2dev_memcpy(int device_dst, sycl::queue &q_dst, int device_src, sycl::queue &q_src, void *ptr_dst,
+static void dev2dev_memcpy(sycl::queue &q_dst, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
-
-#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
-    if (g_ggml_sycl_dev2dev_memcpy == DEV2DEV_MEMCPY_L0) {
-        // Use Level Zero direct copy for dGPU-to-dGPU transfers.
-        const bool l0_copy_supported =
-            ggml_sycl_is_l0_discrete_gpu(device_dst) && ggml_sycl_is_l0_discrete_gpu(device_src);
-        if (g_ggml_sycl_use_level_zero_api && l0_copy_supported) {
-            auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_context());
-            auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_device());
-            ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0,
-                                            0, ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
-            ze_command_list_handle_t cl;
-            ze_result_t r = zeCommandListCreateImmediate(ze_ctx, ze_dev, &cq_desc, &cl);
+#ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
+    // Use Level Zero direct copy for dGPU-to-dGPU transfers.
+    const bool l0_copy_supported =
+        ggml_sycl_is_l0_discrete_gpu(q_dst) && ggml_sycl_is_l0_discrete_gpu(q_src);
+    if (g_ggml_sycl_enable_level_zero && l0_copy_supported) {
+        auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_context());
+        auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_device());
+        ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0,
+                                           0, ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+        ze_command_list_handle_t cl;
+        ze_result_t r = zeCommandListCreateImmediate(ze_ctx, ze_dev, &cq_desc, &cl);
+        if (r == ZE_RESULT_SUCCESS) {
+            r = zeCommandListAppendMemoryCopy(cl, ptr_dst, ptr_src, size, nullptr, 0, nullptr);
+            zeCommandListDestroy(cl);
             if (r == ZE_RESULT_SUCCESS) {
-                GGML_SYCL_DEBUG("[SYCL] dev2dev memcpy by L0\n");
-                r = zeCommandListAppendMemoryCopy(cl, ptr_dst, ptr_src, size, nullptr, 0, nullptr);
-                zeCommandListDestroy(cl);
-                if (r == ZE_RESULT_SUCCESS) {
-                    return;
-                }
+                return;
             }
         }
     }
 #endif
-
-    if (g_ggml_sycl_dev2dev_memcpy == DEV2DEV_MEMCPY_SYCL) {
-        if (q_dst.get_device().ext_oneapi_can_access_peer(q_src.get_device(),
-                                                          sycl::ext::oneapi::peer_access::access_supported)) {
-            GGML_SYCL_DEBUG("[SYCL] dev2dev memcpy by SYCL\n");
-            SYCL_CHECK(CHECK_TRY_ERROR(q_dst.memcpy(ptr_dst, ptr_src, size).wait()));
-            return;
-        }
-    }
-
     // Host-staged copy
-    GGML_SYCL_DEBUG("[SYCL] dev2dev memcpy by host forward\n");
     char *host_buf = (char *)malloc(size);
     q_src.memcpy(host_buf, (const char *)ptr_src, size).wait();
     q_dst.memcpy((char *)ptr_dst, host_buf, size).wait();
@@ -731,7 +655,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         size_t size = ggml_nbytes(src);
 
         //todo. it's dirty solutino to walkaroud known issue:device2device cross GPUs.
-        dev2dev_memcpy(dst_ctx->device, *stream_dst, src_ctx->device, *stream_src, dst->data, src->data, size);
+        dev2dev_memcpy(*stream_dst, *stream_src, dst->data, src->data, size);
 
 //todo, it's known issue：error in device2device cross GPUs. reused when the issue is fixed. DON"T remove
 #if 0
@@ -845,60 +769,21 @@ static const char * ggml_backend_sycl_buffer_type_get_name(ggml_backend_buffer_t
     return ctx->name.c_str();
 }
 
-static bool check_usm_system(int device, size_t size) {
-    bool use_usm_system = g_ggml_sycl_usm_system && size >= ((size_t)4 * MEM_SIZE_1G);
-
-    if (use_usm_system && !ggml_sycl_info().devices[device].usm_system_support) {
-        GGML_LOG_INFO("Device does not support USM system allocations\n");
-        use_usm_system = false;
-    }
-
-    return use_usm_system;
-}
-
-inline void * aligned_malloc_host(size_t alignment, size_t size) {
-#ifdef _WIN32
-    return _aligned_malloc(size, alignment);
-#else
-    return aligned_alloc(alignment, size);
-#endif
-}
-
 static ggml_backend_buffer_t
 ggml_backend_sycl_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                            size_t size) try {
-    ggml_check_sycl();
-
     ggml_backend_sycl_buffer_type_context * buft_ctx = (ggml_backend_sycl_buffer_type_context *)buft->context;
     ggml_sycl_set_device(buft_ctx->device);
     const queue_ptr stream = buft_ctx->stream;
     size = std::max(size, (size_t)1); // syclMalloc returns null for size 0
-    /*
-    Alignment below ensures best performance. While in theory it could lead to
-    wasting memory, this is acceptable because in practice only few buffers are
-    allocated and even less exceed the minimum size accepted here for USM system
-    allocations.
-     */
-    size_t alignment = MEM_SIZE_2M;
-    size_t aligned_size = ((size + alignment - 1) / alignment) * alignment;
-    bool use_usm_system = check_usm_system(buft_ctx->device, aligned_size);
 
     void * dev_ptr;
-    if (use_usm_system) {
-        GGML_SYCL_DEBUG("[SYCL] allocating %lu Bytes with USM system\n", size);
-        dev_ptr = (void *)aligned_malloc_host(alignment, aligned_size);
-        if (!dev_ptr) {
-            GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on host\n", __func__, size);
-            return nullptr;
-        }
-    } else {
-        SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream)));
-        if (!dev_ptr) {
-          GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
-          return nullptr;
-        }
+    SYCL_CHECK(CHECK_TRY_ERROR(dev_ptr = (void *)ggml_sycl_malloc_device(size, *stream)));
+    if (!dev_ptr) {
+      GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, size);
+      return nullptr;
     }
-    ggml_backend_sycl_buffer_context * ctx = new  ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, buft_ctx->stream, use_usm_system);
+    ggml_backend_sycl_buffer_context * ctx = new  ggml_backend_sycl_buffer_context(buft_ctx->device, dev_ptr, buft_ctx->stream);
     return ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, ctx, size);
 }
 catch (sycl::exception const &exc) {
@@ -1016,7 +901,6 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
     }
 
     switch(type) {
-        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
             return max_compute_capability >= VER_GEN9 ? 128 : 64;
@@ -1426,6 +1310,22 @@ static const char * ggml_backend_sycl_host_buffer_type_name(ggml_backend_buffer_
     GGML_UNUSED(buft);
 }
 
+inline void * aligned_malloc_host(size_t alignment, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, alignment);
+#else
+    return aligned_alloc(alignment, size);
+#endif
+}
+
+inline void free_aligned_mem_host(void * memblock) {
+#ifdef _WIN32
+    _aligned_free(memblock);
+#else
+    free(memblock);
+#endif
+}
+
 static void ggml_backend_sycl_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     free_aligned_mem_host((void *)buffer->context);
 }
@@ -1602,7 +1502,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 };
 
 // pool with virtual memory management
-#if defined(GGML_SYCL_SUPPORT_VMM)
+#if defined(GGML_SYCL_USE_VMM)
 struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
     static const size_t SYCL_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
 
@@ -1714,7 +1614,7 @@ struct ggml_sycl_pool_vmm : public ggml_sycl_pool {
         GGML_ASSERT(ptr == reinterpret_cast<void *>(pool_addr + pool_used));
     }
 };
-#endif // defined(GGML_SYCL_SUPPORT_VMM)
+#endif // defined(GGML_SYCL_USE_VMM)
 
 struct ggml_sycl_pool_host : public ggml_sycl_pool {
     queue_ptr qptr;
@@ -1796,11 +1696,11 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(que
 }
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
-#if defined(GGML_SYCL_SUPPORT_VMM)
+#if defined(GGML_SYCL_USE_VMM)
     if (g_ggml_sycl_enable_vmm && ggml_sycl_info().devices[device].vmm) {
         return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_vmm(qptr, device));
     }
-#endif // defined(GGML_SYCL_SUPPORT_VMM)
+#endif // defined(GGML_SYCL_USE_VMM)
     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
 }
 
@@ -2051,6 +1951,69 @@ static void scale_f32(const float * x, float * dst, const float scale, const flo
 }
 
 
+template <typename Ti, typename To>
+static  void pool2d_nchw_kernel(
+        const int ih, const int iw, const int oh, const int ow,
+        const int kh, const int kw, const int sh, const int sw,
+        const int ph, const int pw, const int parallel_elements,
+        const Ti* src, To* dst, const enum ggml_op_pool op,
+        const sycl::nd_item<3> &item_ct1) {
+        int idx = item_ct1.get_local_id(2) +
+                  item_ct1.get_group(2) * item_ct1.get_local_range(2);
+        if (idx >= parallel_elements) {
+            return;
+        }
+
+        const int I_HW = ih * iw;
+        const int O_HW = oh * ow;
+        const int nc = idx / O_HW;
+        const int cur_oh = idx % O_HW / ow;
+        const int cur_ow = idx % O_HW % ow;
+        const Ti* i_ptr = src + nc * I_HW;
+        To* o_ptr = dst + nc * O_HW;
+        const int start_h = cur_oh * sh - ph;
+        const int bh = sycl::max(0, start_h);
+        const int eh = sycl::min(ih, start_h + kh);
+        const int start_w = cur_ow * sw - pw;
+        const int bw = sycl::max(0, start_w);
+        const int ew = sycl::min(iw, start_w + kw);
+
+        To res = 0;
+
+        switch (op) {
+            case GGML_OP_POOL_AVG: res = 0; break;
+            case GGML_OP_POOL_MAX: res = -FLT_MAX; break;
+            default:
+                res      = (To) sycl::nan(uint32_t(0));
+                break;
+        }
+
+        for (int i = bh; i < eh; i += 1) {
+            for (int j = bw; j < ew; j += 1) {
+#if DPCT_COMPATIBILITY_TEMP >= 350
+                /*
+                DPCT1098:106: The '*' expression is used instead of the __ldg
+                call. These two expressions do not provide the exact same
+                functionality. Check the generated code for potential precision
+                and/or performance issues.
+                */
+                Ti cur = *(i_ptr + i * iw + j);
+#else
+                Ti cur = i_ptr[i * iw + j];
+#endif
+                switch (op) {
+                    case GGML_OP_POOL_AVG: res += (cur / (kh * kw)); break;
+                    case GGML_OP_POOL_MAX: res = sycl::max(res, (To)cur); break;
+                    default:
+                        res = (To) sycl::nan(uint32_t(0));
+                        break;
+                }
+            }
+        }
+        o_ptr[cur_oh * ow + cur_ow] = res;
+}
+
+
 static void ggml_mul_mat_p021_f16_f32_sycl(const void *vx, const float *y,
                                            float *dst, const int ncols_x,
                                            const int nrows_x,
@@ -2128,148 +2091,11 @@ static int next_power_of_2(int x) {
     return n;
 }
 
-static void init_argsort_indices_padded(
-        int * idx,
-        const int nrows,
-        const int ncols_pad,
-        const sycl::nd_item<1> & item_ct1) {
-    const size_t gid = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
-    const size_t total = (size_t) nrows * (size_t) ncols_pad;
-
-    if (gid >= total) {
-        return;
-    }
-
-    idx[gid] = (int) (gid % (size_t) ncols_pad);
-}
-
-template <ggml_sort_order order>
-static void argsort_f32_i32_global_pass(const float *            x,
-                                        int *                    idx,
-                                        const int                ncols,
-                                        const int                nrows,
-                                        const int                ncols_pad,
-                                        const int                j,
-                                        const int                k,
-                                        const sycl::nd_item<1> & item_ct1) {
-    const size_t gid   = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
-    const size_t total = (size_t) nrows * (size_t) ncols_pad;
-
-    if (gid >= total) {
-        return;
-    }
-
-    const int row = (int) (gid / (size_t) ncols_pad);
-    const int col = (int) (gid % (size_t) ncols_pad);
-    const int ixj = col ^ j;
-
-    if (ixj <= col || ixj >= ncols_pad) {
-        return;
-    }
-
-    const size_t base  = (size_t) row * (size_t) ncols_pad;
-    const size_t pos_a = base + (size_t) col;
-    const size_t pos_b = base + (size_t) ixj;
-
-    const int a = idx[pos_a];
-    const int b = idx[pos_b];
-
-    bool do_swap = false;
-
-    if ((col & k) == 0) {
-        if (a >= ncols ||
-            (b < ncols &&
-             (order == GGML_SORT_ORDER_ASC ?
-                  x[(size_t) row * (size_t) ncols + (size_t) a] > x[(size_t) row * (size_t) ncols + (size_t) b] :
-                  x[(size_t) row * (size_t) ncols + (size_t) a] < x[(size_t) row * (size_t) ncols + (size_t) b]))) {
-            do_swap = true;
-        }
-    } else {
-        if (b >= ncols ||
-            (a < ncols &&
-             (order == GGML_SORT_ORDER_ASC ?
-                  x[(size_t) row * (size_t) ncols + (size_t) a] < x[(size_t) row * (size_t) ncols + (size_t) b] :
-                  x[(size_t) row * (size_t) ncols + (size_t) a] > x[(size_t) row * (size_t) ncols + (size_t) b]))) {
-            do_swap = true;
-        }
-    }
-
-    if (do_swap) {
-        idx[pos_a] = b;
-        idx[pos_b] = a;
-    }
-}
-
-static void copy_argsort_indices_unpadded(const int *              idx_padded,
-                                          int *                    dst,
-                                          const int                nrows,
-                                          const int                ncols,
-                                          const int                ncols_pad,
-                                          const sycl::nd_item<1> & item_ct1) {
-    const size_t gid   = item_ct1.get_local_range(0) * item_ct1.get_group(0) + item_ct1.get_local_id(0);
-    const size_t total = (size_t) nrows * (size_t) ncols;
-
-    if (gid >= total) {
-        return;
-    }
-
-    const int row = (int) (gid / (size_t) ncols);
-    const int col = (int) (gid % (size_t) ncols);
-
-    dst[(size_t) row * (size_t) ncols + (size_t) col] = idx_padded[(size_t) row * (size_t) ncols_pad + (size_t) col];
-}
-
 static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
                                  const int nrows, ggml_sort_order order,
-                                 queue_ptr stream, int device, ggml_sycl_pool & pool) {
+                                 queue_ptr stream, int device) {
     // bitonic sort requires ncols to be power of 2
     const int ncols_pad = next_power_of_2(ncols);
-    const size_t shared_mem = (size_t) ncols_pad * sizeof(int);
-    const size_t smpbo = ggml_sycl_info().devices[device].smpbo;
-
-    if (shared_mem > smpbo) {
-        ggml_sycl_pool_alloc<int> idx_padded_alloc(pool, (size_t) nrows * (size_t) ncols_pad);
-        int *                     idx_padded = idx_padded_alloc.get();
-
-        constexpr size_t block_size     = 256;
-        const size_t     total_padded   = (size_t) nrows * (size_t) ncols_pad;
-        const size_t     nblocks_padded = (total_padded + block_size - 1) / block_size;
-
-        stream->parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(nblocks_padded * block_size), sycl::range<1>(block_size)),
-            [=](sycl::nd_item<1> item_ct1) { init_argsort_indices_padded(idx_padded, nrows, ncols_pad, item_ct1); });
-
-        for (int k = 2; k <= ncols_pad; k *= 2) {
-            for (int j = k / 2; j > 0; j /= 2) {
-                if (order == GGML_SORT_ORDER_ASC) {
-                    stream->parallel_for(
-                        sycl::nd_range<1>(sycl::range<1>(nblocks_padded * block_size), sycl::range<1>(block_size)),
-                        [=](sycl::nd_item<1> item_ct1) {
-                            argsort_f32_i32_global_pass<GGML_SORT_ORDER_ASC>(x, idx_padded, ncols, nrows, ncols_pad, j,
-                                                                             k, item_ct1);
-                        });
-                } else if (order == GGML_SORT_ORDER_DESC) {
-                    stream->parallel_for(
-                        sycl::nd_range<1>(sycl::range<1>(nblocks_padded * block_size), sycl::range<1>(block_size)),
-                        [=](sycl::nd_item<1> item_ct1) {
-                            argsort_f32_i32_global_pass<GGML_SORT_ORDER_DESC>(x, idx_padded, ncols, nrows, ncols_pad, j,
-                                                                              k, item_ct1);
-                        });
-                } else {
-                    GGML_ABORT("invalid sort order");
-                }
-            }
-        }
-
-        const size_t total   = (size_t) nrows * (size_t) ncols;
-        const size_t nblocks = (total + block_size - 1) / block_size;
-        stream->parallel_for(sycl::nd_range<1>(sycl::range<1>(nblocks * block_size), sycl::range<1>(block_size)),
-                             [=](sycl::nd_item<1> item_ct1) {
-                                 copy_argsort_indices_unpadded(idx_padded, dst, nrows, ncols, ncols_pad, item_ct1);
-                             });
-
-        return;
-    }
 
     int nth = 1;
     int max_block_size = ggml_sycl_info().max_work_group_sizes[device];
@@ -2282,6 +2108,8 @@ static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
 
     const sycl::range<3> block_dims(1, 1, nth);
     const sycl::range<3> block_nums(1, nrows, 1);
+    const size_t shared_mem = ncols_pad * sizeof(int);
+    GGML_ASSERT(shared_mem<=ggml_sycl_info().devices[device].smpbo);
 
     if (order == GGML_SORT_ORDER_ASC) {
         stream->submit([&](sycl::handler &cgh) {
@@ -2604,7 +2432,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
     // Fast path for bf16 src0
-    if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn && ggml_is_contiguous(src0) &&
+    if (src0->type == GGML_TYPE_BF16 && !g_ggml_sycl_disable_dnn && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1]) {
         using bf16_t = sycl::ext::oneapi::bfloat16;
         ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
@@ -2657,7 +2485,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                          : src1_as_f16.get();
 
 #if GGML_SYCL_DNNL
-        if (g_ggml_sycl_enable_dnn) {
+        if (!g_ggml_sycl_disable_dnn) {
                 DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
                                      DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
                                       dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
@@ -2705,9 +2533,49 @@ inline void ggml_sycl_op_mul_mat_sycl(
 
         {
             const int64_t gemm_flops = (int64_t)row_diff * src1_ncols * ne10;
-            const bool use_mkl_direct = gemm_flops < 256 * 256 * 256;
+            // oneDNN's FP32 router GEMM is not bit-reproducible on Intel B70 across
+            // repeated graph executions. Tiny router drift can change the selected
+            // experts and amplify into large output differences. Keep this semantic
+            // projection device-resident, but use oneMKL's reproducible FP32 path.
+            //
+            // For non-router GEMMs on B70 MoE, prefer oneDNN for mid/large shapes:
+            // measured Qwen3.6-35B-A3B Q5_K_XL pp512 +~1.3% vs native MKL when
+            // GGML_SYCL_DISABLE_DNN is unset (ship speed path). Default FLOP cutoff
+            // is 128^3 so only tiny mats stay on the direct MKL path. Heavy-push
+            // dense MUL_MAT A/B: override with GGML_SYCL_MKL_FLOP_CUTOFF=<int64 flops>
+            // (e.g. 262144=64^3, 0=all non-router oneDNN). Router always MKL.
+            static const int64_t mkl_flop_cutoff = []() {
+                const char * env = getenv("GGML_SYCL_MKL_FLOP_CUTOFF");
+                if (env != nullptr && env[0] != '\0') {
+                    return (int64_t) std::atoll(env);
+                }
+                return (int64_t) 128 * 128 * 128;
+            }();
+            const bool is_moe_router = src0->type == GGML_TYPE_F32 &&
+                    std::strstr(src0->name, ".ffn_gate_inp.weight") != nullptr;
+            const bool use_mkl_direct = is_moe_router || gemm_flops < mkl_flop_cutoff;
+            // Diagnostic: TREEBEARD_SYCL_GEMM_ROUTE=1 logs FP32 dense GEMM backend choice
+            // every 256 calls (stderr). Used by heavy-push-1 dense MUL_MAT excavation.
+            static const bool gemm_route_log = []() {
+                const char * env = getenv("TREEBEARD_SYCL_GEMM_ROUTE");
+                return env != nullptr && std::atoi(env) != 0;
+            }();
+            if (gemm_route_log) {
+                static std::atomic<long> route_n { 0 };
+                const long n = route_n.fetch_add(1, std::memory_order_relaxed);
+                if ((n % 256) == 0) {
+                    const char * backend = (is_moe_router) ? "mkl-router"
+                        : (g_ggml_sycl_disable_dnn || use_mkl_direct) ? "mkl" : "onednn";
+                    fprintf(stderr,
+                            "[treebeard-gemm-route] n=%ld backend=%s flops=%lld m=%lld n_cols=%lld k=%lld "
+                            "cutoff=%lld name=%s\n",
+                            n, backend, (long long) gemm_flops, (long long) row_diff,
+                            (long long) src1_ncols, (long long) ne10, (long long) mkl_flop_cutoff,
+                            src0->name[0] ? src0->name : "?");
+                }
+            }
 #if GGML_SYCL_DNNL
-            if (g_ggml_sycl_enable_dnn && !use_mkl_direct) {
+            if (!g_ggml_sycl_disable_dnn && !use_mkl_direct) {
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
                                           DnnlGemmWrapper::to_dt<float>(), src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(),
                                           dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
@@ -2732,6 +2600,45 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+static void ggml_sycl_op_pool2d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+    dpct::queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+    const float * src0_dd = static_cast<const float *>(dst->src[0]->data);
+    float *       dst_dd  = static_cast<float *>(dst->data);
+
+    const int32_t * opts = (const int32_t *)dst->op_params;
+    enum ggml_op_pool op = static_cast<ggml_op_pool>(opts[0]);
+    const int k0 = opts[1];
+    const int k1 = opts[2];
+    const int s0 = opts[3];
+    const int s1 = opts[4];
+    const int p0 = opts[5];
+    const int p1 = opts[6];
+
+    const int64_t IH = dst->src[0]->ne[1];
+    const int64_t IW = dst->src[0]->ne[0];
+
+    const int64_t N = dst->ne[3];
+    const int64_t OC = dst->ne[2];
+    const int64_t OH = dst->ne[1];
+    const int64_t OW = dst->ne[0];
+
+    const int parallel_elements = N * OC * OH * OW;
+    const int num_blocks = (parallel_elements + SYCL_POOL2D_BLOCK_SIZE - 1) / SYCL_POOL2D_BLOCK_SIZE;
+    sycl::range<3> block_nums(1, 1, num_blocks);
+    main_stream->parallel_for(
+        sycl::nd_range<3>(block_nums *
+                              sycl::range<3>(1, 1, SYCL_IM2COL_BLOCK_SIZE),
+                          sycl::range<3>(1, 1, SYCL_IM2COL_BLOCK_SIZE)),
+        [=](sycl::nd_item<3> item_ct1) {
+            pool2d_nchw_kernel(IH, IW, OH, OW, k1, k0, s1, s0, p1, p0,
+                               parallel_elements, src0_dd, dst_dd, op,
+                               item_ct1);
+        });
 }
 
 inline void ggml_sycl_op_sum(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
@@ -2800,7 +2707,7 @@ inline void ggml_sycl_op_argsort(ggml_backend_sycl_context & ctx, ggml_tensor * 
     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
 
     argsort_f32_i32_sycl(src0_dd, (int *)dst_dd, ncols, nrows, order,
-                         main_stream, ctx.device, ctx.pool());
+                         main_stream, ctx.device);
 }
 
 static void ggml_sycl_op_top_k(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -3193,7 +3100,7 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
                             src1_ddf_i_source += (i0 * ne11 + src1_col_0) * ne10;
 
                             SYCL_CHECK(
-                                CHECK_TRY_ERROR(dev2dev_memcpy(i, *stream, ctx.device, *main_stream, src1_ddf_i, src1_ddf_i_source,
+                                CHECK_TRY_ERROR(dev2dev_memcpy(*stream, *main_stream, src1_ddf_i, src1_ddf_i_source,
                                                                src1_ncols * ne10 * sizeof(float))));
                         }
                     }
@@ -3527,7 +3434,7 @@ static void ggml_sycl_mul_mat_batched_sycl(ggml_backend_sycl_context & ctx, cons
     const int64_t r3 = ne13 / ne03;
 
 #if GGML_SYCL_DNNL
-    if (g_ggml_sycl_enable_dnn) {
+    if (!g_ggml_sycl_disable_dnn) {
             int64_t str_a0 = nb00 / type_size_src0;
             int64_t str_a1 = nb01 / type_size_src0;
             int64_t str_a2 = nb02 / type_size_src0;
@@ -3676,18 +3583,32 @@ enum class mul_mat_algo {
 };
 
 inline bool ggml_sycl_supports_mmq(enum ggml_type type) {
-    // TODO: accuracy issues in MMQ
-    GGML_UNUSED(type);
-    return false;
+    // The DP4A-tiled MMQ GEMM (mmq.cpp) was disabled upstream with an unquantified
+    // "accuracy issues" note. Keep this opt-in and limited to Qwen3.6 Q5_K_XL's
+    // tensor formats; broad enablement still fails MUL_MAT (q4_0 large shape -> NaN).
+    // GGML_SYCL_ENABLE_MMQ=1 turns it on; accuracy is gated by test-backend-ops MUL_MAT.
+    static const bool enable_mmq = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MMQ");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enable_mmq) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
 }
 
 inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
             return true;
-        case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -3700,14 +3621,8 @@ inline bool ggml_sycl_supports_reorder_mul_mat_sycl(enum ggml_type type) {
 
 inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
             return true;
         default:
             return false;
@@ -3716,7 +3631,6 @@ inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
 
 inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q3_K:
@@ -3731,7 +3645,6 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
 
 static bool ggml_sycl_supports_dmmv(enum ggml_type type) {
     switch (type) {
-        case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -4083,49 +3996,6 @@ static bool reorder_qw_q6_k_moe(uint8_t * data_device, size_t expert_bytes, int6
     return true;
 }
 
-static bool reorder_qw_q2_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
-    GGML_ASSERT(size % sizeof(block_q2_K) == 0);
-    GGML_ASSERT(offset % sizeof(block_q2_K) == 0);
-
-    const int nblocks = size / sizeof(block_q2_K);
-
-    sycl_reorder_temp_buffer tmp(stream, size);
-    if (!tmp) {
-        GGML_LOG_WARN("%s: failed to allocate %zu bytes for reorder temp buffer, skipping reorder\n", __func__, size);
-        return false;
-    }
-    uint8_t * tmp_buf = static_cast<uint8_t *>(tmp.ptr);
-
-    sycl::event copy_event;
-    SYCL_CHECK(CHECK_TRY_ERROR(copy_event = stream->memcpy(tmp_buf, data_device, size)));
-    if (!g_ggml_sycl_use_async_mem_op) {
-        copy_event.wait();
-    }
-
-    auto *        qs_ptr     = data_device;
-    auto *        scales_ptr = qs_ptr + (QK_K / 4) * nblocks;
-    sycl::half2 * dm_ptr     = (sycl::half2 *) (scales_ptr + (QK_K / 16) * nblocks);
-
-    auto reorder_event = stream->parallel_for(nblocks, [=](auto i) {
-        const block_q2_K * x  = (const block_q2_K *) tmp_buf;
-        const int          ib = i;
-
-        for (int j = 0; j < QK_K / 4; ++j) {
-            qs_ptr[ib * (QK_K / 4) + j] = x[ib].qs[j];
-        }
-
-        for (int j = 0; j < QK_K / 16; ++j) {
-            scales_ptr[ib * (QK_K / 16) + j] = x[ib].scales[j];
-        }
-
-        dm_ptr[ib] = x[ib].dm;
-    });
-    if (!g_ggml_sycl_use_async_mem_op) {
-        reorder_event.wait_and_throw();
-    }
-    return true;
-}
-
 static bool reorder_qw_q3_k(uint8_t * data_device, size_t size, size_t offset, dpct::queue_ptr stream) {
     GGML_ASSERT(size % sizeof(block_q3_K) == 0);
     GGML_ASSERT(offset % sizeof(block_q3_K) == 0);
@@ -4302,8 +4172,6 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             return reorder_qw_q4_0(data_device, ncols, nrows, size, 0, stream);
         case GGML_TYPE_Q8_0:
             return reorder_qw_q8_0(data_device, ncols, nrows, size, 0, stream);
-        case GGML_TYPE_Q2_K:
-            return reorder_qw_q2_k(data_device, size, 0, stream);
         case GGML_TYPE_Q3_K:
             return reorder_qw_q3_k(data_device, size, 0, stream);
         case GGML_TYPE_Q4_K:
@@ -4317,13 +4185,22 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
     }
 }
 
+static bool ggml_sycl_mmvq_12col_disabled() {
+    static const bool disabled = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMVQ_12COL");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
+}
+
 static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_tensor * dst) {
-    return g_ggml_sycl_enable_optimize && //allow optimize, controlled by $GGML_SYCL_ENABLE_OPT
-           ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
-           dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
-           // ne[1] <= 8 so multi-column decode (spec / MTP verify) also bootstraps the reorder;
-           // all reorderable types have a _switch_ncols kernel.
-           dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
+    const bool supported_ncols = dst->src[1]->ne[1] <= 8 ||
+        (!ggml_sycl_mmvq_12col_disabled() && dst->src[1]->ne[1] == 12 && dst->src[0]->type == GGML_TYPE_Q8_0);
+    return !g_ggml_sycl_disable_optimize && //allow optimize, controlled by $GGML_SYCL_DISABLE_OPT
+            ctx.opt_feature.reorder &&      //allow this device due to good perf, skip the devices with bad perf.
+            dst->op == GGML_OP_MUL_MAT &&   //limit to some supported cases of Q4_0, to do for more cases.
+            // Q8_0 also has a direct 12-column kernel.
+            supported_ncols && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
@@ -4362,7 +4239,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
-    if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
+    if (g_ggml_sycl_disable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
     if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
@@ -4389,8 +4266,17 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Wide-batch: past the 8-column kernel templates, chunk-of-8 MMVQ still beats the
+    // dequantize+GEMM fallback for small token counts (batched decode at np<=32) — the
+    // fallback streams the dequantized f16 weights per op.
+    // GGML_SYCL_DISABLE_MMVQ_WIDE_BATCH=1 restores the old ne11<=8 cap.
+    static const bool disable_wide_batch = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMVQ_WIDE_BATCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const int64_t max_batch = disable_wide_batch ? MMVQ_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE_WIDE;
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+           src1->ne[1] <= max_batch;
 }
 
 static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4421,15 +4307,21 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(src0, src1, dst);
 
-    bool use_mul_mat_q =  ggml_sycl_supports_mmq(src0->type)
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    const bool supports_mmq = ggml_sycl_supports_mmq(src0->type);
+    bool use_mul_mat_q = supports_mmq && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
 
     // mmvq and mmq need the __dp4a instruction which is available for gen12+
     // Workaround in https://github.com/ggml-org/llama.cpp/commit/95f84d5ce8b449a9b16009434aca800df504a02e
     use_mul_mat_q = use_mul_mat_q && (src0->type != GGML_TYPE_IQ2_XXS);
 #ifdef SYCL_USE_XMX
-    use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+    // The XMX batch cap starves MMQ (MMVQ already owns ne11<=32), leaving prefill on the
+    // f16 dequant GEMM. When MMQ is explicitly enabled, drop the cap so the tiled int8 GEMM
+    // takes the large-ne11 dense path (prefill / big batch); MMVQ still wins ne11<=32 by
+    // dispatch precedence below.
+    if (!supports_mmq) {
+        use_mul_mat_q = use_mul_mat_q && (src1->ne[1] <= MMQ_MAX_BATCH_SIZE);
+    }
 #endif // SYCL_USE_XMX
 
     // Dispatch becomes obscure with the reorder, MMVQ when the reorder optimization
@@ -4470,9 +4362,9 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         if (extra && extra->optimized_feature.reorder) {
-            ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q_wide);
         } else {
-            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
+            ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q_wide);
         }
     } else if (use_mul_mat_q) {
         ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_q);
@@ -4481,6 +4373,11 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     }
 }
 
+
+struct mmid_row_mapping {
+    int32_t i1;
+    int32_t i2;
+};
 
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
@@ -4524,6 +4421,56 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     }
 }
 
+// A/B gate for the batched fused MUL_MAT_ID extension: =1 restores the old behavior
+// (fused only for ne12==1, sorted host path otherwise).
+static bool ggml_sycl_mmid_fused_batch_disabled() {
+    static const bool disabled = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_FUSED_BATCH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+// True when ggml_sycl_mul_mat_id is guaranteed to take the fused device-routed path for this
+// node — i.e. no blocking host sync, which makes MUL_MAT_ID safe inside a SYCL graph record.
+// Must stay in lockstep with the bail checks in ggml_sycl_mul_mat_id_mmvq_fused and the type
+// switches in ggml_sycl_mul_mat_vec_q_id[_reorder] (reorder is decided lazily at exec time, so
+// a type is only eligible if BOTH switches dispatch it — Q4_K/Q5_K/Q6_K may go either way,
+// everything else always takes the plain switch because opt_for_reorder_id skips it).
+static bool ggml_sycl_mul_mat_id_fused_eligible(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    if (ne12 < 1 || ne12 > 64) return false;
+    if (ne12 > 1 && ggml_sycl_mmid_fused_batch_disabled()) return false;
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
+    if (!ggml_is_contiguous(src1)) return false;
+    if (ids->ne[1] != ne12) return false;
+    if (ids->nb[0] != sizeof(int32_t)) return false;
+    if (ne11 != 1 && ne11 != ids->ne[0]) return false;
+    switch (src0->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
@@ -4532,13 +4479,17 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
-    if (ne12 != 1) return false;
+    // Batched decode (ne12 tokens) stays fused: one launch, ids read on device — no per-layer
+    // host sync / per-expert launch loop. Above the cap, expert reuse across tokens makes the
+    // sorted contiguous-GEMM path win (GEMV re-reads expert weights per routed row).
+    if (ne12 < 1 || ne12 > 64) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
-    if (ids->ne[1] != 1) return false;
+    if (ids->ne[1] != ne12) return false;
+    if (ids->nb[0] != sizeof(int32_t)) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
 
     const queue_ptr stream           = ctx.stream();
@@ -4554,20 +4505,46 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     }
 
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
-    const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_row_stride   = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
+    const int    ids_row_stride    = (int) (ids->nb[1] / sizeof(int32_t));
+
+    // Grouped phase-2 path: for multi-token batches, bucket the routed (token, slot) pairs by
+    // expert on device and read each distinct expert's weights once. Below 4 tokens collisions
+    // are rare enough that the extra routing launch isn't worth it.
+    // A/B gate: GGML_SYCL_DISABLE_MMID_GROUPED=1 keeps the per-pair batched kernel.
+    static const bool disable_grouped = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_GROUPED");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const int64_t n_as = src0->ne[2];
+    if (use_reorder && !disable_grouped && ne12 >= 4) {
+        ggml_sycl_pool_alloc<int32_t> mmid_scratch(ctx.pool(),
+            (size_t) (2 * n_as + 2 + ne12 * n_experts_used));
+        if (ggml_sycl_mul_mat_vec_q_id_grouped_reorder(
+                src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
+                mmid_scratch.get(), (float *) dst->data, (int) ne10, nrows, n_experts_used,
+                (int) n_as,
+                /*expert_weight_stride=*/ src0->nb[2],
+                /*dst_row_stride=*/ dst->nb[1],
+                src1_row_stride, (int) ne12, ids_row_stride,
+                src1_token_stride, /*dst_token_stride=*/ dst->nb[2], stream)) {
+            return true;
+        }
+    }
 
     if (use_reorder) {
         return ggml_sycl_mul_mat_vec_q_id_reorder(
@@ -4575,14 +4552,1190 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
             (float *) dst->data, (int) ne10, nrows, n_experts_used,
             /*expert_weight_stride=*/ src0->nb[2],
             /*dst_row_stride=*/ dst->nb[1],
-            src1_row_stride, stream);
+            src1_row_stride, (int) ne12, ids_row_stride,
+            src1_token_stride, /*dst_token_stride=*/ dst->nb[2], stream);
     }
     return ggml_sycl_mul_mat_vec_q_id(
         src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
         (float *) dst->data, (int) ne10, nrows, n_experts_used,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+        src1_row_stride, (int) ne12, ids_row_stride,
+        src1_token_stride, /*dst_token_stride=*/ dst->nb[2], stream);
+}
+
+// Production Qwen3.6 gate/up path. The model stores two separate expert
+// matrices, but both MMIDs consume the same routed activations and ids. Compute
+// matching rows together and apply SwiGLU before storage so neither MMID result
+// is materialized and no standalone GLU kernel is submitted.
+static bool ggml_sycl_mul_mat_id_dual_swiglu_fused(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * gate,
+    const ggml_tensor * up, ggml_tensor * glu) {
+    const ggml_tensor * gate_weights = gate->src[0];
+    const ggml_tensor * up_weights   = up->src[0];
+    const ggml_tensor * src1         = gate->src[1];
+    const ggml_tensor * ids          = gate->src[2];
+    static const bool trace_reject = []() {
+        const char * env = getenv("GGML_SYCL_MOE_DUAL_SWIGLU_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID ||
+        gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
+        gate_weights->type != up_weights->type ||
+        (gate_weights->type != GGML_TYPE_Q5_K &&
+         gate_weights->type != GGML_TYPE_Q6_K) ||
+        src1->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        if (trace_reject) {
+            fprintf(stderr, "[treebeard-moe-dual-swiglu] dispatcher=type-reject\n");
+        }
+        return false;
+    }
+
+    const int64_t ncols    = src1->ne[0];
+    const int64_t nslots   = src1->ne[1];
+    const int64_t n_tokens = src1->ne[2];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t nrows    = gate_weights->ne[1];
+    const int64_t n_as     = gate_weights->ne[2];
+    if (n_tokens < 1 || n_tokens > 64 || ncols != gate_weights->ne[0] ||
+        ncols != up_weights->ne[0] || ncols % QK8_1 != 0 ||
+        up_weights->ne[1] != nrows || up_weights->ne[2] != n_as ||
+        ids->ne[1] != n_tokens || ids->nb[0] != sizeof(int32_t) ||
+        (nslots != 1 && nslots != n_used) || !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(glu) || gate->ne[0] != nrows ||
+        up->ne[0] != nrows || gate->ne[1] != n_used ||
+        up->ne[1] != n_used || gate->ne[2] != n_tokens ||
+        up->ne[2] != n_tokens || !ggml_are_same_shape(gate, up) ||
+        !ggml_are_same_shape(gate, glu)) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-moe-dual-swiglu] dispatcher=shape-reject"
+                    " ncols=%" PRId64 " nslots=%" PRId64
+                    " tokens=%" PRId64 " used=%" PRId64
+                    " rows=%" PRId64 " experts=%" PRId64 "\n",
+                    ncols, nslots, n_tokens, n_used, nrows, n_as);
+        }
+        return false;
+    }
+
+    opt_for_reorder_id(&ctx, gate_weights);
+    opt_for_reorder_id(&ctx, up_weights);
+    const ggml_tensor_extra_gpu * gate_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(gate_weights->extra);
+    const ggml_tensor_extra_gpu * up_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(up_weights->extra);
+    if (!gate_extra || !up_extra ||
+        !gate_extra->optimized_feature.reorder ||
+        !up_extra->optimized_feature.reorder) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-moe-dual-swiglu] dispatcher=reorder-reject"
+                    " gate_extra=%d gate_reorder=%d up_extra=%d up_reorder=%d\n",
+                    gate_extra != nullptr,
+                    gate_extra != nullptr && gate_extra->optimized_feature.reorder,
+                    up_extra != nullptr,
+                    up_extra != nullptr && up_extra->optimized_feature.reorder);
+        }
+        return false;
+    }
+
+    const queue_ptr stream = ctx.stream();
+    const int src1_padded_cols = GGML_PAD((int) ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(), (size_t) nslots * n_tokens * src1_padded_cols *
+                        sizeof(block_q8_1) / QK8_1);
+    char * src1_q8 = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_q8, (int) ncols,
+        (int) (nslots * n_tokens), src1_padded_cols, stream);
+
+    const size_t bytes_per_qrow =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t src1_row_stride = nslots == 1 ? 0 : bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) nslots * bytes_per_qrow;
+    const int ids_row_stride = (int) (ids->nb[1] / sizeof(int32_t));
+
+    static const bool disable_grouped = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_GROUPED");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_grouped && n_tokens >= 4) {
+        ggml_sycl_pool_alloc<int32_t> scratch(
+            ctx.pool(), (size_t) (2 * n_as + 2 + n_tokens * n_used));
+        if (ggml_sycl_mul_mat_vec_q_id_dual_swiglu_grouped_reorder(
+                gate_weights->type, gate_weights->data, up_weights->data,
+                src1_q8, (const int32_t *) ids->data, scratch.get(),
+                (float *) glu->data, (int) ncols, (int) nrows, (int) n_used,
+                (int) n_as, gate_weights->nb[2], up_weights->nb[2],
+                glu->nb[1], src1_row_stride, (int) n_tokens, ids_row_stride,
+                src1_token_stride, glu->nb[2], stream)) {
+            return true;
+        }
+    }
+
+    return ggml_sycl_mul_mat_vec_q_id_dual_swiglu_reorder(
+        gate_weights->type, gate_weights->data, up_weights->data, src1_q8,
+        (const int32_t *) ids->data, (float *) glu->data, (int) ncols,
+        (int) nrows, (int) n_used, gate_weights->nb[2], up_weights->nb[2],
+        glu->nb[1], src1_row_stride, (int) n_tokens, ids_row_stride,
+        src1_token_stride, glu->nb[2], stream);
+}
+
+// Shared-expert dense path: MUL_MAT gate + MUL_MAT up + GLU(SwiGLU). CUDA already
+// fuses this; SYCL only had the MUL_MAT_ID dual. Target: Q5_K/Q6_K reorder MMVQ,
+// decode ncols_dst=1 and small prefill batches. Disable:
+// GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU=1. Debug: GGML_SYCL_DENSE_DUAL_SWIGLU_DEBUG=1.
+static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * gate,
+    const ggml_tensor * up, ggml_tensor * glu) {
+    const ggml_tensor * gate_weights = gate->src[0];
+    const ggml_tensor * up_weights   = up->src[0];
+    const ggml_tensor * src1         = gate->src[1];
+    static const bool trace_reject = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_SWIGLU_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    const bool type_ok =
+        gate_weights->type == up_weights->type &&
+        (gate_weights->type == GGML_TYPE_Q8_0 ||
+         gate_weights->type == GGML_TYPE_Q4_K ||
+         gate_weights->type == GGML_TYPE_Q5_K ||
+         gate_weights->type == GGML_TYPE_Q6_K);
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+        gate->src[1] != up->src[1] || !type_ok ||
+        src1->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        if (trace_reject) {
+            static std::atomic<int> tr{0};
+            if (tr.fetch_add(1, std::memory_order_relaxed) < 12) {
+                fprintf(stderr,
+                        "[treebeard-dense-dual-swiglu] dispatcher=type-reject"
+                        " gate_op=%s up_op=%s same_src1=%d"
+                        " wgate=%s wup=%s src1=%s gate=%s up=%s glu=%s"
+                        " wgate_name=%s wup_name=%s\n",
+                        ggml_op_name(gate->op), ggml_op_name(up->op),
+                        gate->src[1] == up->src[1],
+                        ggml_type_name(gate_weights->type),
+                        ggml_type_name(up_weights->type),
+                        ggml_type_name(src1->type),
+                        ggml_type_name(gate->type), ggml_type_name(up->type),
+                        ggml_type_name(glu->type),
+                        gate_weights->name, up_weights->name);
+            }
+        }
+        return false;
+    }
+
+    // MMVQ shapes only: 2D weights, activation batch in ne[1], no higher dims.
+    const int64_t ncols     = src1->ne[0];
+    const int64_t ncols_dst = src1->ne[1];
+    const int64_t nrows     = gate_weights->ne[1];
+    if (ncols_dst < 1 || ncols_dst > 32 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        gate_weights->ne[0] != ncols || up_weights->ne[0] != ncols ||
+        up_weights->ne[1] != nrows ||
+        gate_weights->ne[2] != 1 || gate_weights->ne[3] != 1 ||
+        up_weights->ne[2] != 1 || up_weights->ne[3] != 1 ||
+        ncols % QK8_1 != 0 ||
+        !ggml_is_contiguous(src1) || !ggml_is_contiguous(glu) ||
+        !ggml_is_contiguous(gate_weights) || !ggml_is_contiguous(up_weights) ||
+        gate->ne[0] != nrows || up->ne[0] != nrows ||
+        gate->ne[1] != ncols_dst || up->ne[1] != ncols_dst ||
+        !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(gate, glu) ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 /* swapped */) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-swiglu] dispatcher=shape-reject"
+                    " ncols=%" PRId64 " ncols_dst=%" PRId64 " rows=%" PRId64 "\n",
+                    ncols, ncols_dst, nrows);
+        }
+        return false;
+    }
+
+    // Shared-expert Q8_0 needs MMVQ reorder (opt_for_reorder_id is K-quants only).
+    auto ensure_reorder_mmvq = [&](const ggml_tensor * w) {
+        if (g_ggml_sycl_disable_optimize || !ctx.opt_feature.reorder) {
+            return false;
+        }
+        if (!ggml_sycl_supports_reorder_mmvq(w->type)) {
+            return false;
+        }
+        ggml_tensor_extra_gpu * extra =
+            static_cast<ggml_tensor_extra_gpu *>(w->extra);
+        if (!extra) {
+            return false;
+        }
+        if (extra->optimized_feature.reorder) {
+            return true;
+        }
+        if (reorder_qw(w, ctx.stream())) {
+            extra->optimized_feature.reorder = true;
+            return true;
+        }
+        return false;
+    };
+    if (!ensure_reorder_mmvq(gate_weights) || !ensure_reorder_mmvq(up_weights)) {
+        if (trace_reject) {
+            const ggml_tensor_extra_gpu * ge =
+                static_cast<const ggml_tensor_extra_gpu *>(gate_weights->extra);
+            const ggml_tensor_extra_gpu * ue =
+                static_cast<const ggml_tensor_extra_gpu *>(up_weights->extra);
+            fprintf(stderr,
+                    "[treebeard-dense-dual-swiglu] dispatcher=reorder-reject"
+                    " gate_reorder=%d up_reorder=%d type=%s\n",
+                    ge != nullptr && ge->optimized_feature.reorder,
+                    ue != nullptr && ue->optimized_feature.reorder,
+                    ggml_type_name(gate_weights->type));
+        }
+        return false;
+    }
+
+    const queue_ptr stream = ctx.stream();
+    const int src1_padded_cols = GGML_PAD((int) ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(),
+        (size_t) ncols_dst * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_q8 = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_q8, (int) ncols, (int) ncols_dst,
+        src1_padded_cols, stream);
+
+    const size_t bytes_per_qrow =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t dst_col_stride = glu->nb[1] / sizeof(float);
+
+    const bool ok = ggml_sycl_mul_mat_vec_q_dense_dual_swiglu_reorder(
+        gate_weights->type, gate_weights->data, up_weights->data, src1_q8,
+        (float *) glu->data, (int) ncols, (int) nrows, (int) ncols_dst,
+        bytes_per_qrow, dst_col_stride, stream);
+    if (ok && trace_reject) {
+        static std::atomic<int> hits{0};
+        const int n = hits.fetch_add(1, std::memory_order_relaxed);
+        if (n < 8) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-swiglu] hit type=%s rows=%" PRId64
+                    " cols=%" PRId64 " ncols_dst=%" PRId64 "\n",
+                    ggml_type_name(gate_weights->type), nrows, ncols, ncols_dst);
+        }
+    }
+    return ok;
+}
+
+// Dense dual MMVQ: two ordinary MUL_MATs sharing one activation (no GLU).
+// Targets GDN pairs that share `cur`: attn_qkv+attn_gate (z), ssm_alpha+ssm_beta.
+// Disable: GGML_SYCL_DISABLE_DENSE_DUAL_MMVQ=1.
+// Debug:   GGML_SYCL_DENSE_DUAL_MMVQ_DEBUG=1.
+static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
+    ggml_backend_sycl_context & ctx, ggml_tensor * mm_a, ggml_tensor * mm_b) {
+    const ggml_tensor * wa   = mm_a->src[0];
+    const ggml_tensor * wb   = mm_b->src[0];
+    const ggml_tensor * src1 = mm_a->src[1];
+    static const bool trace = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_MMVQ_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    const bool type_ok =
+        wa->type == wb->type &&
+        (wa->type == GGML_TYPE_Q8_0 || wa->type == GGML_TYPE_Q4_K ||
+         wa->type == GGML_TYPE_Q5_K || wa->type == GGML_TYPE_Q6_K);
+    if (mm_a->op != GGML_OP_MUL_MAT || mm_b->op != GGML_OP_MUL_MAT ||
+        mm_a->src[1] != mm_b->src[1] || !type_ok ||
+        src1->type != GGML_TYPE_F32 ||
+        mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] type-reject wa=%s wb=%s "
+                    "same_src1=%d\n",
+                    ggml_type_name(wa->type), ggml_type_name(wb->type),
+                    mm_a->src[1] == mm_b->src[1]);
+        }
+        return false;
+    }
+
+    const int64_t ncols     = src1->ne[0];
+    const int64_t ncols_dst = src1->ne[1];
+    const int64_t nrows_a   = wa->ne[1];
+    const int64_t nrows_b   = wb->ne[1];
+    // Production np12 decode presents ncols_dst=12 (one token × 12 seqs). The
+    // original cap of 4 made this fuse *structurally inert* at serving shape
+    // (remeasured 2026-07-26: only shape-reject). Allow up to 16 for np12 +
+    // small headroom; still reject large prefill (64+ regressed pp historically).
+    // Override: GGML_SYCL_DENSE_DUAL_MMVQ_MAX_NCOLS_DST (1..64).
+    static const int max_ncols_dst = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_MMVQ_MAX_NCOLS_DST");
+        if (env == nullptr) {
+            return 16;
+        }
+        const int v = std::atoi(env);
+        if (v < 1) {
+            return 16;
+        }
+        return v > 64 ? 64 : v;
+    }();
+    if (ncols_dst < 1 || ncols_dst > max_ncols_dst ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        wa->ne[0] != ncols || wb->ne[0] != ncols ||
+        wa->ne[2] != 1 || wa->ne[3] != 1 ||
+        wb->ne[2] != 1 || wb->ne[3] != 1 ||
+        ncols % QK8_1 != 0 ||
+        !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
+        !ggml_is_contiguous(mm_a) || !ggml_is_contiguous(mm_b) ||
+        mm_a->ne[0] != nrows_a || mm_b->ne[0] != nrows_b ||
+        mm_a->ne[1] != ncols_dst || mm_b->ne[1] != ncols_dst) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] shape-reject ncols=%" PRId64
+                    " ncols_dst=%" PRId64 " rows_a=%" PRId64 " rows_b=%" PRId64
+                    " cont_src1=%d cont_a=%d cont_b=%d cont_wa=%d cont_wb=%d\n",
+                    ncols, ncols_dst, nrows_a, nrows_b,
+                    (int) ggml_is_contiguous(src1),
+                    (int) ggml_is_contiguous(mm_a),
+                    (int) ggml_is_contiguous(mm_b),
+                    (int) ggml_is_contiguous(wa),
+                    (int) ggml_is_contiguous(wb));
+        }
+        return false;
+    }
+
+    auto ensure_reorder_mmvq = [&](const ggml_tensor * w) {
+        if (g_ggml_sycl_disable_optimize || !ctx.opt_feature.reorder) {
+            return false;
+        }
+        if (!ggml_sycl_supports_reorder_mmvq(w->type)) {
+            return false;
+        }
+        ggml_tensor_extra_gpu * extra =
+            static_cast<ggml_tensor_extra_gpu *>(w->extra);
+        if (!extra) {
+            return false;
+        }
+        if (extra->optimized_feature.reorder) {
+            return true;
+        }
+        if (reorder_qw(w, ctx.stream())) {
+            extra->optimized_feature.reorder = true;
+            return true;
+        }
+        return false;
+    };
+    if (!ensure_reorder_mmvq(wa) || !ensure_reorder_mmvq(wb)) {
+        if (trace) {
+            fprintf(stderr, "[treebeard-dense-dual-mmvq] reorder-reject\n");
+        }
+        return false;
+    }
+
+    const queue_ptr stream = ctx.stream();
+    const int src1_padded_cols = GGML_PAD((int) ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(),
+        (size_t) ncols_dst * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_q8 = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_q8, (int) ncols, (int) ncols_dst,
+        src1_padded_cols, stream);
+
+    const size_t bytes_per_qrow =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t dst_a_col_stride = mm_a->nb[1] / sizeof(float);
+    const size_t dst_b_col_stride = mm_b->nb[1] / sizeof(float);
+
+    const bool ok = ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
+        wa->type, wa->data, wb->data, src1_q8,
+        (float *) mm_a->data, (float *) mm_b->data,
+        (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
+        bytes_per_qrow, dst_a_col_stride, dst_b_col_stride, stream);
+    if (ok && trace) {
+        static std::atomic<int> hits{0};
+        if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-mmvq] hit type=%s rows_a=%" PRId64
+                    " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
+                    " wa=%s wb=%s\n",
+                    ggml_type_name(wa->type), nrows_a, nrows_b, ncols,
+                    ncols_dst, wa->name, wb->name);
+        }
+    }
+    return ok;
+}
+
+// Dense dual F32 GEMV for equal-K projections sharing one activation
+// (ssm_alpha + ssm_beta on the GDN path). Default OFF; opt-in with
+// GGML_SYCL_ENABLE_DENSE_DUAL_F32=1. Debug: GGML_SYCL_DENSE_DUAL_F32_DEBUG=1.
+static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
+    ggml_backend_sycl_context & ctx, ggml_tensor * mm_a, ggml_tensor * mm_b) {
+    const ggml_tensor * wa   = mm_a->src[0];
+    const ggml_tensor * wb   = mm_b->src[0];
+    const ggml_tensor * src1 = mm_a->src[1];
+    static const bool trace = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_F32_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    if (mm_a->op != GGML_OP_MUL_MAT || mm_b->op != GGML_OP_MUL_MAT ||
+        mm_a->src[1] != mm_b->src[1] ||
+        wa->type != GGML_TYPE_F32 || wb->type != GGML_TYPE_F32 ||
+        src1->type != GGML_TYPE_F32 ||
+        mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-f32] type-reject wa=%s wb=%s "
+                    "same_src1=%d\n",
+                    ggml_type_name(wa->type), ggml_type_name(wb->type),
+                    mm_a->src[1] == mm_b->src[1]);
+        }
+        return false;
+    }
+
+    const int64_t ncols     = src1->ne[0];
+    const int64_t ncols_dst = src1->ne[1];
+    const int64_t nrows_a   = wa->ne[1];
+    const int64_t nrows_b   = wb->ne[1];
+    // Decode-first: ship path is ncols_dst=1. Cap at 8 (prefill for these
+    // small F32 pairs is already oneDNN; dual is for MKL GEMV submit savings).
+    if (ncols_dst < 1 || ncols_dst > 8 ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        wa->ne[0] != ncols || wb->ne[0] != ncols ||
+        wa->ne[2] != 1 || wa->ne[3] != 1 ||
+        wb->ne[2] != 1 || wb->ne[3] != 1 ||
+        !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(wa) || !ggml_is_contiguous(wb) ||
+        !ggml_is_contiguous(mm_a) || !ggml_is_contiguous(mm_b) ||
+        mm_a->ne[0] != nrows_a || mm_b->ne[0] != nrows_b ||
+        mm_a->ne[1] != ncols_dst || mm_b->ne[1] != ncols_dst) {
+        if (trace) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-f32] shape-reject ncols=%" PRId64
+                    " ncols_dst=%" PRId64 " rows_a=%" PRId64 " rows_b=%" PRId64
+                    "\n",
+                    ncols, ncols_dst, nrows_a, nrows_b);
+        }
+        return false;
+    }
+
+    // Reject MoE router weights — must stay on oneMKL for bit-stable expert choice.
+    if (std::strstr(wa->name, ".ffn_gate_inp.weight") != nullptr ||
+        std::strstr(wb->name, ".ffn_gate_inp.weight") != nullptr) {
+        if (trace) {
+            fprintf(stderr, "[treebeard-dense-dual-f32] router-reject\n");
+        }
+        return false;
+    }
+
+    const size_t x_col_stride      = src1->nb[1] / sizeof(float);
+    const size_t dst_a_col_stride  = mm_a->nb[1] / sizeof(float);
+    const size_t dst_b_col_stride  = mm_b->nb[1] / sizeof(float);
+    const size_t wa_row_stride     = wa->nb[1] / sizeof(float);
+    const size_t wb_row_stride     = wb->nb[1] / sizeof(float);
+
+    // Custom dual GEMV only. oneMKL gemm_batch(2) pointer-array path was tried
+    // 2026-07-20 and hung on product decode after activation hits — do not re-enable
+    // without a new bound. Custom kernel completes but measured −2.7% tg (park).
+    const bool ok = ggml_sycl_mul_mat_vec_f32_dense_dual(
+        (const float *) wa->data, (const float *) wb->data,
+        (const float *) src1->data,
+        (float *) mm_a->data, (float *) mm_b->data,
+        (int) ncols, (int) nrows_a, (int) nrows_b, (int) ncols_dst,
+        x_col_stride, dst_a_col_stride, dst_b_col_stride,
+        wa_row_stride, wb_row_stride, ctx.stream());
+    if (ok && trace) {
+        static std::atomic<int> hits{0};
+        if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
+            fprintf(stderr,
+                    "[treebeard-dense-dual-f32] hit rows_a=%" PRId64
+                    " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
+                    " wa=%s wb=%s\n",
+                    nrows_a, nrows_b, ncols, ncols_dst, wa->name, wb->name);
+        }
+    }
+    return ok;
+}
+
+// Diagnostic (TREEBEARD_MOE_ROUTE_HIST=1): how many DISTINCT experts does a layer
+// actually touch per decode step? The default MoE-down path serializes the routed
+// experts per token with no cross-token reuse, so the entire upside of any
+// expert-reuse kernel is bounded by draws/distinct. Nothing else measures this.
+// Host-syncs on the ids buffer, so it is a measurement build only - never a perf arm.
+static void ggml_sycl_moe_route_hist(const ggml_tensor * ids, const ggml_tensor * src0,
+                                     int64_t n_tokens, int n_experts_used,
+                                     const queue_ptr & stream) {
+    static const bool enabled = []() {
+        const char * env = getenv("TREEBEARD_MOE_ROUTE_HIST");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+    const int n_as = (int) src0->ne[2];
+    if (n_as <= 0) {
+        return;
+    }
+
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids)).wait()));
+
+    std::vector<int> counts((size_t) n_as, 0);
+    int draws = 0;
+    int distinct = 0;
+    int top_count = 0;
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int s = 0; s < n_experts_used; ++s) {
+            const int32_t e = *(const int32_t *) (ids_host.data() + t * ids->nb[1] + s * ids->nb[0]);
+            if (e < 0 || e >= n_as) {
+                continue;
+            }
+            ++draws;
+            if (counts[(size_t) e]++ == 0) {
+                ++distinct;
+            }
+            if (counts[(size_t) e] > top_count) {
+                top_count = counts[(size_t) e];
+            }
+        }
+    }
+
+    // Global monotonic call index; the aggregator buckets by tensor name and
+    // recovers per-layer step order from the emission order.
+    static std::atomic<long> call_index{0};
+    const long call = call_index.fetch_add(1, std::memory_order_relaxed);
+
+    fprintf(stderr,
+            "[treebeard-moe-route] call=%ld tensor=%s n_tokens=%d draws=%d"
+            " distinct=%d top_expert_count=%d\n",
+            call, src0->name, (int) n_tokens, draws, distinct, top_count);
+}
+
+// Controlled reuse probe (TREEBEARD_MOE_ROUTE_FORCE=N, N>0): overwrite the ids
+// buffer so the layer touches exactly N distinct experts while the (token,slot)
+// PAIR count stays at n_tokens*n_experts_used. That is the one experiment that
+// separates the two live explanations for why the grouped reuse kernel ties:
+//   - if MoE-down time is flat in N, the redundant weight reads were already
+//     being absorbed by cache and there is no DRAM traffic for reuse to save;
+//   - if time scales with N, DRAM traffic IS the cost, the 2.4x is real, and
+//     the grouped kernel is merely an inefficient way to collect it.
+// DESTROYS OUTPUT - the model emits garbage under this flag. Perf probe only.
+static void ggml_sycl_moe_route_force(const ggml_tensor * ids, int64_t n_tokens,
+                                      int n_experts_used, int n_as,
+                                      const queue_ptr & stream) {
+    static const int force_n = []() {
+        const char * env = getenv("TREEBEARD_MOE_ROUTE_FORCE");
+        return env == nullptr ? 0 : std::atoi(env);
+    }();
+    if (force_n <= 0) {
+        return;
+    }
+    const int n_distinct = std::min(force_n, n_as);
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids)).wait()));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        for (int s = 0; s < n_experts_used; ++s) {
+            const int32_t e = (int32_t) ((t * n_experts_used + s) % n_distinct);
+            *(int32_t *) (ids_host.data() + t * ids->nb[1] + s * ids->nb[0]) = e;
+        }
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids->data, ids_host.data(), ggml_nbytes(ids)).wait()));
+}
+
+// Phase attribution (TREEBEARD_MOE_DOWN_PHASE_PROF=1) for the MoE-down op.
+// The op is not just the GEMV: it also runs the reorder check and a src1
+// quantize launch. The npl scaling fit leaves a ~188 us/op intercept at np12
+// and this splits that intercept across the sub-steps. Inserts a stream wait
+// after each phase, so it inflates the op - use it for attribution shares,
+// never as a perf arm.
+static bool ggml_sycl_moe_phase_prof_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("TREEBEARD_MOE_DOWN_PHASE_PROF");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+enum ggml_sycl_moe_phase {
+    GGML_SYCL_MOE_PHASE_REORDER = 0,
+    GGML_SYCL_MOE_PHASE_QUANTIZE,
+    GGML_SYCL_MOE_PHASE_GEMV,
+    GGML_SYCL_MOE_PHASE_COUNT,
+};
+
+static std::atomic<long long> g_moe_phase_ns[GGML_SYCL_MOE_PHASE_COUNT];
+static std::atomic<long>      g_moe_phase_calls{ 0 };
+static std::atomic<long>      g_moe_phase_tokens{ 0 };
+
+// returns the timestamp to hand to the next phase
+static std::chrono::steady_clock::time_point ggml_sycl_moe_phase_mark(
+    ggml_sycl_moe_phase phase, std::chrono::steady_clock::time_point prev,
+    const queue_ptr & stream) {
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    const auto now = std::chrono::steady_clock::now();
+    g_moe_phase_ns[phase].fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - prev).count(),
+        std::memory_order_relaxed);
+    return now;
+}
+
+// Reports the WINDOW delta, not the running mean. A cumulative mean keeps warmup
+// (JIT, cold caches, first-touch of ~30 GB of weights) in every later report -
+// that is exactly how a nonexistent "188 us/op fixed cost" got published once.
+static void ggml_sycl_moe_phase_report(int64_t n_tokens) {
+    constexpr long window = 2000;
+    const long calls = g_moe_phase_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_moe_phase_tokens.fetch_add((long) n_tokens, std::memory_order_relaxed);
+    if (calls % window != 0) {
+        return;
+    }
+    static long long prev[GGML_SYCL_MOE_PHASE_COUNT] = { 0 };
+    static long      prev_tokens = 0;
+    const long long  cur[GGML_SYCL_MOE_PHASE_COUNT] = {
+        g_moe_phase_ns[GGML_SYCL_MOE_PHASE_REORDER].load(),
+        g_moe_phase_ns[GGML_SYCL_MOE_PHASE_QUANTIZE].load(),
+        g_moe_phase_ns[GGML_SYCL_MOE_PHASE_GEMV].load(),
+    };
+    const long cur_tokens = g_moe_phase_tokens.load();
+    const double r = (cur[0] - prev[0]) / 1e3 / window;
+    const double q = (cur[1] - prev[1]) / 1e3 / window;
+    const double g = (cur[2] - prev[2]) / 1e3 / window;
+    fprintf(stderr,
+            "[treebeard-moe-phase] window_end=%ld mean_tokens=%.1f"
+            " reorder=%.2f quantize=%.2f gemv=%.2f total=%.2f us/op"
+            " (gemv %.1f%%)\n",
+            calls, (double) (cur_tokens - prev_tokens) / window, r, q, g, r + q + g,
+            100.0 * g / (r + q + g));
+    for (int i = 0; i < GGML_SYCL_MOE_PHASE_COUNT; ++i) {
+        prev[i] = cur[i];
+    }
+    prev_tokens = cur_tokens;
+}
+
+// MoE down-projection specialization: compute routed expert dots, multiply by
+// routing weights in slot order, and write only the final token output.
+static bool ggml_sycl_mul_mat_id_mmvq_weighted(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * mmid,
+    const ggml_tensor * weights, ggml_tensor * dst) {
+    const ggml_tensor * src0 = mmid->src[0];
+    const ggml_tensor * src1 = mmid->src[1];
+    const ggml_tensor * ids  = mmid->src[2];
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+
+    // ne12 is the token batch on src1. Allow single-token (decode) so the
+    // integrated weighted path can replace separate mul_mat_id + weighted_sum.
+    if (!ggml_sycl_mul_mat_id_fused_eligible(mmid) || ne12 < 1 || ne12 > 64) {
+        return false;
+    }
+    const int64_t n_ids_per_group = ids->ne[0];
+    if (ne11 != n_ids_per_group || ids->ne[1] != ne12 ||
+        weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) ||
+        weights->ne[0] != 1 || weights->ne[1] != n_ids_per_group ||
+        weights->ne[2] != ne12 || weights->ne[3] != 1 ||
+        dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        dst->ne[0] != src0->ne[1] || dst->ne[1] != ne12 ||
+        dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+
+    const queue_ptr stream           = ctx.stream();
+    const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
+    const int       n_experts_used   = (int) n_ids_per_group;
+    const int       nrows            = (int) src0->ne[1];
+
+    ggml_sycl_moe_route_force(ids, ne12, n_experts_used, (int) src0->ne[2], stream);
+    ggml_sycl_moe_route_hist(ids, src0, ne12, n_experts_used, stream);
+
+    const bool phase_prof = ggml_sycl_moe_phase_prof_enabled();
+    if (phase_prof) {
+        // Drain everything the graph queued BEFORE this op, otherwise the first
+        // phase mark charges all of that pipeline depth to the reorder check.
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+    }
+    auto phase_t = std::chrono::steady_clock::now();
+
+    opt_for_reorder_id(&ctx, src0);
+    if (phase_prof) {
+        phase_t = ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_REORDER, phase_t, stream);
+    }
+    const ggml_tensor_extra_gpu * src0_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const bool reorder_type = src0->type == GGML_TYPE_Q4_K ||
+                              src0->type == GGML_TYPE_Q5_K ||
+                              src0->type == GGML_TYPE_Q6_K;
+    const bool use_reorder = reorder_type && src0_extra != nullptr &&
+                             src0_extra->optimized_feature.reorder;
+    if (!use_reorder && src0->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
+        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_ddq = src1_q8_alloc.get();
+    if (use_reorder) {
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
+            src1_padded_cols, stream);
+    } else {
+        quantize_row_q8_1_sycl<quantize_q8_1>(
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
+            src1_padded_cols, stream);
+    }
+    if (phase_prof) {
+        phase_t = ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_QUANTIZE, phase_t, stream);
+    }
+
+    const size_t bytes_per_qrow =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t src1_row_stride   = bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
+    const int    ids_row_stride    = (int) (ids->nb[1] / sizeof(int32_t));
+
+    if (use_reorder) {
+        // Dual-topology expert-grouped down: keeps rows_per_sg + weight-once.
+        // Opt-in only (classic all-experts-in-WG grouped remains separate park).
+        static const bool enable_expert_grouped = []() {
+            const char * enable = getenv("GGML_SYCL_ENABLE_MOE_DOWN_EXPERT_GROUPED");
+            return enable != nullptr && std::atoi(enable) != 0;
+        }();
+        if (enable_expert_grouped && ne12 >= 4) {
+            const int n_as = (int) src0->ne[2];
+            // Atomic-dst path: only scratch for group_pairs (no multi-MB contrib).
+            if (ne12 <= 256) {
+                ggml_sycl_pool_alloc<int32_t> scratch(
+                    ctx.pool(), (size_t) (2 * n_as + 2 + ne12 * n_experts_used));
+                if (ggml_sycl_mul_mat_vec_q_id_weighted_expert_grouped_reorder(
+                        src0->type, src0->data, src1_ddq,
+                        (const int32_t *) ids->data, (const float *) weights->data,
+                        scratch.get(), (float *) dst->data,
+                        (int) ne10, nrows, n_experts_used, n_as, src0->nb[2],
+                        src1_row_stride, weights->nb[1], (int) ne12, ids_row_stride,
+                        src1_token_stride, weights->nb[2], dst->nb[1], stream)) {
+                    static const bool trace_eg = []() {
+                        const char * env = getenv("GGML_SYCL_MOE_DOWN_REDUCE_DEBUG");
+                        return env != nullptr && std::atoi(env) != 0;
+                    }();
+                    static std::atomic<int> once{0};
+                    if (trace_eg && once.fetch_add(1) < 4) {
+                        fprintf(stderr,
+                                "[treebeard-moe-down-reduce] event=expert-grouped-hit"
+                                " mode=atomic-dst rows=%d experts=%d tokens=%" PRId64 "\n",
+                                nrows, n_experts_used, ne12);
+                    }
+                    if (phase_prof) {
+                        ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+                        ggml_sycl_moe_phase_report(ne12);
+                    }
+                    return true;
+                }
+            }
+        }
+        static const bool enable_grouped = []() {
+            const char * enable = getenv("GGML_SYCL_ENABLE_MOE_DOWN_GROUPED");
+            const char * disable_all = getenv("GGML_SYCL_DISABLE_MMID_GROUPED");
+            const char * disable_down = getenv("GGML_SYCL_DISABLE_MOE_DOWN_GROUPED");
+            return enable != nullptr && std::atoi(enable) != 0 &&
+                   !(disable_all != nullptr && std::atoi(disable_all) != 0) &&
+                   !(disable_down != nullptr && std::atoi(disable_down) != 0);
+        }();
+        if (enable_grouped && ne12 >= 4) {
+            const int n_as = (int) src0->ne[2];
+            ggml_sycl_pool_alloc<int32_t> scratch(
+                ctx.pool(), (size_t) (2 * n_as + 2 + ne12 * n_experts_used));
+            if (ggml_sycl_mul_mat_vec_q_id_weighted_grouped_reorder(
+                    src0->type, src0->data, src1_ddq,
+                    (const int32_t *) ids->data, (const float *) weights->data,
+                    scratch.get(), (float *) dst->data, (int) ne10, nrows,
+                    n_experts_used, n_as, src0->nb[2], src1_row_stride,
+                    weights->nb[1], (int) ne12, ids_row_stride,
+                    src1_token_stride, weights->nb[2], dst->nb[1], stream)) {
+                static const bool trace_grouped = []() {
+                    const char * env = getenv("GGML_SYCL_MOE_DOWN_REDUCE_DEBUG");
+                    return env != nullptr && std::atoi(env) != 0;
+                }();
+                static std::atomic<int> trace_counts[65];
+                if (trace_grouped &&
+                    trace_counts[ne12].fetch_add(1, std::memory_order_relaxed) < 4) {
+                    fprintf(stderr,
+                            "[treebeard-moe-down-reduce] event=batched-grouped-hit"
+                            " rows=%d experts=%d tokens=%" PRId64 "\n",
+                            nrows, n_experts_used, ne12);
+                }
+                if (phase_prof) {
+                    ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+                    ggml_sycl_moe_phase_report(ne12);
+                }
+                return true;
+            }
+        }
+        const bool ok_reorder = ggml_sycl_mul_mat_vec_q_id_weighted_reorder(
+            src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
+            (const float *) weights->data, (float *) dst->data,
+            (int) ne10, nrows, n_experts_used,
+            /*expert_weight_stride=*/ src0->nb[2], src1_row_stride,
+            /*weights_slot_stride=*/ weights->nb[1], (int) ne12, ids_row_stride,
+            src1_token_stride, /*weights_token_stride=*/ weights->nb[2],
+            /*dst_token_stride=*/ dst->nb[1], stream);
+        if (phase_prof) {
+            ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+            ggml_sycl_moe_phase_report(ne12);
+        }
+        return ok_reorder;
+    }
+    const bool ok_weighted = ggml_sycl_mul_mat_vec_q_id_weighted(
+        src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
+        (const float *) weights->data, (float *) dst->data,
+        (int) ne10, nrows, n_experts_used,
+        /*expert_weight_stride=*/ src0->nb[2], src1_row_stride,
+        /*weights_slot_stride=*/ weights->nb[1], (int) ne12, ids_row_stride,
+        src1_token_stride, /*weights_token_stride=*/ weights->nb[2],
+        /*dst_token_stride=*/ dst->nb[1], stream);
+    if (phase_prof) {
+        ggml_sycl_moe_phase_mark(GGML_SYCL_MOE_PHASE_GEMV, phase_t, stream);
+        ggml_sycl_moe_phase_report(ne12);
+    }
+    return ok_weighted;
+}
+
+// Dual+down redesign v2: modern dual (shared_act + count1) → f32 intermediate →
+// Q8 quantize → modern expert-grouped atomic-dst down. Replaces the old
+// pipeline dual_q8 + weighted_grouped path that lost multi-shape/rps4/eg.
+// Opt-in: GGML_SYCL_ENABLE_MOE_DUAL_DOWN_V2=1 (also enables pipeline fuse region).
+static bool ggml_sycl_moe_dual_down_v2_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MOE_DUAL_DOWN_V2");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Dual→LDS→down: one WG per expert, intermediate resident in local memory.
+// Opt-in: GGML_SYCL_ENABLE_MOE_DUAL_DOWN_LDS=1 (also enables pipeline fuse region).
+static bool ggml_sycl_moe_dual_down_lds_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MOE_DUAL_DOWN_LDS");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Dual→Q8-band multi-WG partial down: one WG per (expert, QK_K intermediate band).
+// Opt-in: GGML_SYCL_ENABLE_MOE_DUAL_DOWN_Q8BAND=1 (also enables pipeline fuse region).
+static bool ggml_sycl_moe_dual_down_q8band_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MOE_DUAL_DOWN_Q8BAND");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Complete batched MoE expert pipeline. The graph still exposes separate
+// gate/up MMIDs, SwiGLU, down MMID, routing MUL, and ordered expert reduction;
+// this dispatcher consumes the entire region with one routing pre-pass and two
+// compute submissions. The gate/up kernel emits reordered Q8_1 directly, so no
+// global F32 expert activation or standalone quantization kernel is produced.
+// When DUAL_DOWN_V2 is set, uses modern dual + eg-down instead of legacy tiles.
+static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * gate,
+    const ggml_tensor * up, const ggml_tensor * glu,
+    const ggml_tensor * down, const ggml_tensor * route_weights,
+    ggml_tensor * dst) {
+    const ggml_tensor * gate_weights = gate->src[0];
+    const ggml_tensor * up_weights   = up->src[0];
+    const ggml_tensor * down_weights = down->src[0];
+    const ggml_tensor * src1         = gate->src[1];
+    const ggml_tensor * ids          = gate->src[2];
+    static const bool trace_reject = []() {
+        const char * env = getenv("GGML_SYCL_MOE_PIPELINE_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    if (gate->op != GGML_OP_MUL_MAT_ID || up->op != GGML_OP_MUL_MAT_ID ||
+        glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT_ID ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        glu->src[0] != gate || glu->src[1] != up ||
+        gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
+        down->src[1] != glu || down->src[2] != ids ||
+        gate_weights->type != up_weights->type ||
+        (gate_weights->type != GGML_TYPE_Q5_K &&
+         gate_weights->type != GGML_TYPE_Q6_K) ||
+        (down_weights->type != GGML_TYPE_Q4_K &&
+         down_weights->type != GGML_TYPE_Q5_K &&
+         down_weights->type != GGML_TYPE_Q6_K) ||
+        src1->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+        down->type != GGML_TYPE_F32 || route_weights->type != GGML_TYPE_F32 ||
+        dst->type != GGML_TYPE_F32) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-moe-pipeline] dispatcher=type-or-edge-reject"
+                    " gate=%s up=%s down=%s glu_op=%d\n",
+                    ggml_type_name(gate_weights->type),
+                    ggml_type_name(up_weights->type),
+                    ggml_type_name(down_weights->type),
+                    (int) ggml_get_glu_op(glu));
+        }
+        return false;
+    }
+
+    const int64_t gate_ncols = src1->ne[0];
+    const int64_t nslots     = src1->ne[1];
+    const int64_t n_tokens   = src1->ne[2];
+    const int64_t n_used     = ids->ne[0];
+    const int64_t gate_nrows = gate_weights->ne[1];
+    const int64_t down_nrows = down_weights->ne[1];
+    const int64_t n_as       = gate_weights->ne[2];
+    if (n_tokens < 4 || n_tokens > 64 || n_used < 2 || n_used > 16 ||
+        n_as > 256 || gate_ncols != gate_weights->ne[0] ||
+        gate_ncols != up_weights->ne[0] || gate_ncols % QK8_1 != 0 ||
+        gate_nrows < QK8_1 || gate_nrows % QK8_1 != 0 ||
+        up_weights->ne[1] != gate_nrows || up_weights->ne[2] != n_as ||
+        down_weights->ne[0] != gate_nrows || down_weights->ne[2] != n_as ||
+        ids->ne[1] != n_tokens || ids->nb[0] != sizeof(int32_t) ||
+        (nslots != 1 && nslots != n_used) ||
+        !ggml_is_contiguous(src1) || !ggml_is_contiguous(route_weights) ||
+        !ggml_is_contiguous(dst) ||
+        gate->ne[0] != gate_nrows || gate->ne[1] != n_used ||
+        gate->ne[2] != n_tokens || !ggml_are_same_shape(gate, up) ||
+        !ggml_are_same_shape(gate, glu) ||
+        down->ne[0] != down_nrows || down->ne[1] != n_used ||
+        down->ne[2] != n_tokens || down->ne[3] != 1 ||
+        route_weights->ne[0] != 1 || route_weights->ne[1] != n_used ||
+        route_weights->ne[2] != n_tokens || route_weights->ne[3] != 1 ||
+        dst->ne[0] != down_nrows || dst->ne[1] != n_tokens ||
+        dst->ne[2] != 1 || dst->ne[3] != 1) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-moe-pipeline] dispatcher=shape-reject"
+                    " gate_cols=%" PRId64 " gate_rows=%" PRId64
+                    " down_rows=%" PRId64 " slots=%" PRId64
+                    " used=%" PRId64 " tokens=%" PRId64
+                    " experts=%" PRId64 " down_ne=%" PRId64 ",%" PRId64
+                    ",%" PRId64 ",%" PRId64 " dst_ne=%" PRId64 ",%" PRId64
+                    ",%" PRId64 ",%" PRId64 "\n",
+                    gate_ncols, gate_nrows, down_nrows, nslots, n_used,
+                    n_tokens, n_as, down->ne[0], down->ne[1], down->ne[2],
+                    down->ne[3], dst->ne[0], dst->ne[1], dst->ne[2],
+                    dst->ne[3]);
+        }
+        return false;
+    }
+
+    opt_for_reorder_id(&ctx, gate_weights);
+    opt_for_reorder_id(&ctx, up_weights);
+    opt_for_reorder_id(&ctx, down_weights);
+    const ggml_tensor_extra_gpu * gate_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(gate_weights->extra);
+    const ggml_tensor_extra_gpu * up_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(up_weights->extra);
+    const ggml_tensor_extra_gpu * down_extra =
+        static_cast<const ggml_tensor_extra_gpu *>(down_weights->extra);
+    if (!gate_extra || !up_extra || !down_extra ||
+        !gate_extra->optimized_feature.reorder ||
+        !up_extra->optimized_feature.reorder ||
+        !down_extra->optimized_feature.reorder) {
+        if (trace_reject) {
+            fprintf(stderr,
+                    "[treebeard-moe-pipeline] dispatcher=reorder-reject"
+                    " gate=%d up=%d down=%d\n",
+                    gate_extra != nullptr && gate_extra->optimized_feature.reorder,
+                    up_extra != nullptr && up_extra->optimized_feature.reorder,
+                    down_extra != nullptr && down_extra->optimized_feature.reorder);
+        }
+        return false;
+    }
+
+    const queue_ptr stream = ctx.stream();
+    const int src1_padded_cols =
+        GGML_PAD((int) gate_ncols, MATRIX_ROW_PADDING);
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(), (size_t) nslots * n_tokens * src1_padded_cols *
+                        sizeof(block_q8_1) / QK8_1);
+    char * src1_q8 = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_q8, (int) gate_ncols,
+        (int) (nslots * n_tokens), src1_padded_cols, stream);
+
+    const int gate_nrows_padded =
+        GGML_PAD((int) gate_nrows, MATRIX_ROW_PADDING);
+    const size_t src1_qrow_bytes =
+        (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t glu_qrow_bytes =
+        (size_t) gate_nrows_padded * sizeof(block_q8_1) / QK8_1;
+    ggml_sycl_pool_alloc<int32_t> scratch(
+        ctx.pool(), (size_t) (2 * n_as + 2 + n_tokens * n_used));
+    const int ids_row_stride = (int) (ids->nb[1] / sizeof(int32_t));
+
+    const size_t src1_row_stride_in =
+        nslots == 1 ? 0 : src1_qrow_bytes;
+    const size_t src1_token_stride_in =
+        (size_t) nslots * src1_qrow_bytes;
+
+    // --- Dual→Q8-band multi-WG partial down (split-K topology) ---
+    if (ggml_sycl_moe_dual_down_q8band_enabled() &&
+        gate_weights->type == GGML_TYPE_Q5_K &&
+        (down_weights->type == GGML_TYPE_Q4_K ||
+         down_weights->type == GGML_TYPE_Q5_K ||
+         down_weights->type == GGML_TYPE_Q6_K) &&
+        n_tokens >= 4 && gate_nrows % QK_K == 0) {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            fprintf(stderr,
+                    "[treebeard-moe-dual-down-q8band] dispatcher=hit "
+                    "gate=%s down=%s rows_g=%" PRId64 " rows_d=%" PRId64
+                    " k_blocks=%" PRId64 " tokens=%" PRId64 " used=%" PRId64
+                    " (first entry)\n",
+                    ggml_type_name(gate_weights->type),
+                    ggml_type_name(down_weights->type), gate_nrows, down_nrows,
+                    gate_nrows / QK_K, n_tokens, n_used);
+        }
+        if (ggml_sycl_mul_mat_vec_q_id_dual_down_q8band_reorder(
+                gate_weights->type, down_weights->type, gate_weights->data,
+                up_weights->data, down_weights->data, src1_q8,
+                (const int32_t *) ids->data,
+                (const float *) route_weights->data, scratch.get(),
+                (float *) dst->data, (int) gate_ncols, (int) gate_nrows,
+                (int) down_nrows, (int) n_used, (int) n_as,
+                gate_weights->nb[2], up_weights->nb[2], down_weights->nb[2],
+                src1_row_stride_in, route_weights->nb[1], (int) n_tokens,
+                ids_row_stride, src1_token_stride_in, route_weights->nb[2],
+                dst->nb[1], stream)) {
+            return true;
+        }
+        if (trace_reject) {
+            fprintf(stderr, "[treebeard-moe-dual-down-q8band] dispatch-reject\n");
+        }
+        return false;
+    }
+
+    // --- Dual→LDS→down: intermediate residency in local memory ---
+    if (ggml_sycl_moe_dual_down_lds_enabled() &&
+        gate_weights->type == GGML_TYPE_Q5_K &&
+        (down_weights->type == GGML_TYPE_Q4_K ||
+         down_weights->type == GGML_TYPE_Q5_K ||
+         down_weights->type == GGML_TYPE_Q6_K) &&
+        n_tokens >= 4) {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            fprintf(stderr,
+                    "[treebeard-moe-dual-down-lds] dispatcher=hit "
+                    "gate=%s down=%s rows_g=%" PRId64 " rows_d=%" PRId64
+                    " tokens=%" PRId64 " used=%" PRId64 " (first entry)\n",
+                    ggml_type_name(gate_weights->type),
+                    ggml_type_name(down_weights->type), gate_nrows, down_nrows,
+                    n_tokens, n_used);
+        }
+        if (ggml_sycl_mul_mat_vec_q_id_dual_down_lds_reorder(
+                gate_weights->type, down_weights->type, gate_weights->data,
+                up_weights->data, down_weights->data, src1_q8,
+                (const int32_t *) ids->data,
+                (const float *) route_weights->data, scratch.get(),
+                (float *) dst->data, (int) gate_ncols, (int) gate_nrows,
+                (int) down_nrows, (int) n_used, (int) n_as,
+                gate_weights->nb[2], up_weights->nb[2], down_weights->nb[2],
+                src1_row_stride_in, route_weights->nb[1], (int) n_tokens,
+                ids_row_stride, src1_token_stride_in, route_weights->nb[2],
+                dst->nb[1], stream)) {
+            return true;
+        }
+        if (trace_reject) {
+            fprintf(stderr, "[treebeard-moe-dual-down-lds] dispatch-reject\n");
+        }
+        return false;
+    }
+
+    // --- Dual+down v2: modern dual + eg-down (not legacy dual_q8 pipeline) ---
+    if (ggml_sycl_moe_dual_down_v2_enabled() &&
+        (gate_weights->type == GGML_TYPE_Q5_K ||
+         gate_weights->type == GGML_TYPE_Q6_K) &&
+        (down_weights->type == GGML_TYPE_Q4_K ||
+         down_weights->type == GGML_TYPE_Q5_K ||
+         down_weights->type == GGML_TYPE_Q6_K) &&
+        n_tokens >= 4) {
+        static std::atomic<int> once{0};
+        if (once.fetch_add(1) == 0) {
+            fprintf(stderr,
+                    "[treebeard-moe-dual-down-v2] mode=modern-dual+eg-down "
+                    "gate=%s down=%s rows_g=%" PRId64 " rows_d=%" PRId64
+                    " tokens=%" PRId64 " used=%" PRId64 " (first entry)\n",
+                    ggml_type_name(gate_weights->type),
+                    ggml_type_name(down_weights->type), gate_nrows, down_nrows,
+                    n_tokens, n_used);
+        }
+
+        // Contiguous f32 intermediate [token][slot][row] matching glu layout.
+        const size_t inter_elems =
+            (size_t) n_tokens * (size_t) n_used * (size_t) gate_nrows;
+        ggml_sycl_pool_alloc<float> f32_inter(ctx.pool(), inter_elems);
+        const size_t dst_row_stride_b   = (size_t) gate_nrows * sizeof(float);
+        const size_t dst_token_stride_b =
+            (size_t) n_used * dst_row_stride_b;
+
+        if (!ggml_sycl_mul_mat_vec_q_id_dual_swiglu_grouped_reorder(
+                gate_weights->type, gate_weights->data, up_weights->data,
+                src1_q8, (const int32_t *) ids->data, scratch.get(),
+                f32_inter.get(), (int) gate_ncols, (int) gate_nrows,
+                (int) n_used, (int) n_as, gate_weights->nb[2],
+                up_weights->nb[2], dst_row_stride_b, src1_row_stride_in,
+                (int) n_tokens, ids_row_stride, src1_token_stride_in,
+                dst_token_stride_b, stream)) {
+            if (trace_reject) {
+                fprintf(stderr,
+                        "[treebeard-moe-dual-down-v2] dual-grouped-reject\n");
+            }
+            return false;
+        }
+
+        // Quantize intermediate to reordered Q8_1 for eg-down.
+        ggml_sycl_pool_alloc<char> glu_q8_alloc(
+            ctx.pool(), (size_t) n_used * n_tokens * glu_qrow_bytes);
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+            f32_inter.get(), glu_q8_alloc.get(), (int) gate_nrows,
+            (int) (n_used * n_tokens), gate_nrows_padded, stream);
+
+        const size_t q8_row_stride   = glu_qrow_bytes;
+        const size_t q8_token_stride = (size_t) n_used * glu_qrow_bytes;
+
+        if (!ggml_sycl_mul_mat_vec_q_id_weighted_expert_grouped_reorder(
+                down_weights->type, down_weights->data, glu_q8_alloc.get(),
+                (const int32_t *) ids->data,
+                (const float *) route_weights->data, scratch.get(),
+                (float *) dst->data, (int) gate_nrows, (int) down_nrows,
+                (int) n_used, (int) n_as, down_weights->nb[2], q8_row_stride,
+                route_weights->nb[1], (int) n_tokens, ids_row_stride,
+                q8_token_stride, route_weights->nb[2], dst->nb[1], stream)) {
+            if (trace_reject) {
+                fprintf(stderr,
+                        "[treebeard-moe-dual-down-v2] eg-down-reject\n");
+            }
+            return false;
+        }
+        return true;
+    }
+
+    // Legacy pipeline (PARK −23.8% on modern stack): dual_q8 tile + ordered
+    // weighted_grouped down. Kept for A/B when V2 is off and PIPELINE=1.
+    ggml_sycl_pool_alloc<char> glu_q8_alloc(
+        ctx.pool(), (size_t) n_used * n_tokens * glu_qrow_bytes);
+
+    return ggml_sycl_mul_mat_vec_q_id_swiglu_down_grouped_reorder(
+        gate_weights->type, down_weights->type, gate_weights->data,
+        up_weights->data, down_weights->data, src1_q8,
+        (const int32_t *) ids->data, (const float *) route_weights->data,
+        scratch.get(), glu_q8_alloc.get(), (float *) dst->data,
+        (int) gate_ncols, (int) gate_nrows, gate_nrows_padded,
+        (int) down_nrows, (int) n_used, (int) n_as,
+        gate_weights->nb[2], up_weights->nb[2], down_weights->nb[2],
+        nslots == 1 ? 0 : src1_qrow_bytes, route_weights->nb[1],
+        (int) n_tokens, ids_row_stride,
+        (size_t) nslots * src1_qrow_bytes, glu_qrow_bytes,
+        (size_t) n_used * glu_qrow_bytes, route_weights->nb[2], dst->nb[1],
+        stream);
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -4641,7 +5794,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
+    // Fused device-routed expert GEMV: handles ne12 up to its batch cap (see the bail checks).
+    if (ne12 == 1 || !ggml_sycl_mmid_fused_batch_disabled()) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
@@ -4652,8 +5806,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
-
-    // also ensures ctx.mmid_row_mapping_host is drained before we use it again
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
 
     ggml_tensor src0_row = *src0;
@@ -4711,7 +5863,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         // where each expert's slice starts and the previous ends (row indices, right-exclusive)
         std::vector<int64_t> expert_row_offsets;
         // the sources (slot/token pairs) of contiguous rows to guide k_copy_src1_to_contiguous
-        std::vector<mmid_row_mapping> & routed_row_src = ctx.mmid_row_mapping_host;
+        std::vector<mmid_row_mapping> routed_row_src;
 
         mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows,
                                 expert_row_counts, expert_row_offsets, routed_row_src);
@@ -4815,11 +5967,6 @@ static void ggml_sycl_pool2d(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     ggml_sycl_op_pool2d(ctx, dst);
 }
 
-static void ggml_sycl_pool1d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
-    ggml_sycl_op_pool1d(ctx, dst);
-}
-
 static void ggml_sycl_im2col(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     ggml_sycl_op_im2col(ctx, dst);
@@ -4828,16 +5975,6 @@ static void ggml_sycl_im2col(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
 static void ggml_sycl_im2col_3d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     ggml_sycl_op_im2col_3d(ctx, dst);
-}
-
-static void ggml_sycl_col2im_1d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
-    ggml_sycl_op_col2im_1d(ctx, dst);
-}
-
-static void ggml_sycl_conv_3d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
-    ggml_sycl_op_conv_3d(ctx, dst);
 }
 
 static void ggml_sycl_sum(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -4903,20 +6040,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_ARGMAX:
             ggml_sycl_argmax(ctx, dst);
             break;
-        case GGML_OP_CONV_2D:
-            ggml_sycl_op_conv2d(ctx, dst);
-            break;
-        case GGML_OP_CONV_2D_DW:
-            ggml_sycl_op_conv2d_dw(ctx, dst);
-            break;
-        case GGML_OP_CONV_3D:
-            ggml_sycl_conv_3d(ctx, dst);
-            break;
         case GGML_OP_CONV_TRANSPOSE_1D:
             ggml_sycl_op_conv_transpose_1d(ctx, dst);
-            break;
-        case GGML_OP_CONV_TRANSPOSE_2D:
-            ggml_sycl_op_conv2d_transpose(ctx, dst);
             break;
         case GGML_OP_REPEAT:
             ggml_sycl_repeat(ctx, dst);
@@ -4999,9 +6124,6 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                 case GGML_UNARY_OP_EXP:
                     ggml_sycl_exp(ctx, dst);
                     break;
-                case GGML_UNARY_OP_EXPM1:
-                    ggml_sycl_expm1(ctx, dst);
-                    break;
                 case GGML_UNARY_OP_SOFTPLUS:
                     ggml_sycl_softplus(ctx, dst);
                     break;
@@ -5013,9 +6135,6 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
                     break;
                 case GGML_UNARY_OP_ELU:
                     ggml_sycl_elu(ctx, dst);
-                    break;
-                case GGML_UNARY_OP_XIELU:
-                    ggml_sycl_xielu(ctx, dst);
                     break;
                 case GGML_UNARY_OP_FLOOR:
                     ggml_sycl_floor(ctx, dst);
@@ -5146,12 +6265,6 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_SOFT_MAX_BACK:
             ggml_sycl_op_soft_max_back(ctx, dst);
             break;
-        case GGML_OP_CROSS_ENTROPY_LOSS:
-            ggml_sycl_cross_entropy_loss(ctx, dst);
-            break;
-        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
-            ggml_sycl_cross_entropy_loss_back(ctx, dst);
-            break;
         case GGML_OP_ROPE:
             ggml_sycl_rope(ctx, dst);
             break;
@@ -5164,14 +6277,8 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_IM2COL_3D:
             ggml_sycl_im2col_3d(ctx, dst);
             break;
-        case GGML_OP_COL2IM_1D:
-            ggml_sycl_col2im_1d(ctx, dst);
-            break;
         case GGML_OP_POOL_2D:
             ggml_sycl_pool2d(ctx, dst);
-            break;
-        case GGML_OP_POOL_1D:
-            ggml_sycl_pool1d(ctx, dst);
             break;
         case GGML_OP_SUM:
             ggml_sycl_sum(ctx, dst);
@@ -5373,11 +6480,1609 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Detect a fusable op subgraph starting at node i and, if found, dispatch a single fused kernel.
+// Returns the number of *following* nodes consumed (0 = no fusion, dispatch node i normally).
+// Decode on this backend is host-submit bound, so eliding glue submits (norm-weight MUL, residual
+// ADD) directly buys throughput. Mirrors the CUDA backend's ggml_cuda_try_fuse for the patterns
+// this model actually emits. Toggle off with GGML_SYCL_DISABLE_FUSION=1.
+static bool ggml_sycl_tensor_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    GGML_ASSERT(a != nullptr && b != nullptr);
+    GGML_ASSERT(a->data != nullptr && b->data != nullptr);
+
+    const size_t a_size = ggml_nbytes(a);
+    const size_t b_size = ggml_nbytes(b);
+    if (a_size == 0 || b_size == 0) {
+        return false;
+    }
+
+    const uintptr_t a_begin = reinterpret_cast<uintptr_t>(a->data);
+    const uintptr_t b_begin = reinterpret_cast<uintptr_t>(b->data);
+
+    // Difference-based half-open interval test avoids end-address overflow.
+    return a_begin <= b_begin ? b_begin - a_begin < a_size
+                              : a_begin - b_begin < b_size;
+}
+
+enum ggml_sycl_moe_down_reduce_trace_event {
+    GGML_SYCL_MOE_DOWN_REDUCE_ELIGIBLE,
+    GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_SUBGRAPH_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_OUTPUT_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_BOUNDS_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_SUBGRAPH_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_VIEWS_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_CHAIN_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_OUTPUT_REJECT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_LIVENESS_ANNOTATED,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_WEIGHTS_SNAPSHOT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_INTEGRATED_HIT,
+    GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_HIT,
+    GGML_SYCL_MOE_DOWN_REDUCE_TRACE_EVENT_COUNT,
+};
+
+static void ggml_sycl_trace_moe_down_reduce(
+        ggml_sycl_moe_down_reduce_trace_event event,
+        const ggml_tensor * experts,
+        const ggml_tensor * dst = nullptr,
+        unsigned int detail = 0) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_MOE_DOWN_REDUCE_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+
+    static constexpr const char * event_names[] = {
+        "eligible", "single-subgraph-reject", "single-output-reject", "single-hit",
+        "batched-bounds-reject", "batched-subgraph-reject", "batched-views-reject",
+        "batched-chain-reject", "batched-output-reject", "batched-liveness-annotated",
+        "batched-weights-snapshot", "batched-integrated-hit", "batched-hit",
+    };
+    static_assert(GGML_SYCL_MOE_DOWN_REDUCE_TRACE_EVENT_COUNT ==
+                  (int) (sizeof(event_names) / sizeof(event_names[0])));
+    static std::atomic<int> event_counts[GGML_SYCL_MOE_DOWN_REDUCE_TRACE_EVENT_COUNT][65] = {};
+
+    GGML_ASSERT(event >= 0 && event < GGML_SYCL_MOE_DOWN_REDUCE_TRACE_EVENT_COUNT);
+    const int token_index = experts->ne[2] >= 0 && experts->ne[2] <= 64 ? (int) experts->ne[2] : 0;
+    const int occurrence = event_counts[event][token_index].fetch_add(1, std::memory_order_relaxed);
+    if (occurrence < 4) {
+        fprintf(stderr,
+                "[treebeard-moe-down-reduce] event=%s occurrence=%d rows=%" PRId64
+                " experts=%" PRId64 " tokens=%" PRId64
+                " detail=0x%x experts_data=%p dst_data=%p\n",
+                event_names[event], occurrence + 1, experts->ne[0], experts->ne[1], experts->ne[2],
+                detail, experts->data, dst != nullptr ? dst->data : nullptr);
+    }
+}
+
+static bool ggml_sycl_moe_down_reduce_disabled() {
+    static const bool disabled = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MOE_DOWN_REDUCE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+static bool ggml_sycl_moe_dual_swiglu_disabled() {
+    static const bool disabled = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MOE_DUAL_SWIGLU");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return disabled;
+}
+
+static bool ggml_sycl_moe_pipeline_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_MOE_PIPELINE");
+        // Dual+down v2 / LDS / Q8BAND reuse the same graph fuse region as pipeline.
+        const char * v2  = getenv("GGML_SYCL_ENABLE_MOE_DUAL_DOWN_V2");
+        const char * lds = getenv("GGML_SYCL_ENABLE_MOE_DUAL_DOWN_LDS");
+        const char * q8b = getenv("GGML_SYCL_ENABLE_MOE_DUAL_DOWN_Q8BAND");
+        return (env != nullptr && std::atoi(env) != 0) ||
+               (v2 != nullptr && std::atoi(v2) != 0) ||
+               (lds != nullptr && std::atoi(lds) != 0) ||
+               (q8b != nullptr && std::atoi(q8b) != 0);
+    }();
+    return enabled;
+}
+
+static void ggml_sycl_trace_moe_pipeline(
+        const char * event, const ggml_tensor * gate,
+        const ggml_tensor * dst = nullptr) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_MOE_PIPELINE_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+    int event_index = 4;
+    if (strcmp(event, "liveness-annotated") == 0) {
+        event_index = 0;
+    } else if (strcmp(event, "candidate") == 0) {
+        event_index = 1;
+    } else if (strcmp(event, "integrated-hit") == 0 ||
+               strcmp(event, "integrated-hit-views-first") == 0) {
+        event_index = 2;
+    } else if (strcmp(event, "dispatch-reject") == 0) {
+        event_index = 3;
+    }
+    static std::atomic<int> trace_count[5][65] = {};
+    const int token_index = gate->ne[2] >= 1 && gate->ne[2] <= 64 ?
+        (int) gate->ne[2] : 0;
+    const int occurrence = trace_count[event_index][token_index].fetch_add(
+        1, std::memory_order_relaxed);
+    if (occurrence < 8) {
+        fprintf(stderr,
+                "[treebeard-moe-pipeline] event=%s occurrence=%d gate_type=%s"
+                " rows=%" PRId64 " used=%" PRId64 " tokens=%" PRId64
+                " gate_data=%p dst_data=%p\n",
+                event, occurrence + 1, ggml_type_name(gate->src[0]->type),
+                gate->ne[0], gate->ne[1], gate->ne[2], gate->data,
+                dst != nullptr ? dst->data : nullptr);
+    }
+}
+
+static void ggml_sycl_trace_moe_dual_swiglu(
+        const char * event, const ggml_tensor * gate, const ggml_tensor * dst) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_MOE_DUAL_SWIGLU_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!enabled) {
+        return;
+    }
+    static std::atomic<int> event_counts[4][65] = {};
+    int event_index = 3;
+    if (strcmp(event, "liveness-annotated") == 0) {
+        event_index = 0;
+    } else if (strcmp(event, "candidate") == 0) {
+        event_index = 1;
+    } else if (strcmp(event, "dual-integrated-hit") == 0) {
+        event_index = 2;
+    }
+    const int token_index = gate->ne[2] >= 1 && gate->ne[2] <= 64 ?
+        (int) gate->ne[2] : 0;
+    const int occurrence = event_counts[event_index][token_index].fetch_add(
+        1, std::memory_order_relaxed);
+    if (occurrence < 4) {
+        fprintf(stderr,
+                "[treebeard-moe-dual-swiglu] event=%s occurrence=%d type=%s"
+                " rows=%" PRId64 " experts=%" PRId64 " tokens=%" PRId64
+                " gate_data=%p dst_data=%p\n",
+                event, occurrence + 1, ggml_type_name(gate->src[0]->type),
+                gate->ne[0], gate->ne[1], gate->ne[2], gate->data, dst->data);
+    }
+}
+
+static bool ggml_sycl_state_io_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_STATE_IO_FUSION");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_sycl_state_io_op_enabled(ggml_op op) {
+    if (!ggml_sycl_state_io_enabled()) {
+        return false;
+    }
+    static const std::string mode = []() {
+        const char * env = getenv("GGML_SYCL_STATE_IO_MODE");
+        return env != nullptr ? std::string(env) : std::string("all");
+    }();
+    if (mode == "all") {
+        return true;
+    }
+    return (mode == "ssm" && op == GGML_OP_SSM_CONV) ||
+           (mode == "gdn" && op == GGML_OP_GATED_DELTA_NET);
+}
+
+static ggml_tensor * ggml_sycl_view_base(ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static const ggml_tensor * ggml_sycl_view_base(const ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor;
+}
+
+static ggml_tensor * ggml_sycl_find_state_copy(
+        ggml_cgraph * cgraph, ggml_tensor * producer, int * count_out = nullptr) {
+    ggml_tensor * found = nullptr;
+    int count = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_CPY && node->src[0] != nullptr &&
+            ggml_sycl_view_base(node->src[0]) == producer) {
+            found = node;
+            ++count;
+        }
+    }
+    if (count_out != nullptr) {
+        *count_out = count;
+    }
+    return count == 1 ? found : nullptr;
+}
+
+static bool ggml_sycl_reserve_state_io_src(
+        ggml_tensor * node, int index, ggml_tensor * value) {
+    GGML_ASSERT(index >= 0 && index < GGML_MAX_SRC);
+    if (node->src[index] != nullptr && node->src[index] != value) {
+        return false;
+    }
+    node->src[index] = value;
+    return true;
+}
+
+// Annotate the exact AR recurrent-state pattern before allocation. The spare
+// sources are allocator liveness edges; the ordinary backend implementations
+// continue to consume only their declared sources when the opt-in path is not
+// runtime-safe for a particular recurrent copy map.
+static void ggml_sycl_annotate_state_io(ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (ggml_sycl_state_io_op_enabled(GGML_OP_SSM_CONV) &&
+            node->op == GGML_OP_SSM_CONV && node->src[0] != nullptr &&
+            node->src[0]->op == GGML_OP_CONCAT && node->src[1] != nullptr &&
+            node->ne[1] == 1) {
+            ggml_tensor * concat = node->src[0];
+            ggml_tensor * gather = concat->src[0] != nullptr
+                ? ggml_sycl_view_base(concat->src[0]) : nullptr;
+            ggml_tensor * token = concat->src[1];
+            int copy_count = 0;
+            ggml_tensor * copy = ggml_sycl_find_state_copy(cgraph, concat, &copy_count);
+            if (gather == nullptr || gather->op != GGML_OP_GET_ROWS ||
+                gather->src[0] == nullptr || gather->src[1] == nullptr ||
+                token == nullptr || copy == nullptr || copy_count != 1) {
+                continue;
+            }
+            ggml_tensor * state_cache = gather->src[0];
+            ggml_tensor * state_ids   = gather->src[1];
+            ggml_tensor * state_dst   = copy->src[1];
+            const int64_t d_conv = node->src[1]->ne[0];
+            const int64_t d_inner = node->src[1]->ne[1];
+            const int64_t state_size = (d_conv - 1) * d_inner;
+            if (state_cache->type != GGML_TYPE_F32 || state_ids->type != GGML_TYPE_I32 ||
+                token->type != GGML_TYPE_F32 || state_dst == nullptr ||
+                state_dst->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
+                d_conv < 2 || d_conv > 16 || state_cache->ne[0] != state_size ||
+                state_dst->ne[0] != state_size || state_dst->ne[1] != node->ne[2] ||
+                token->ne[0] != 1 || token->ne[1] != d_inner || token->ne[2] != node->ne[2] ||
+                ggml_sycl_view_base(state_cache) != ggml_sycl_view_base(state_dst)) {
+                continue;
+            }
+            if (!ggml_sycl_reserve_state_io_src(node, 2, state_cache) ||
+                !ggml_sycl_reserve_state_io_src(node, 3, state_ids) ||
+                !ggml_sycl_reserve_state_io_src(node, 4, token) ||
+                !ggml_sycl_reserve_state_io_src(node, 5, state_dst) ||
+                !ggml_sycl_reserve_state_io_src(node, 6, gather)) {
+                continue;
+            }
+        }
+
+        if (ggml_sycl_state_io_op_enabled(GGML_OP_GATED_DELTA_NET) &&
+            node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr &&
+            node->src[2]->ne[2] == 1 && ggml_get_op_params_i32(node, 0) == 1) {
+            ggml_tensor * gather = node->src[5] != nullptr
+                ? ggml_sycl_view_base(node->src[5]) : nullptr;
+            int copy_count = 0;
+            ggml_tensor * copy = ggml_sycl_find_state_copy(cgraph, node, &copy_count);
+            if (gather == nullptr || gather->op != GGML_OP_GET_ROWS ||
+                gather->src[0] == nullptr || gather->src[1] == nullptr ||
+                copy == nullptr || copy_count != 1) {
+                continue;
+            }
+            ggml_tensor * state_cache = gather->src[0];
+            ggml_tensor * state_ids   = gather->src[1];
+            ggml_tensor * state_dst   = copy->src[1];
+            const int64_t state_size =
+                node->src[2]->ne[0] * node->src[2]->ne[0] * node->src[2]->ne[1];
+            if (state_cache->type != GGML_TYPE_F32 || state_ids->type != GGML_TYPE_I32 ||
+                state_dst == nullptr || state_dst->type != GGML_TYPE_F32 ||
+                state_cache->ne[0] != state_size || state_dst->ne[0] != state_size ||
+                state_dst->ne[1] != node->src[2]->ne[3] ||
+                ggml_sycl_view_base(state_cache) != ggml_sycl_view_base(state_dst)) {
+                continue;
+            }
+            if (!ggml_sycl_reserve_state_io_src(node, 6, state_cache) ||
+                !ggml_sycl_reserve_state_io_src(node, 7, state_ids) ||
+                !ggml_sycl_reserve_state_io_src(node, 8, state_dst) ||
+                !ggml_sycl_reserve_state_io_src(node, 9, gather)) {
+                continue;
+            }
+        }
+    }
+}
+
+// Extend the routing-weight live range before graph allocation. The production
+// batched MoE graph expands all expert views before its ordered ADD chain. When
+// that complete tail is present, a non-compute dependency on the final ADD
+// prevents gallocr from reusing the routing-weight buffer for the destination.
+// The ADD backend reads only src[0] and src[1]; the last source is allocator
+// metadata. The runtime overlap check and tiny snapshot remain the safety net.
+static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    GGML_UNUSED(backend);
+
+    if (ggml_sycl_state_io_enabled()) {
+        ggml_sycl_annotate_state_io(cgraph);
+    }
+
+    const bool pipeline_enabled = ggml_sycl_moe_pipeline_enabled();
+    const bool disable_down =
+        ggml_sycl_moe_down_reduce_disabled() && !pipeline_enabled;
+    const bool disable_dual_swiglu =
+        ggml_sycl_moe_dual_swiglu_disabled() && !pipeline_enabled;
+    if (disable_down && disable_dual_swiglu && !pipeline_enabled) {
+        return;
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        // Keep shared activations and ids alive through the fused output. The
+        // normal graph considers their last uses to be the two MMID nodes,
+        // while the fused kernel consumes them when dispatching the GLU node's
+        // destination allocation.
+        if (!disable_dual_swiglu && i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+            cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+            ggml_tensor * mmid0 = cgraph->nodes[i];
+            ggml_tensor * mmid1 = cgraph->nodes[i + 1];
+            ggml_tensor * glu   = cgraph->nodes[i + 2];
+            const int output = i + 2;
+            if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                ggml_can_fuse_subgraph(
+                    cgraph, i,
+                    { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU },
+                    { output }) &&
+                ((glu->src[0] == mmid0 && glu->src[1] == mmid1) ||
+                 (glu->src[0] == mmid1 && glu->src[1] == mmid0)) &&
+                mmid0->src[1] == mmid1->src[1] &&
+                mmid0->src[2] == mmid1->src[2]) {
+                ggml_tensor *& activation_liveness = glu->src[GGML_MAX_SRC - 2];
+                ggml_tensor *& ids_liveness        = glu->src[GGML_MAX_SRC - 1];
+                if ((activation_liveness == nullptr ||
+                     activation_liveness == mmid0->src[1]) &&
+                    (ids_liveness == nullptr || ids_liveness == mmid0->src[2])) {
+                    activation_liveness = mmid0->src[1];
+                    ids_liveness        = mmid0->src[2];
+                    ggml_sycl_trace_moe_dual_swiglu(
+                        "liveness-annotated", glu->src[0], glu);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+
+        if (disable_down) {
+            continue;
+        }
+        ggml_tensor * experts = cgraph->nodes[i];
+        if (experts->op != GGML_OP_MUL_MAT_ID ||
+            i + 1 >= cgraph->n_nodes) {
+            continue;
+        }
+
+        ggml_tensor * weighted = cgraph->nodes[i + 1];
+        if (weighted->op != GGML_OP_MUL ||
+            (weighted->src[0] != experts && weighted->src[1] != experts)) {
+            continue;
+        }
+
+        ggml_tensor * weights = weighted->src[0] == experts ? weighted->src[1] : weighted->src[0];
+        const int64_t nrows            = experts->ne[0];
+        const int64_t n_tensor_experts = experts->ne[1];
+        const int64_t n_tokens         = experts->ne[2];
+        if (experts->type != GGML_TYPE_F32 || weighted->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(experts, weighted) || experts->ne[3] != 1 ||
+            weights == nullptr || weights->type != GGML_TYPE_F32 ||
+            weights->ne[0] != 1 || weights->ne[1] != n_tensor_experts ||
+            weights->ne[2] != n_tokens || weights->ne[3] != 1 ||
+            !ggml_is_contiguous(experts) || !ggml_is_contiguous(weights) ||
+            n_tensor_experts < 2 || n_tokens < 2) {
+            continue;
+        }
+
+        // Allocation plans are normally reserved from a warmup graph. Warmup
+        // can use every model expert and a much larger token count while still
+        // constructing only the production top-k view/ADD tail. Discover that
+        // tail instead of applying the <=64-token runtime-fusion bounds here,
+        // otherwise decode reuses an unannotated warmup address plan.
+        int n_reduce_experts = 0;
+        while (i + 2 + n_reduce_experts < cgraph->n_nodes &&
+               cgraph->nodes[i + 2 + n_reduce_experts]->op == GGML_OP_VIEW &&
+               n_reduce_experts < 16) {
+            ++n_reduce_experts;
+        }
+        if (n_reduce_experts < 2 ||
+            (n_reduce_experts == 16 && i + 2 + n_reduce_experts < cgraph->n_nodes &&
+             cgraph->nodes[i + 2 + n_reduce_experts]->op == GGML_OP_VIEW)) {
+            continue;
+        }
+
+        const int count = 2 * n_reduce_experts + 1;
+        if (count >= 32 || i + count > cgraph->n_nodes) {
+            continue;
+        }
+
+        std::vector<ggml_op> ops;
+        ops.reserve((size_t) count);
+        ops.push_back(GGML_OP_MUL_MAT_ID);
+        ops.push_back(GGML_OP_MUL);
+        for (int expert = 0; expert < n_reduce_experts; ++expert) {
+            ops.push_back(GGML_OP_VIEW);
+        }
+        for (int expert = 1; expert < n_reduce_experts; ++expert) {
+            ops.push_back(GGML_OP_ADD);
+        }
+        GGML_ASSERT((int) ops.size() == count);
+
+        const int output = i + count - 1;
+        if (!ggml_can_fuse_subgraph(cgraph, i, count, ops.data(), &output, 1)) {
+            continue;
+        }
+
+        ggml_tensor * add = cgraph->nodes[i + 2 + n_reduce_experts];
+        ggml_tensor * view0 = cgraph->nodes[i + 2];
+        ggml_tensor * view1 = cgraph->nodes[i + 3];
+        if (view0->src[0] != weighted || view1->src[0] != weighted ||
+            !((add->src[0] == view0 && add->src[1] == view1) ||
+              (add->src[1] == view0 && add->src[0] == view1))) {
+            continue;
+        }
+        bool chain_ok = true;
+        for (int expert = 2; expert < n_reduce_experts; ++expert) {
+            ggml_tensor * view = cgraph->nodes[i + 2 + expert];
+            ggml_tensor * next = cgraph->nodes[i + 1 + n_reduce_experts + expert];
+            if (view->src[0] != weighted ||
+                !((next->src[0] == add && next->src[1] == view) ||
+                  (next->src[1] == add && next->src[0] == view))) {
+                chain_ok = false;
+                break;
+            }
+            add = next;
+        }
+        if (!chain_ok || add != cgraph->nodes[output]) {
+            continue;
+        }
+
+        ggml_tensor * dst = cgraph->nodes[output];
+        if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            dst->ne[0] != nrows || dst->ne[1] != n_tokens ||
+            dst->ne[2] != 1 || dst->ne[3] != 1) {
+            continue;
+        }
+        ggml_tensor * ids = experts->src[2];
+        ggml_tensor * activations = experts->src[1];
+        ggml_tensor * pipeline_input = nullptr;
+        if (pipeline_enabled && activations->op == GGML_OP_GLU &&
+            ggml_get_glu_op(activations) == GGML_GLU_OP_SWIGLU &&
+            activations->src[0] != nullptr && activations->src[1] != nullptr &&
+            activations->src[0]->op == GGML_OP_MUL_MAT_ID &&
+            activations->src[1]->op == GGML_OP_MUL_MAT_ID &&
+            activations->src[0]->src[1] == activations->src[1]->src[1] &&
+            activations->src[0]->src[2] == ids &&
+            activations->src[1]->src[2] == ids) {
+            pipeline_input = activations->src[0]->src[1];
+        }
+        ggml_tensor *& pipeline_input_liveness = dst->src[GGML_MAX_SRC - 4];
+        ggml_tensor *& ids_liveness         = dst->src[GGML_MAX_SRC - 3];
+        ggml_tensor *& activation_liveness  = dst->src[GGML_MAX_SRC - 2];
+        ggml_tensor *& weights_liveness     = dst->src[GGML_MAX_SRC - 1];
+        if ((pipeline_input_liveness != nullptr &&
+             pipeline_input_liveness != pipeline_input) ||
+            (ids_liveness != nullptr && ids_liveness != ids) ||
+            (activation_liveness != nullptr && activation_liveness != activations) ||
+            (weights_liveness != nullptr && weights_liveness != weights)) {
+            continue;
+        }
+        if (pipeline_input != nullptr) {
+            pipeline_input_liveness = pipeline_input;
+            ggml_sycl_trace_moe_pipeline("liveness-annotated",
+                                         activations->src[0], dst);
+        }
+        ids_liveness        = ids;
+        activation_liveness = activations;
+        weights_liveness    = weights;
+        ggml_sycl_trace_moe_down_reduce(
+            GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_LIVENESS_ANNOTATED,
+            experts, dst, (unsigned int) n_reduce_experts);
+        i += count - 1;
+    }
+}
+
+static int ggml_sycl_try_fuse_moe_pipeline(
+        ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_sycl_moe_pipeline_enabled() || i + 4 >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    ggml_tensor * mmid0 = cgraph->nodes[i];
+    ggml_tensor * mmid1 = cgraph->nodes[i + 1];
+    ggml_tensor * glu   = cgraph->nodes[i + 2];
+    ggml_tensor * down  = cgraph->nodes[i + 3];
+    ggml_tensor * weighted = cgraph->nodes[i + 4];
+    if (mmid0->op != GGML_OP_MUL_MAT_ID ||
+        mmid1->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+        down->op != GGML_OP_MUL_MAT_ID || weighted->op != GGML_OP_MUL ||
+        ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        !((glu->src[0] == mmid0 && glu->src[1] == mmid1) ||
+          (glu->src[0] == mmid1 && glu->src[1] == mmid0)) ||
+        mmid0->src[1] != mmid1->src[1] ||
+        mmid0->src[2] != mmid1->src[2] || down->src[1] != glu ||
+        down->src[2] != mmid0->src[2] ||
+        (weighted->src[0] != down && weighted->src[1] != down)) {
+        return 0;
+    }
+
+    ggml_tensor * gate = glu->src[0];
+    ggml_tensor * up   = glu->src[1];
+    ggml_tensor * route_weights =
+        weighted->src[0] == down ? weighted->src[1] : weighted->src[0];
+    const int64_t n_experts = down->ne[1];
+    const int64_t n_tokens  = down->ne[2];
+    if (n_experts < 2 || n_experts > 16 || n_tokens < 4 || n_tokens > 64 ||
+        weighted->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(down, weighted) ||
+        route_weights == nullptr || route_weights->type != GGML_TYPE_F32 ||
+        route_weights->ne[0] != 1 || route_weights->ne[1] != n_experts ||
+        route_weights->ne[2] != n_tokens || route_weights->ne[3] != 1) {
+        return 0;
+    }
+    ggml_sycl_trace_moe_pipeline("candidate", gate);
+
+    const int down_count = (int) (2 * n_experts + 1);
+    const int count = 3 + down_count;
+    if (count >= 32 || i + count > cgraph->n_nodes) {
+        ggml_sycl_trace_moe_pipeline("bounds-reject", gate);
+        return 0;
+    }
+
+    std::vector<ggml_op> ops;
+    ops.reserve((size_t) count);
+    ops.push_back(GGML_OP_MUL_MAT_ID);
+    ops.push_back(GGML_OP_MUL_MAT_ID);
+    ops.push_back(GGML_OP_GLU);
+    ops.push_back(GGML_OP_MUL_MAT_ID);
+    ops.push_back(GGML_OP_MUL);
+    ops.push_back(GGML_OP_VIEW);
+    ops.push_back(GGML_OP_VIEW);
+    ops.push_back(GGML_OP_ADD);
+    for (int64_t expert = 2; expert < n_experts; ++expert) {
+        ops.push_back(GGML_OP_VIEW);
+        ops.push_back(GGML_OP_ADD);
+    }
+    GGML_ASSERT((int) ops.size() == count);
+    const int output = i + count - 1;
+    // Graph optimization keeps GLU live through the final reduction by adding
+    // it as allocator metadata on dst. That edge is inside this exact region,
+    // but it was added after cgraph use_counts were built, so the generic
+    // subgraph validator observes one more in-region use than its cached count.
+    // Validate that GLU has no use outside the candidate, then list it as a
+    // checked boundary output solely to bypass that stale-count comparison.
+    bool glu_external_use = (glu->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+    for (int node_idx = 0; node_idx < cgraph->n_nodes && !glu_external_use;
+         ++node_idx) {
+        if (node_idx >= i && node_idx < i + count) {
+            continue;
+        }
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            if (cgraph->nodes[node_idx]->src[src_idx] == glu) {
+                glu_external_use = true;
+                break;
+            }
+        }
+    }
+    if (glu_external_use) {
+        ggml_sycl_trace_moe_pipeline("glu-external-use-reject", gate);
+        return 0;
+    }
+    const int checked_outputs[] = { i + 2, output };
+    bool views_first = false;
+    if (!ggml_can_fuse_subgraph(
+            cgraph, i, count, ops.data(), checked_outputs, 2)) {
+        ops.clear();
+        ops.push_back(GGML_OP_MUL_MAT_ID);
+        ops.push_back(GGML_OP_MUL_MAT_ID);
+        ops.push_back(GGML_OP_GLU);
+        ops.push_back(GGML_OP_MUL_MAT_ID);
+        ops.push_back(GGML_OP_MUL);
+        for (int64_t expert = 0; expert < n_experts; ++expert) {
+            ops.push_back(GGML_OP_VIEW);
+        }
+        for (int64_t expert = 1; expert < n_experts; ++expert) {
+            ops.push_back(GGML_OP_ADD);
+        }
+        GGML_ASSERT((int) ops.size() == count);
+        if (!ggml_can_fuse_subgraph(
+                cgraph, i, count, ops.data(), checked_outputs, 2)) {
+            ggml_sycl_trace_moe_pipeline("subgraph-reject", gate);
+            return 0;
+        }
+        views_first = true;
+    }
+
+    const int down_i = i + 3;
+    const auto get_view = [&](int64_t expert) {
+        const int node = views_first ? down_i + 2 + (int) expert
+                                     : expert < 2 ? down_i + 2 + (int) expert
+                                                  : down_i + 2 * (int) expert + 1;
+        return cgraph->nodes[node];
+    };
+    const auto get_add = [&](int64_t expert) {
+        GGML_ASSERT(expert >= 1 && expert < n_experts);
+        const int node = views_first ? down_i + 1 + (int) n_experts + (int) expert
+                                     : down_i + 2 * (int) expert + 2;
+        return cgraph->nodes[node];
+    };
+    ggml_tensor * view0 = get_view(0);
+    ggml_tensor * view1 = get_view(1);
+    ggml_tensor * add   = get_add(1);
+    if (view0->src[0] != weighted || view1->src[0] != weighted ||
+        !((add->src[0] == view0 && add->src[1] == view1) ||
+          (add->src[1] == view0 && add->src[0] == view1))) {
+        ggml_sycl_trace_moe_pipeline("views-reject", gate);
+        return 0;
+    }
+    for (int64_t expert = 2; expert < n_experts; ++expert) {
+        ggml_tensor * view = get_view(expert);
+        ggml_tensor * next = get_add(expert);
+        if (view->src[0] != weighted ||
+            !((next->src[0] == add && next->src[1] == view) ||
+              (next->src[1] == add && next->src[0] == view))) {
+            ggml_sycl_trace_moe_pipeline("chain-reject", gate);
+            return 0;
+        }
+        add = next;
+    }
+
+    ggml_tensor * dst = cgraph->nodes[output];
+    if (add != dst || !ggml_is_contiguous(route_weights) ||
+        !ggml_is_contiguous(dst) ||
+        ggml_sycl_tensor_ranges_overlap(gate->src[1], dst) ||
+        ggml_sycl_tensor_ranges_overlap(gate->src[2], dst) ||
+        ggml_sycl_tensor_ranges_overlap(route_weights, dst)) {
+        ggml_sycl_trace_moe_pipeline("overlap-reject", gate, dst);
+        return 0;
+    }
+
+    if (!ggml_sycl_moe_swiglu_down_pipeline_fused(
+            ctx, gate, up, glu, down, route_weights, dst)) {
+        ggml_sycl_trace_moe_pipeline("dispatch-reject", gate, dst);
+        return 0;
+    }
+    ggml_sycl_trace_moe_pipeline(
+        views_first ? "integrated-hit-views-first" : "integrated-hit",
+        gate, dst);
+    return count - 1;
+}
+
+static int ggml_sycl_try_fuse_moe_down_reduce(
+        ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * experts = cgraph->nodes[i];
+    if (experts->op != GGML_OP_MUL_MAT_ID ||
+        !ggml_sycl_mul_mat_id_fused_eligible(experts)) {
+        return 0;
+    }
+
+    if (ggml_sycl_moe_down_reduce_disabled() || i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    ggml_tensor * weighted = cgraph->nodes[i + 1];
+    if (weighted->op != GGML_OP_MUL ||
+        (weighted->src[0] != experts && weighted->src[1] != experts)) {
+        return 0;
+    }
+    ggml_tensor * weights = weighted->src[0] == experts ? weighted->src[1] : weighted->src[0];
+    const int64_t nrows     = experts->ne[0];
+    const int64_t n_experts = experts->ne[1];
+    const int64_t n_tokens  = experts->ne[2];
+    if (experts->type != GGML_TYPE_F32 || weighted->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(experts, weighted) || experts->ne[3] != 1 ||
+        weights == nullptr || weights->type != GGML_TYPE_F32 ||
+        weights->ne[0] != 1 || weights->ne[1] != n_experts ||
+        weights->ne[2] != n_tokens || weights->ne[3] != 1 ||
+        !ggml_is_contiguous(experts) || !ggml_is_contiguous(weights) ||
+        n_experts < 2 || n_experts > 16 ||
+        n_tokens < 1 || n_tokens > 64) {
+        return 0;
+    }
+    ggml_sycl_trace_moe_down_reduce(GGML_SYCL_MOE_DOWN_REDUCE_ELIGIBLE, experts);
+
+    // Single-token graphs already express the reduction as
+    // PERMUTE -> CONT -> SUM_ROWS -> RESHAPE.
+    if (n_tokens == 1 && i + 5 < cgraph->n_nodes) {
+        constexpr ggml_op ops[] = {
+            GGML_OP_MUL_MAT_ID, GGML_OP_MUL, GGML_OP_PERMUTE,
+            GGML_OP_CONT, GGML_OP_SUM_ROWS, GGML_OP_RESHAPE,
+        };
+        const int output = i + 5;
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, &output, 1)) {
+            ggml_tensor * permute = cgraph->nodes[i + 2];
+            ggml_tensor * cont    = cgraph->nodes[i + 3];
+            ggml_tensor * sum     = cgraph->nodes[i + 4];
+            ggml_tensor * dst     = cgraph->nodes[i + 5];
+            // Product decode: routing weights almost always alias the final
+            // reshape/sum output (allocator reuse). Snapshotting + fusing was
+            // measured −3.5% tg (two-step) to −6.6% tg (integrated) vs unfused
+            // on B70 Qwen3.6-35B-A3B (2026-07-21). Hard-reject on weight
+            // overlap so decode stays on the faster unfused permute/sum path.
+            // Batched path still snapshots and fuses (prefill).
+            if (permute->src[0] == weighted && cont->src[0] == permute &&
+                sum->src[0] == cont && dst->src[0] == sum &&
+                dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+                !ggml_sycl_tensor_ranges_overlap(experts, dst) &&
+                !ggml_sycl_tensor_ranges_overlap(weights, dst) &&
+                dst->ne[0] == nrows &&
+                dst->ne[1] == n_tokens && dst->ne[2] == 1 && dst->ne[3] == 1) {
+                // Prefer integrated weighted MMVQ when live ranges are clean.
+                // Opt out of integrated: default two-step not needed here —
+                // clean-overlap case is rare on product; keep historical path.
+                if (ggml_sycl_mul_mat_id_mmvq_weighted(ctx, experts, weights, dst)) {
+                    ggml_sycl_trace_moe_down_reduce(
+                        GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst, 0x10u);
+                    return 5;
+                }
+                ggml_sycl_mul_mat_id(ctx, experts);
+                ggml_sycl_op_moe_weighted_sum(experts, weights, dst, ctx.stream());
+                ggml_sycl_trace_moe_down_reduce(
+                    GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_HIT, experts, dst);
+                return 5;
+            }
+            ggml_sycl_trace_moe_down_reduce(
+                GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_OUTPUT_REJECT, experts, nullptr, 0x1u);
+        } else {
+            ggml_sycl_trace_moe_down_reduce(
+                GGML_SYCL_MOE_DOWN_REDUCE_SINGLE_SUBGRAPH_REJECT, experts, nullptr, 0x1u);
+        }
+    }
+
+    // Batched graphs use two expert views followed by the first ADD, then one
+    // VIEW+ADD pair for every remaining routed expert.  Fuse the complete
+    // reduction only when every intermediate use is confined to this subgraph.
+    const int count = (int) (2 * n_experts + 1);
+    if (count >= 32 || i + count > cgraph->n_nodes) {
+        ggml_sycl_trace_moe_down_reduce(
+            GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_BOUNDS_REJECT, experts, nullptr,
+            count >= 32 ? 0x01u : 0x02u);
+        return 0;
+    }
+    std::vector<ggml_op> ops;
+    ops.reserve((size_t) count);
+    ops.push_back(GGML_OP_MUL_MAT_ID);
+    ops.push_back(GGML_OP_MUL);
+    ops.push_back(GGML_OP_VIEW);
+    ops.push_back(GGML_OP_VIEW);
+    ops.push_back(GGML_OP_ADD);
+    for (int64_t expert = 2; expert < n_experts; ++expert) {
+        ops.push_back(GGML_OP_VIEW);
+        ops.push_back(GGML_OP_ADD);
+    }
+    GGML_ASSERT((int) ops.size() == count);
+    const int output = i + count - 1;
+    bool views_first = false;
+    if (!ggml_can_fuse_subgraph(cgraph, i, count, ops.data(), &output, 1)) {
+        // Production explicitly expands every expert view before constructing
+        // the ordered ADD chain. Fixtures that only return the final tensor
+        // are recursively expanded into the interleaved layout above.
+        ops.clear();
+        ops.push_back(GGML_OP_MUL_MAT_ID);
+        ops.push_back(GGML_OP_MUL);
+        for (int64_t expert = 0; expert < n_experts; ++expert) {
+            ops.push_back(GGML_OP_VIEW);
+        }
+        for (int64_t expert = 1; expert < n_experts; ++expert) {
+            ops.push_back(GGML_OP_ADD);
+        }
+        GGML_ASSERT((int) ops.size() == count);
+        if (!ggml_can_fuse_subgraph(cgraph, i, count, ops.data(), &output, 1)) {
+            ggml_sycl_trace_moe_down_reduce(
+                GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_SUBGRAPH_REJECT, experts);
+            return 0;
+        }
+        views_first = true;
+    }
+
+    const auto get_view = [&](int64_t expert) {
+        const int node = views_first ? i + 2 + (int) expert
+                                     : expert < 2 ? i + 2 + (int) expert
+                                                  : i + 2 * (int) expert + 1;
+        return cgraph->nodes[node];
+    };
+    const auto get_add = [&](int64_t expert) {
+        GGML_ASSERT(expert >= 1 && expert < n_experts);
+        const int node = views_first ? i + 1 + (int) n_experts + (int) expert
+                                     : i + 2 * (int) expert + 2;
+        return cgraph->nodes[node];
+    };
+
+    ggml_tensor * view0 = get_view(0);
+    ggml_tensor * view1 = get_view(1);
+    ggml_tensor * add   = get_add(1);
+    if (view0->src[0] != weighted || view1->src[0] != weighted ||
+        !((add->src[0] == view0 && add->src[1] == view1) ||
+          (add->src[1] == view0 && add->src[0] == view1))) {
+        ggml_sycl_trace_moe_down_reduce(
+            GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_VIEWS_REJECT, experts);
+        return 0;
+    }
+    for (int64_t expert = 2; expert < n_experts; ++expert) {
+        ggml_tensor * view = get_view(expert);
+        ggml_tensor * next = get_add(expert);
+        if (view->src[0] != weighted ||
+            !((next->src[0] == add && next->src[1] == view) ||
+              (next->src[1] == add && next->src[0] == view))) {
+            ggml_sycl_trace_moe_down_reduce(
+                GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_CHAIN_REJECT, experts, nullptr, (unsigned int) expert);
+            return 0;
+        }
+        add = next;
+    }
+    ggml_tensor * dst = cgraph->nodes[output];
+    const bool dst_contiguous = ggml_is_contiguous(dst);
+    const bool experts_overlap = dst_contiguous && ggml_sycl_tensor_ranges_overlap(experts, dst);
+    const bool weights_overlap = dst_contiguous && ggml_sycl_tensor_ranges_overlap(weights, dst);
+    const bool activations_overlap = dst_contiguous &&
+        ggml_sycl_tensor_ranges_overlap(experts->src[1], dst);
+    const bool ids_overlap = dst_contiguous &&
+        ggml_sycl_tensor_ranges_overlap(experts->src[2], dst);
+    const bool dst_shape = dst->ne[0] == nrows && dst->ne[1] == n_tokens &&
+                           dst->ne[2] == 1 && dst->ne[3] == 1;
+    if (add != dst || dst->type != GGML_TYPE_F32 || !dst_contiguous ||
+        experts_overlap || !dst_shape) {
+        const unsigned int detail =
+            (add != dst                  ? 0x01u : 0u) |
+            (dst->type != GGML_TYPE_F32 ? 0x02u : 0u) |
+            (!dst_contiguous             ? 0x04u : 0u) |
+            (experts_overlap             ? 0x08u : 0u) |
+            (!dst_shape                  ? 0x20u : 0u);
+        ggml_sycl_trace_moe_down_reduce(
+            GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_OUTPUT_REJECT, experts, dst, detail);
+        return 0;
+    }
+
+    // The graph allocator may reuse the routing-weight allocation for an ADD
+    // output after the materialized MUL has consumed it. Fusion extends the
+    // weight live range into the reduction, so direct reads would race with
+    // destination writes. Snapshot only this tiny tensor (<= 4 KiB for the
+    // accepted top-16, 64-token bounds) on the in-order queue before reducing.
+    ggml_sycl_pool_alloc<float> weights_snapshot(ctx.pool());
+    ggml_tensor safe_weights = *weights;
+    if (weights_overlap) {
+        weights_snapshot.alloc((size_t) ggml_nelements(weights));
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            ctx.stream()->memcpy(weights_snapshot.get(), weights->data, ggml_nbytes(weights))));
+        safe_weights.data = weights_snapshot.get();
+        ggml_sycl_trace_moe_down_reduce(
+            GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_WEIGHTS_SNAPSHOT, experts, dst);
+    }
+
+    const ggml_tensor * safe_weights_ptr = weights_overlap ? &safe_weights : weights;
+    if (!activations_overlap && !ids_overlap &&
+        ggml_sycl_mul_mat_id_mmvq_weighted(ctx, experts, safe_weights_ptr, dst)) {
+        ggml_sycl_trace_moe_down_reduce(
+            GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_INTEGRATED_HIT,
+            experts, dst, views_first ? 0x01u : 0u);
+        return count - 1;
+    }
+
+    ggml_sycl_mul_mat_id(ctx, experts);
+    ggml_sycl_op_moe_weighted_sum(
+        experts, safe_weights_ptr, dst, ctx.stream());
+    ggml_sycl_trace_moe_down_reduce(
+        GGML_SYCL_MOE_DOWN_REDUCE_BATCHED_HIT, experts, dst, views_first ? 0x01u : 0u);
+    return count - 1;
+}
+
+enum ggml_sycl_fusion_profile_kind {
+    GGML_SYCL_FUSION_PROFILE_NONE,
+    GGML_SYCL_FUSION_PROFILE_MOE_PIPELINE,
+    GGML_SYCL_FUSION_PROFILE_MOE_DUAL_SWIGLU,
+    GGML_SYCL_FUSION_PROFILE_MOE_DOWN_REDUCE,
+    GGML_SYCL_FUSION_PROFILE_TOPK_MOE,
+    GGML_SYCL_FUSION_PROFILE_DELTANET_GLUE,
+    GGML_SYCL_FUSION_PROFILE_STATE_IO,
+    GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD,
+    GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL,
+    GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_SWIGLU,
+    GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_MMVQ,
+    GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_F32,
+    GGML_SYCL_FUSION_PROFILE_COUNT,
+};
+
+// Partners of non-adjacent dense dual-MMVQ fuses; cleared each graph eval.
+// Looked up from try_fuse and the SYCL graph compute loop.
+static thread_local std::unordered_set<ggml_tensor *> g_sycl_dual_mmvq_elide;
+
+static int ggml_sycl_try_fuse(
+        ggml_backend_sycl_context & ctx,
+        ggml_cgraph * cgraph,
+        int i,
+        ggml_sycl_fusion_profile_kind * profile_kind) {
+    GGML_ASSERT(profile_kind != nullptr);
+    *profile_kind = GGML_SYCL_FUSION_PROFILE_NONE;
+    ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int skip = ggml_sycl_try_fuse_moe_pipeline(ctx, cgraph, i);
+        if (skip != 0) {
+            *profile_kind = GGML_SYCL_FUSION_PROFILE_MOE_PIPELINE;
+            return skip;
+        }
+    }
+
+    // Separate expert gate/up MMIDs share activations and routing ids. Fuse
+    // both projections with SwiGLU into one output-producing submission.
+    if (!ggml_sycl_moe_dual_swiglu_disabled() &&
+        i + 2 < cgraph->n_nodes && node->op == GGML_OP_MUL_MAT_ID &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+        cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+        ggml_tensor * mmid0 = node;
+        ggml_tensor * mmid1 = cgraph->nodes[i + 1];
+        ggml_tensor * glu   = cgraph->nodes[i + 2];
+        const int output = i + 2;
+        const bool edges_ok =
+            ((glu->src[0] == mmid0 && glu->src[1] == mmid1) ||
+             (glu->src[0] == mmid1 && glu->src[1] == mmid0)) &&
+            mmid0->src[1] == mmid1->src[1] &&
+            mmid0->src[2] == mmid1->src[2];
+        if (edges_ok) {
+            ggml_sycl_trace_moe_dual_swiglu("candidate", glu->src[0], glu);
+        }
+        const bool subgraph_ok = ggml_can_fuse_subgraph(
+            cgraph, i,
+            { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU },
+            { output });
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            subgraph_ok && edges_ok) {
+            ggml_tensor * gate = glu->src[0];
+            ggml_tensor * up   = glu->src[1];
+            ggml_tensor * activations = gate->src[1];
+            ggml_tensor * ids = gate->src[2];
+            const bool activations_overlap =
+                ggml_sycl_tensor_ranges_overlap(activations, glu);
+            const bool ids_overlap = ggml_sycl_tensor_ranges_overlap(ids, glu);
+            if (activations_overlap || ids_overlap) {
+                ggml_sycl_trace_moe_dual_swiglu(
+                    activations_overlap ? "activations-overlap" : "ids-overlap",
+                    gate, glu);
+            } else if (ggml_sycl_mul_mat_id_dual_swiglu_fused(
+                           ctx, gate, up, glu)) {
+                ggml_sycl_trace_moe_dual_swiglu(
+                    "dual-integrated-hit", gate, glu);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_MOE_DUAL_SWIGLU;
+                return 2;
+            } else {
+                ggml_sycl_trace_moe_dual_swiglu(
+                    "dispatch-reject", gate, glu);
+            }
+        }
+    }
+
+    // Dense shared-expert dual-SwiGLU (MUL_MAT + MUL_MAT + GLU). Default ON.
+    // A/B off: GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU=1.
+    static const bool disable_dense_dual = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_DENSE_DUAL_SWIGLU");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_dense_dual &&
+        i + 2 < cgraph->n_nodes && node->op == GGML_OP_MUL_MAT &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+        cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+        ggml_tensor * mm0 = node;
+        ggml_tensor * mm1 = cgraph->nodes[i + 1];
+        ggml_tensor * glu = cgraph->nodes[i + 2];
+        const int output = i + 2;
+        const bool edges_ok =
+            ((glu->src[0] == mm0 && glu->src[1] == mm1) ||
+             (glu->src[0] == mm1 && glu->src[1] == mm0)) &&
+            mm0->src[1] == mm1->src[1];
+        const bool subgraph_ok = ggml_can_fuse_subgraph(
+            cgraph, i,
+            { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU },
+            { output });
+        if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+            subgraph_ok && edges_ok) {
+            ggml_tensor * gate = glu->src[0];
+            ggml_tensor * up   = glu->src[1];
+            ggml_tensor * activations = gate->src[1];
+            if (!ggml_sycl_tensor_ranges_overlap(activations, glu) &&
+                ggml_sycl_mul_mat_dense_dual_swiglu_fused(ctx, gate, up, glu)) {
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_SWIGLU;
+                return 2;
+            }
+        }
+    }
+
+    // Dense dual MMVQ: two MUL_MATs sharing one activation. Independent
+    // projections get graph-sorted apart, so search ahead for a partner and
+    // elide it when non-adjacent (see g_sycl_dual_mmvq_elide).
+    // Must NOT steal dense dual-SwiGLU pairs (MUL_MAT+MUL_MAT+GLU).
+    // Default OFF (parked 2026-07-20: r=3 tg flat / prefill-large regress).
+    // Opt-in: GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ=1.
+    static const bool enable_dense_dual_mmvq = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_DENSE_DUAL_MMVQ");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static const bool trace_dual_mmvq = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_MMVQ_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (enable_dense_dual_mmvq && node->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * mm0 = node;
+        // Already the elided partner of an earlier dual fuse.
+        if (g_sycl_dual_mmvq_elide.count(mm0) != 0) {
+            return 0;
+        }
+        const enum ggml_type wtype = mm0->src[0]->type;
+        const bool type_ok =
+            wtype == GGML_TYPE_Q8_0 || wtype == GGML_TYPE_Q4_K ||
+            wtype == GGML_TYPE_Q5_K || wtype == GGML_TYPE_Q6_K;
+        int j = -1;
+        if (type_ok) {
+            // Search remaining graph for the first compatible partner on the
+            // same activation. Prefer nearest (keeps full-attn K/V tight).
+            for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+                ggml_tensor * cand = cgraph->nodes[k];
+                if (cand->op != GGML_OP_MUL_MAT) {
+                    continue;
+                }
+                if (g_sycl_dual_mmvq_elide.count(cand) != 0) {
+                    continue;
+                }
+                if (cand->src[1] != mm0->src[1] ||
+                    cand->src[0] == mm0->src[0] ||
+                    cand->src[0]->type != wtype) {
+                    continue;
+                }
+                if (cand->src[0] == mm0 || cand->src[1] == mm0 ||
+                    mm0->src[0] == cand || mm0->src[1] == cand) {
+                    continue;
+                }
+                // Leave gate+up+SwiGLU to dense dual-SwiGLU.
+                bool owned_by_swiglu = false;
+                if (k + 1 < cgraph->n_nodes &&
+                    cgraph->nodes[k + 1]->op == GGML_OP_GLU) {
+                    ggml_tensor * glu = cgraph->nodes[k + 1];
+                    owned_by_swiglu =
+                        (glu->src[0] == mm0 && glu->src[1] == cand) ||
+                        (glu->src[0] == cand && glu->src[1] == mm0);
+                }
+                // Also: if mm0 is immediately followed by GLU with cand as the
+                // other src, dense dual-swiglu owns it (adjacent shexp case).
+                if (i + 2 < cgraph->n_nodes &&
+                    cgraph->nodes[i + 1] == cand &&
+                    cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+                    ggml_tensor * glu = cgraph->nodes[i + 2];
+                    owned_by_swiglu =
+                        owned_by_swiglu ||
+                        (glu->src[0] == mm0 && glu->src[1] == cand) ||
+                        (glu->src[0] == cand && glu->src[1] == mm0);
+                }
+                if (owned_by_swiglu) {
+                    continue;
+                }
+                j = k;
+                break;
+            }
+        }
+        if (j > i) {
+            ggml_tensor * mm1 = cgraph->nodes[j];
+            if (ggml_sycl_mul_mat_dense_dual_mmvq_fused(ctx, mm0, mm1)) {
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_MMVQ;
+                if (j == i + 1) {
+                    // Adjacent: classic skip-1 (current + next).
+                    return 1;
+                }
+                // Non-adjacent: elide partner when the loop reaches it; return
+                // -1 so the eval loop skips recompute of mm0 only.
+                g_sycl_dual_mmvq_elide.insert(mm1);
+                if (trace_dual_mmvq) {
+                    static std::atomic<int> hits{0};
+                    if (hits.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        fprintf(stderr,
+                                "[treebeard-dense-dual-mmvq] hit-nonadj"
+                                " i=%d j=%d wa=%s wb=%s type=%s"
+                                " ne1_a=%" PRId64 " ne1_b=%" PRId64
+                                " act_ne1=%" PRId64 "\n",
+                                i, j, mm0->src[0]->name, mm1->src[0]->name,
+                                ggml_type_name(wtype),
+                                mm0->src[0]->ne[1], mm1->src[0]->ne[1],
+                                mm0->src[1]->ne[1]);
+                    }
+                }
+                return -1;
+            }
+            if (trace_dual_mmvq) {
+                static std::atomic<int> miss{0};
+                if (miss.fetch_add(1, std::memory_order_relaxed) < 12) {
+                    fprintf(stderr,
+                            "[treebeard-dense-dual-mmvq] dispatch-miss"
+                            " i=%d j=%d wa=%s wb=%s\n",
+                            i, j, mm0->src[0]->name, mm1->src[0]->name);
+                }
+            }
+        }
+    }
+
+    // Dense dual F32 GEMV: two F32 MUL_MATs sharing one activation
+    // (ssm_alpha+ssm_beta). Prefer equal-shape partners (same nrows) so we do
+    // not pair router / sparse F32 mats with the GDN pair by accident.
+    // Opt-in: GGML_SYCL_ENABLE_DENSE_DUAL_F32=1 (default OFF until gated).
+    static const bool enable_dense_dual_f32 = []() {
+        const char * env = getenv("GGML_SYCL_ENABLE_DENSE_DUAL_F32");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static const bool trace_dual_f32 = []() {
+        const char * env = getenv("GGML_SYCL_DENSE_DUAL_F32_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (enable_dense_dual_f32 && node->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * mm0 = node;
+        if (g_sycl_dual_mmvq_elide.count(mm0) != 0) {
+            return 0;
+        }
+        if (mm0->src[0]->type == GGML_TYPE_F32) {
+            // Two-pass partner pick: (1) equal nrows (preferred for alpha/beta),
+            // (2) any other F32 same-act partner. Retry on dispatch miss.
+            auto try_partner = [&](int j) -> int {
+                ggml_tensor * mm1 = cgraph->nodes[j];
+                if (!ggml_sycl_mul_mat_dense_dual_f32_fused(ctx, mm0, mm1)) {
+                    return 0;
+                }
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DENSE_DUAL_F32;
+                if (j == i + 1) {
+                    return 1;
+                }
+                g_sycl_dual_mmvq_elide.insert(mm1);
+                if (trace_dual_f32) {
+                    static std::atomic<int> hits{0};
+                    if (hits.fetch_add(1, std::memory_order_relaxed) < 12) {
+                        fprintf(stderr,
+                                "[treebeard-dense-dual-f32] hit-nonadj"
+                                " i=%d j=%d wa=%s wb=%s"
+                                " ne1_a=%" PRId64 " ne1_b=%" PRId64 "\n",
+                                i, j, mm0->src[0]->name, mm1->src[0]->name,
+                                mm0->src[0]->ne[1], mm1->src[0]->ne[1]);
+                    }
+                }
+                return -1;
+            };
+            int equal_j = -1;
+            int any_j   = -1;
+            for (int k = i + 1; k < cgraph->n_nodes; ++k) {
+                ggml_tensor * cand = cgraph->nodes[k];
+                if (cand->op != GGML_OP_MUL_MAT) {
+                    continue;
+                }
+                if (g_sycl_dual_mmvq_elide.count(cand) != 0) {
+                    continue;
+                }
+                if (cand->src[1] != mm0->src[1] ||
+                    cand->src[0] == mm0->src[0] ||
+                    cand->src[0]->type != GGML_TYPE_F32) {
+                    continue;
+                }
+                if (cand->src[0] == mm0 || cand->src[1] == mm0 ||
+                    mm0->src[0] == cand || mm0->src[1] == cand) {
+                    continue;
+                }
+                if (any_j < 0) {
+                    any_j = k;
+                }
+                if (equal_j < 0 && cand->src[0]->ne[1] == mm0->src[0]->ne[1] &&
+                    cand->src[0]->ne[0] == mm0->src[0]->ne[0]) {
+                    equal_j = k;
+                    break; // nearest equal-shape is ideal
+                }
+            }
+            if (equal_j > i) {
+                if (trace_dual_f32) {
+                    static std::atomic<int> cands{0};
+                    if (cands.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        fprintf(stderr,
+                                "[treebeard-dense-dual-f32] equal-cand"
+                                " i=%d j=%d wa=%s wb=%s act_ne1=%" PRId64 "\n",
+                                i, equal_j, mm0->src[0]->name,
+                                cgraph->nodes[equal_j]->src[0]->name,
+                                mm0->src[1]->ne[1]);
+                    }
+                }
+                const int skip = try_partner(equal_j);
+                if (skip != 0) {
+                    return skip;
+                }
+            }
+            // Do not fall through to unequal-shape partners for F32: the only
+            // ship wins are equal-shape GDN pairs; unequal often pairs router
+            // weight with a 1-row projection and would just shape-reject.
+            (void) any_j;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int skip = ggml_sycl_try_fuse_moe_down_reduce(ctx, cgraph, i);
+        if (skip != 0) {
+            *profile_kind = GGML_SYCL_FUSION_PROFILE_MOE_DOWN_REDUCE;
+            return skip;
+        }
+    }
+
+    // topk-moe router fusion: collapses the softmax->top-k->get_rows[->norm][->scale] serial chain that
+    // otherwise blocks the expert GEMVs. This chain is submit-bound (not hidden behind a big op), so it
+    // is the lever that actually moves decode here. Default ON; A/B with GGML_SYCL_DISABLE_TOPK_MOE=1.
+    static const bool disable_topk_moe = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_TOPK_MOE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_topk_moe) {
+        const int skip = ggml_sycl_try_fuse_topk_moe(ctx, cgraph, i);
+        if (skip != 0) {
+            *profile_kind = GGML_SYCL_FUSION_PROFILE_TOPK_MOE;
+            return skip;
+        }
+    }
+
+    // gated-delta-net gate glue: ADD -> SOFTPLUS(unary) -> MUL  =>  softplus(alpha + ssm_dt) * ssm_a.
+    // A 3-deep tiny-op serial chain per linear-attn layer (x30); collapse to one elementwise kernel.
+    // Default ON; A/B with GGML_SYCL_DISABLE_DELTANET_GLUE=1.
+    static const bool disable_dn_glue = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_DELTANET_GLUE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!disable_dn_glue && node->op == GGML_OP_ADD &&
+        ggml_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL })) {
+        ggml_tensor * add = node;
+        ggml_tensor * sp  = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS) {
+            // a = full-shape operand of the add, b = its broadcast 1-D operand; c = mul's non-softplus operand
+            ggml_tensor * a = ggml_are_same_shape(add->src[0], add) ? add->src[0] : add->src[1];
+            ggml_tensor * b = (a == add->src[0]) ? add->src[1] : add->src[0];
+            ggml_tensor * c = (mul->src[0] == sp) ? mul->src[1] : mul->src[0];
+            const bool ok = a && b && c &&
+                a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 &&
+                c->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(a, add) && ggml_is_contiguous(a) && ggml_is_contiguous(mul) &&
+                ggml_is_contiguous(b) && ggml_nelements(b) == a->ne[0] &&
+                ggml_is_contiguous(c) && ggml_nelements(c) == a->ne[0];
+            if (ok) {
+                ggml_sycl_op_fused_add_softplus_mul(ctx, a, b, c, mul);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_DELTANET_GLUE;
+                return 2;
+            }
+        }
+    }
+
+    // Glue fusion (RMS_NORM+MUL[+ADD]): collapse norm-weight MUL and residual ADD into one kernel.
+    // On B70 Qwen3.6-35B-A3B (hybrid MoE + SSM/GDN) with the ship speed path (oneDNN + f16 KV),
+    // measured 2026-07-20: tg128 +~5% vs unfused glue (80.87 -> 85.05 t/s, r=3). Prefill flat.
+    // Default ON. Disable with GGML_SYCL_DISABLE_FUSION=1, or GGML_SYCL_ENABLE_FUSION=0.
+    static const bool enable_glue_fusion = []() {
+        const char * disable = getenv("GGML_SYCL_DISABLE_FUSION");
+        if (disable != nullptr && std::atoi(disable) != 0) {
+            return false;
+        }
+        const char * enable = getenv("GGML_SYCL_ENABLE_FUSION");
+        // Explicit 0 disables; unset or non-zero keeps default ON.
+        if (enable != nullptr && std::atoi(enable) == 0) {
+            return false;
+        }
+        return true;
+    }();
+    if (!enable_glue_fusion) {
+        return 0;
+    }
+
+    // RMS_NORM (+ MUL weight) (+ ADD residual/bias)  ->  one fused norm kernel
+    if (node->op == GGML_OP_RMS_NORM) {
+        auto types_ok = [](const ggml_tensor * t) {
+            return t->src[0]->type == GGML_TYPE_F32 && t->src[1]->type == GGML_TYPE_F32 && t->type == GGML_TYPE_F32;
+        };
+        // longest match first: RMS_NORM + MUL + ADD
+        if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+            ggml_tensor * mul = cgraph->nodes[i + 1];
+            ggml_tensor * add = cgraph->nodes[i + 2];
+            const bool bcast_ok = !(node == mul->src[1] && !ggml_are_same_shape(mul->src[0], node));
+            if (node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                types_ok(mul) && types_ok(add) && bcast_ok &&
+                ggml_is_contiguous_rows(mul->src[0]) && ggml_is_contiguous_rows(mul->src[1]) &&
+                ggml_is_contiguous(add->src[0]) && ggml_is_contiguous_rows(add->src[1])) {
+                ggml_sycl_op_rms_norm_fused_add(ctx, node, mul, add);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL_ADD;
+                return 2;
+            }
+        }
+        // RMS_NORM + MUL
+        if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            ggml_tensor * mul = cgraph->nodes[i + 1];
+            const bool bcast_ok = !(node == mul->src[1] && !ggml_are_same_shape(mul->src[0], node));
+            if (node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+                types_ok(mul) && bcast_ok &&
+                ggml_is_contiguous_rows(mul->src[0]) && ggml_is_contiguous_rows(mul->src[1])) {
+                ggml_sycl_op_rms_norm_fused(ctx, node, mul);
+                *profile_kind = GGML_SYCL_FUSION_PROFILE_RMS_NORM_MUL;
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    g_sycl_dual_mmvq_elide.clear();
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    // Optional Treebeard SYCL per-op profiler (TREEBEARD_SYCL_PROF=1): serializes each op with a
+    // queue wait and accumulates host-observed GPU time per op type. Serialization inflates
+    // absolutes (removes overlap) but the RELATIVE breakdown + serialized-total-vs-wall ratio
+    // reveal where decode time goes. Diagnostic only - not a ship path.
+    // TREEBEARD_SYCL_PROF_TRIGGER_FILE: leave execution unmodified until that file exists so a
+    // late profile window can open after expensive prompt/state setup without restarting.
+    // Legacy aliases (still accepted): SIQ_PROF, SIQ_PROF_TRIGGER_FILE.
+    static const bool prof = []() {
+        return getenv("TREEBEARD_SYCL_PROF") != nullptr || getenv("SIQ_PROF") != nullptr;
+    }();
+    static const std::string prof_trigger_file = []() {
+        const char * path = getenv("TREEBEARD_SYCL_PROF_TRIGGER_FILE");
+        if (path == nullptr) {
+            path = getenv("SIQ_PROF_TRIGGER_FILE");
+        }
+        return path != nullptr ? std::string(path) : std::string();
+    }();
+    static std::atomic<bool> prof_active { prof_trigger_file.empty() };
+    if (prof && !prof_active.load(std::memory_order_relaxed)) {
+        FILE * trigger = fopen(prof_trigger_file.c_str(), "rb");
+        if (trigger != nullptr) {
+            fclose(trigger);
+            if (!prof_active.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr, "[treebeard-sycl-prof] trigger active file=%s\n",
+                        prof_trigger_file.c_str());
+            }
+        }
+    }
+    const bool prof_now = prof && prof_active.load(std::memory_order_relaxed);
+    static double op_us[GGML_OP_COUNT] = { 0 };
+    static long   op_n [GGML_OP_COUNT] = { 0 };
+    static double unary_us = 0;
+    static long unary_n = 0;
+    static double fusion_us[GGML_SYCL_FUSION_PROFILE_COUNT] = { 0 };
+    static long fusion_n[GGML_SYCL_FUSION_PROFILE_COUNT] = { 0 };
+    struct named_profile_stat {
+        std::string name;
+        double us;
+        long n;
+    };
+    static std::vector<named_profile_stat> mul_mat_stats;
+    static std::vector<named_profile_stat> state_op_stats;
+    static int    geval = 0;
+    auto now_us = []() {
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    auto normalize_profile_name = [](const char * raw_name) {
+        std::string name = raw_name != nullptr ? raw_name : "unnamed";
+        for (size_t pos = 0; pos < name.size();) {
+            if (name[pos] < '0' || name[pos] > '9') {
+                ++pos;
+                continue;
+            }
+            size_t end = pos;
+            while (end < name.size() && name[end] >= '0' && name[end] <= '9') {
+                ++end;
+            }
+            name.replace(pos, end - pos, "*");
+            ++pos;
+        }
+        return name;
+    };
+    auto mul_mat_profile_name = [&](const ggml_tensor * node) {
+        const std::string node_name = ggml_get_name(node);
+        const bool generic_name = node_name.empty() || node_name == "unnamed" ||
+                                  node_name.rfind("node_", 0) == 0;
+        if (!generic_name) {
+            return normalize_profile_name(node_name.c_str());
+        }
+
+        const ggml_tensor * weights = node->src[0];
+        if (weights != nullptr) {
+            const std::string weight_name = ggml_get_name(weights);
+            if (!weight_name.empty() && weight_name.rfind("node_", 0) != 0) {
+                return std::string("weight:") + normalize_profile_name(weight_name.c_str());
+            }
+
+            char signature[192];
+            snprintf(signature, sizeof(signature),
+                     "shape:%s[%" PRId64 "x%" PRId64 "x%" PRId64 "]->%s[%" PRId64 "x%" PRId64 "]",
+                     ggml_type_name(weights->type), weights->ne[0], weights->ne[1], weights->ne[2],
+                     ggml_type_name(node->type), node->ne[0], node->ne[1]);
+            return std::string(signature);
+        }
+
+        return normalize_profile_name(node_name.c_str());
+    };
+    auto state_op_profile_name = [&](const ggml_tensor * node) {
+        auto tensor_name = [&](const ggml_tensor * tensor) {
+            if (tensor == nullptr) {
+                return std::string("none");
+            }
+            const std::string raw_name = ggml_get_name(tensor);
+            if (!raw_name.empty() && raw_name != "unnamed" &&
+                raw_name.rfind("node_", 0) != 0) {
+                return normalize_profile_name(raw_name.c_str());
+            }
+            char signature[128];
+            snprintf(signature, sizeof(signature),
+                     "%s[%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "]",
+                     ggml_type_name(tensor->type), tensor->ne[0], tensor->ne[1],
+                     tensor->ne[2], tensor->ne[3]);
+            return std::string(signature);
+        };
+        return std::string(ggml_op_name(node->op)) + ":" + tensor_name(node) +
+               "<-" + tensor_name(node->src[0]) + "," + tensor_name(node->src[1]);
+    };
+    auto add_named_profile_stat = [](std::vector<named_profile_stat> & stats,
+                                     std::string name, double us) {
+        const auto it = std::find_if(stats.begin(), stats.end(), [&](const named_profile_stat & stat) {
+            return stat.name == name;
+        });
+        if (it != stats.end()) {
+            it->us += us;
+            it->n++;
+        } else {
+            stats.push_back({ std::move(name), us, 1 });
+        }
+    };
+
+    static const bool state_io_debug = []() {
+        const char * env = getenv("GGML_SYCL_STATE_IO_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    static std::atomic<bool> state_io_dumped { false };
+    if (state_io_debug && !state_io_dumped.load(std::memory_order_relaxed)) {
+        bool full_width = false;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_GATED_DELTA_NET && node->src[2] != nullptr &&
+                node->src[2]->ne[3] == 12) {
+                full_width = true;
+                break;
+            }
+        }
+        if (full_width && !state_io_dumped.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr, "[treebeard-state-io] event=graph-dump nodes=%d\n", cgraph->n_nodes);
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node->op != GGML_OP_GET_ROWS && node->op != GGML_OP_CPY &&
+                    node->op != GGML_OP_CONCAT && node->op != GGML_OP_SSM_CONV &&
+                    node->op != GGML_OP_GATED_DELTA_NET) {
+                    continue;
+                }
+                fprintf(stderr,
+                        "[treebeard-state-io] index=%d op=%s name=%s ptr=%p data=%p"
+                        " view_src=%p uses=%d",
+                        i, ggml_op_name(node->op), ggml_get_name(node), (const void *) node,
+                        node->data, (void *) node->view_src,
+                        ggml_node_get_use_count(cgraph, i));
+                for (int src = 0; src < 6 && node->src[src] != nullptr; ++src) {
+                    fprintf(stderr, " src%d=%p/%s/%s", src, (void *) node->src[src],
+                            ggml_op_name(node->src[src]->op), ggml_get_name(node->src[src]));
+                }
+                fputc('\n', stderr);
+            }
+        }
+    }
+
+    struct state_io_plan_entry {
+        ggml_tensor * marker;
+        ggml_tensor * gather;
+        int64_t n_rs;
+    };
+    std::vector<state_io_plan_entry> state_io_plan;
+    std::vector<ggml_tensor *> state_io_direct;
+    std::vector<ggml_tensor *> state_io_elide;
+    if (ggml_sycl_state_io_enabled()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * marker = cgraph->nodes[i];
+            const bool annotated_ssm = marker->op == GGML_OP_SSM_CONV &&
+                marker->src[2] != nullptr && marker->src[3] != nullptr &&
+                marker->src[4] != nullptr && marker->src[5] != nullptr &&
+                marker->src[6] != nullptr;
+            const bool annotated_gdn = marker->op == GGML_OP_GATED_DELTA_NET &&
+                marker->src[6] != nullptr && marker->src[7] != nullptr &&
+                marker->src[8] != nullptr && marker->src[9] != nullptr;
+            if (!annotated_ssm && !annotated_gdn) {
+                continue;
+            }
+
+            ggml_tensor * producer = annotated_ssm ? marker->src[0] : marker;
+            ggml_tensor * gather = annotated_ssm
+                ? ggml_sycl_view_base(marker->src[0]->src[0])
+                : ggml_sycl_view_base(marker->src[5]);
+            ggml_tensor * copy = ggml_sycl_find_state_copy(cgraph, producer);
+            if (gather == nullptr || gather->op != GGML_OP_GET_ROWS || copy == nullptr) {
+                continue;
+            }
+            ggml_tensor * state_ids = annotated_ssm ? marker->src[3] : marker->src[7];
+            const ggml_tensor * ids_all = ggml_sycl_view_base(state_ids);
+            const int64_t n_rs = ids_all != nullptr ? ggml_nelements(ids_all) : 0;
+            const int64_t n_seqs = annotated_ssm ? marker->ne[2] : marker->src[2]->ne[3];
+            if (n_rs < n_seqs) {
+                continue;
+            }
+
+            state_io_plan.push_back({ marker, gather, n_rs });
+            state_io_direct.push_back(marker);
+            state_io_elide.push_back(copy);
+            if (annotated_ssm) {
+                state_io_elide.push_back(marker->src[0]);
+            }
+        }
+        if (state_io_debug && !state_io_direct.empty()) {
+            static std::atomic<int> plan_traces { 0 };
+            const int trace = plan_traces.fetch_add(1, std::memory_order_relaxed);
+            if (trace < 8) {
+                fprintf(stderr,
+                        "[treebeard-state-io] event=runtime-plan direct=%zu conflict-gathers=%zu elide=%zu\n",
+                        state_io_direct.size(), state_io_plan.size(), state_io_elide.size());
+            }
+        }
+    }
+
+    const auto state_io_contains = [](const std::vector<ggml_tensor *> & tensors,
+                                      const ggml_tensor * node) {
+        return std::find(tensors.begin(), tensors.end(), node) != tensors.end();
+    };
+    const auto state_io_plan_for_gather = [&](const ggml_tensor * gather) {
+        return std::find_if(state_io_plan.begin(), state_io_plan.end(),
+                            [&](const state_io_plan_entry & entry) {
+                                return entry.gather == gather;
+                            });
+    };
+    const auto state_io_plan_for_marker = [&](const ggml_tensor * marker) {
+        return std::find_if(state_io_plan.begin(), state_io_plan.end(),
+                            [&](const state_io_plan_entry & entry) {
+                                return entry.marker == marker;
+                            });
+    };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        const auto gather_plan = state_io_plan_for_gather(node);
+        if (gather_plan != state_io_plan.end()) {
+            const double tf0 = prof_now ? now_us() : 0.0;
+            ggml_tensor * marker = gather_plan->marker;
+            if (marker->op == GGML_OP_SSM_CONV) {
+                ggml_sycl_state_io_gather_conflicts(
+                    *sycl_ctx, marker->src[2], marker->src[3], marker->src[6],
+                    marker->src[5], gather_plan->n_rs);
+            } else {
+                GGML_ASSERT(marker->op == GGML_OP_GATED_DELTA_NET);
+                ggml_sycl_state_io_gather_conflicts(
+                    *sycl_ctx, marker->src[6], marker->src[7], marker->src[9],
+                    marker->src[8], gather_plan->n_rs);
+            }
+            if (prof_now) {
+                sycl_ctx->stream()->wait();
+                fusion_us[GGML_SYCL_FUSION_PROFILE_STATE_IO] += now_us() - tf0;
+                fusion_n[GGML_SYCL_FUSION_PROFILE_STATE_IO]++;
+            }
+            continue;
+        }
+        if (state_io_contains(state_io_elide, node)) {
+            continue;
+        }
+        if (g_sycl_dual_mmvq_elide.count(node) != 0) {
+            continue;
+        }
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
@@ -5385,10 +8090,48 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
-        if (nodes_to_skip != 0) {
-            i += nodes_to_skip;
+        if (state_io_contains(state_io_direct, node)) {
+            const double tf0 = prof_now ? now_us() : 0.0;
+            const auto direct_plan = state_io_plan_for_marker(node);
+            GGML_ASSERT(direct_plan != state_io_plan.end());
+            if (node->op == GGML_OP_SSM_CONV) {
+                ggml_sycl_ssm_conv_state_io(
+                    *sycl_ctx, node, node->src[2], node->src[3], node->src[6],
+                    node->src[4], node->src[5], direct_plan->n_rs);
+            } else {
+                GGML_ASSERT(node->op == GGML_OP_GATED_DELTA_NET);
+                ggml_sycl_gated_delta_net_state_io(
+                    *sycl_ctx, node, node->src[6], node->src[7], node->src[9],
+                    node->src[8], direct_plan->n_rs);
+            }
+            if (prof_now) {
+                sycl_ctx->stream()->wait();
+                fusion_us[GGML_SYCL_FUSION_PROFILE_STATE_IO] += now_us() - tf0;
+                fusion_n[GGML_SYCL_FUSION_PROFILE_STATE_IO]++;
+            }
             continue;
+        }
+
+        {
+            const double tf0 = prof_now ? now_us() : 0.0;
+            ggml_sycl_fusion_profile_kind fusion_kind = GGML_SYCL_FUSION_PROFILE_NONE;
+            const int nodes_to_skip = ggml_sycl_try_fuse(
+                *sycl_ctx, cgraph, i, &fusion_kind);
+            if (nodes_to_skip != 0) {
+                GGML_ASSERT(fusion_kind > GGML_SYCL_FUSION_PROFILE_NONE &&
+                            fusion_kind < GGML_SYCL_FUSION_PROFILE_COUNT);
+                if (prof_now) {
+                    sycl_ctx->stream()->wait();
+                    fusion_us[fusion_kind] += now_us() - tf0;
+                    fusion_n[fusion_kind]++;
+                }
+                // nodes_to_skip > 0: classic skip of subsequent nodes
+                // nodes_to_skip < 0: fused current only (partner elided later)
+                if (nodes_to_skip > 0) {
+                    i += nodes_to_skip;
+                }
+                continue;
+            }
         }
 #ifndef NDEBUG
         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
@@ -5398,11 +8141,110 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        const double t0 = prof_now ? now_us() : 0.0;
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        if (prof_now) {
+            sycl_ctx->stream()->wait();
+            const double dt = now_us() - t0;
+            if (node->op == GGML_OP_UNARY) { unary_us += dt; unary_n++; }
+            else { op_us[node->op] += dt; op_n[node->op]++; }
+            if (node->op == GGML_OP_MUL_MAT) {
+                add_named_profile_stat(mul_mat_stats, mul_mat_profile_name(node), dt);
+            }
+            if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_CPY ||
+                node->op == GGML_OP_CONCAT || node->op == GGML_OP_GATED_DELTA_NET) {
+                add_named_profile_stat(state_op_stats, state_op_profile_name(node), dt);
+            }
+        }
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+
+    if (prof_now && (++geval % 50 == 0)) {
+        struct row { const char * name; double us; long n; };
+        std::vector<row> rows;
+        for (int op = 0; op < GGML_OP_COUNT; ++op) {
+            if (op_n[op] > 0) rows.push_back({ ggml_op_name((ggml_op) op), op_us[op], op_n[op] });
+        }
+        if (unary_n > 0) rows.push_back({ "UNARY", unary_us, unary_n });
+        static constexpr const char * fusion_names[GGML_SYCL_FUSION_PROFILE_COUNT] = {
+            "FUSED_NONE",
+            "FUSED_MOE_PIPE",
+            "FUSED_MOE_DUAL",
+            "FUSED_MOE_DOWN",
+            "FUSED_TOPK_MOE",
+            "FUSED_DN_GLUE",
+            "FUSED_STATE_IO",
+            "FUSED_RMS_ADD",
+            "FUSED_RMS",
+            "FUSED_DENSE_DUAL",
+            "FUSED_DUAL_MMVQ",
+            "FUSED_DUAL_F32",
+        };
+        for (int kind = GGML_SYCL_FUSION_PROFILE_NONE + 1;
+             kind < GGML_SYCL_FUSION_PROFILE_COUNT; ++kind) {
+            if (fusion_n[kind] > 0) {
+                rows.push_back({ fusion_names[kind], fusion_us[kind], fusion_n[kind] });
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const row & a, const row & b){ return a.us > b.us; });
+        double tot = 0; for (auto & r : rows) tot += r.us;
+        fprintf(stderr,
+                "[treebeard-sycl-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",
+                geval, tot / 1000.0, tot / geval);
+        for (auto & r : rows) {
+            fprintf(stderr, "  %-14s %9.1f ms  %6.1f%%  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
+                    r.name, r.us/1000.0, 100.0*r.us/tot, r.n, r.us/r.n, (double)r.n/geval);
+        }
+        auto named_rows = mul_mat_stats;
+        std::sort(named_rows.begin(), named_rows.end(),
+                  [](const named_profile_stat & a, const named_profile_stat & b) {
+                      return a.us > b.us;
+                  });
+        double named_total_us = 0.0;
+        for (const auto & row : named_rows) {
+            named_total_us += row.us;
+        }
+        fprintf(stderr,
+                "[treebeard-sycl-prof-mul-mat] after %d graph evals window-total=%.1f ms families=%zu\n",
+                geval, named_total_us / 1000.0, named_rows.size());
+        const size_t named_limit = std::min<size_t>(named_rows.size(), 32);
+        for (size_t row_index = 0; row_index < named_limit; ++row_index) {
+            const auto & r = named_rows[row_index];
+            fprintf(stderr,
+                    "  %-54s %9.1f ms  %6.1f%%-mm"
+                    "  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
+                    r.name.c_str(), r.us / 1000.0,
+                    100.0 * r.us / named_total_us,
+                    r.n, r.us / r.n, (double) r.n / 50.0);
+        }
+        mul_mat_stats.clear();
+
+        auto state_rows = state_op_stats;
+        std::sort(state_rows.begin(), state_rows.end(),
+                  [](const named_profile_stat & a, const named_profile_stat & b) {
+                      return a.us > b.us;
+                  });
+        double state_total_us = 0.0;
+        for (const auto & row : state_rows) {
+            state_total_us += row.us;
+        }
+        fprintf(stderr,
+                "[treebeard-sycl-prof-state] after %d graph evals window-total=%.1f ms families=%zu\n",
+                geval, state_total_us / 1000.0, state_rows.size());
+        const size_t state_limit = std::min<size_t>(state_rows.size(), 32);
+        for (size_t row_index = 0; row_index < state_limit; ++row_index) {
+            const auto & r = state_rows[row_index];
+            fprintf(stderr,
+                    "  %-86s %9.1f ms  %6.1f%%-state"
+                    "  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
+                    r.name.c_str(), r.us / 1000.0,
+                    state_total_us > 0.0 ? 100.0 * r.us / state_total_us : 0.0,
+                    r.n, r.us / r.n, (double) r.n / 50.0);
+        }
+        state_op_stats.clear();
     }
 }
 
@@ -5414,23 +8256,29 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
         return false;
     }
 
+    // GGML_SYCL_DISABLE_MMID_GRAPH=1 restores the blanket MUL_MAT_ID graph ban (A/B gate).
+    static const bool disable_mmid_graph = []() {
+        const char * env = getenv("GGML_SYCL_DISABLE_MMID_GRAPH");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         const ggml_op node_op = cgraph->nodes[i]->op;
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                [[fallthrough]];
             case GGML_OP_MUL_MAT_ID:
-                // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
-                // submitting a memcpy operation, but wait() can't be called on a queue that
-                // is recording to a graph.
-                GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                              ggml_op_name(node_op));
-                return false;
+                // The fused device-routed path reads the routing ids on device — no host sync —
+                // so it records into a graph fine (its pool allocs still need the async mem-op
+                // extension, same as MUL_MAT). Any node that would fall to the generic path does
+                // a blocking ids readback and must keep graphs disabled.
+                if (disable_mmid_graph || !g_ggml_sycl_use_async_mem_op ||
+                    !ggml_sycl_mul_mat_id_fused_eligible(cgraph->nodes[i])) {
+                    GGML_LOG_INFO("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
+                                  ggml_op_name(node_op));
+                    return false;
+                }
+                break;
             case GGML_OP_MUL_MAT:
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
                 // as SYCL malloc / free and host wait calls are not supported when recording to a graph which are all present
@@ -5447,16 +8295,67 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
     }
     return true;
 }
+
+// Initialize only persistent, lazily reordered weight storage before graph capture.
+// Running the entire graph as a warm-up is not valid: legal source/destination aliasing
+// and stateful writes can make a duplicate evaluation observe different inputs.
+static void prepare_graph_reorders(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            if (ggml_sycl_mul_mat_id_fused_eligible(node)) {
+                opt_for_reorder_id(sycl_ctx, node->src[0]);
+            }
+            continue;
+        }
+        if (node->op != GGML_OP_MUL_MAT || ggml_backend_buffer_is_sycl_split(node->src[0]->buffer)) {
+            continue;
+        }
+
+        const ggml_tensor * src0 = node->src[0];
+        const ggml_tensor * src1 = node->src[1];
+        bool use_dmmv = can_use_dequantize_mul_mat_vec(src0, src1, node);
+        const bool use_mmvq = can_use_mul_mat_vec_q(src0, src1, node);
+
+        // Keep this precedence rule in lockstep with ggml_sycl_mul_mat().
+        if (!g_ggml_sycl_prioritize_dmmv &&
+            should_reorder_tensor(*sycl_ctx, node) &&
+            ggml_sycl_supports_reorder_mmvq(src0->type)) {
+            const bool skip_arc_q4 =
+                ggml_sycl_info().devices[sycl_ctx->device].hw_info.arch == gpu_arch::intel_gpu_acm_g10 &&
+                src0->type == GGML_TYPE_Q4_0;
+            if (!skip_arc_q4) {
+                use_dmmv = use_dmmv && !use_mmvq;
+            }
+        }
+
+        if (use_dmmv) {
+            opt_for_reorder(sycl_ctx, src0, src1, node, mul_mat_algo::DMMV);
+        } else if (use_mmvq) {
+            opt_for_reorder(sycl_ctx, src0, src1, node, mul_mat_algo::MMVQ);
+        }
+    }
+
+    // Reorder uses async allocation and kernels. Capture must not inherit any of their
+    // events, and the in-place weight layout must be complete before recording begins.
+    sycl_ctx->stream()->wait_and_throw();
+}
 #endif
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
 #ifdef GGML_SYCL_GRAPH
-    bool use_sycl_graph = false;
-    if (g_ggml_sycl_enable_graph) {
-        use_sycl_graph = check_graph_compatibility(cgraph);
+    static const bool graph_debug = []() {
+        const char * env = getenv("GGML_SYCL_GRAPH_DEBUG");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    static std::atomic<int> graph_debug_count { 0 };
+    if (graph_debug && graph_debug_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+        fprintf(stderr, "[SYCL-GRAPH] dispatch disabled=%d uid=%zu nodes=%d\n",
+                g_ggml_sycl_disable_graph, cgraph->uid, cgraph->n_nodes);
     }
+    bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(cgraph);
     if (use_sycl_graph) {
         const bool graph_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_limited_graph);
         if (!graph_support) {
@@ -5465,6 +8364,25 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             return GGML_STATUS_SUCCESS;
         }
 
+        GGML_ASSERT(cgraph->n_nodes > 0);
+        ggml_sycl_graph * cached_graph = sycl_ctx->sycl_graph(cgraph->nodes[0]);
+
+        // A nonzero graph UID is the scheduler's promise that topology, tensor addresses,
+        // shapes and strides are unchanged. Replaying the finalized executable avoids
+        // recording and updating hundreds of kernel submissions on every decode step.
+        if (cgraph->uid != 0 && cached_graph->executable && cached_graph->uid == cgraph->uid) {
+            sycl_ctx->stream()->ext_oneapi_graph(*(cached_graph->executable));
+            if (graph_debug && graph_debug_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+                fprintf(stderr, "[SYCL-GRAPH] replay uid=%zu nodes=%d\n", cgraph->uid, cgraph->n_nodes);
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+
+        // Lazy quantized-weight reorder uses async allocation events that cannot cross
+        // the capture boundary. Prepare only those persistent resources; do not execute
+        // graph outputs twice because graphs may contain legal aliases or stateful writes.
+        prepare_graph_reorders(sycl_ctx, cgraph);
+
         sycl_ex::command_graph model_sycl_graph(*(sycl_ctx->stream()), {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
 
         model_sycl_graph.begin_recording(*(sycl_ctx->stream()));
@@ -5472,24 +8390,28 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         model_sycl_graph.end_recording();
 
         const bool graph_update_support = dpct::get_device(sycl_ctx->device).has(sycl::aspect::ext_oneapi_graph);
-        if (!sycl_ctx->exec_graph || !graph_update_support) {
+        if (!cached_graph->executable || !graph_update_support) {
             auto exec_graph = graph_update_support ? model_sycl_graph.finalize(sycl_ex::property::graph::updatable{}) :
                                                      model_sycl_graph.finalize();
-            sycl_ctx->exec_graph = std::make_unique<
+            cached_graph->executable = std::make_unique<
                 sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
         } else {
             try {
-                sycl_ctx->exec_graph->update(model_sycl_graph);
+                cached_graph->executable->update(model_sycl_graph);
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] update success\n");
             } catch (sycl::exception const & e) {
                 GGML_SYCL_DEBUG("[SYCL-GRAPH] Exception when updating graph, %s\n", e.what());
                 auto exec_graph = model_sycl_graph.finalize({sycl_ex::property::graph::updatable{}});
-                sycl_ctx->exec_graph = std::make_unique<
+                cached_graph->executable = std::make_unique<
                     sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec_graph);
             }
         }
 
-        sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->exec_graph));
+        cached_graph->uid = cgraph->uid;
+        sycl_ctx->stream()->ext_oneapi_graph(*(cached_graph->executable));
+        if (graph_debug && graph_debug_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+            fprintf(stderr, "[SYCL-GRAPH] record uid=%zu nodes=%d\n", cgraph->uid, cgraph->n_nodes);
+        }
     } else
 #endif
     {
@@ -5549,7 +8471,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_sycl_graph_optimize,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {
@@ -5642,7 +8564,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
     return nullptr;
 }
 
-static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_sycl_device_context *sycl_ctx =
         (ggml_backend_sycl_device_context *)dev->context;
     int device = sycl_ctx->device;
@@ -5656,10 +8578,6 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 }
                 return false;
             }
-        case GGML_OP_CONV_2D:
-        case GGML_OP_CONV_2D_DW:
-        case GGML_OP_CONV_TRANSPOSE_2D:
-            return true;
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_SGN:
@@ -5676,16 +8594,18 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_GELU_ERF:
                 case GGML_UNARY_OP_EXP:
-                case GGML_UNARY_OP_EXPM1:
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_ELU:
-                case GGML_UNARY_OP_XIELU:
                 case GGML_UNARY_OP_CEIL:
                     return true;
                 case GGML_UNARY_OP_FLOOR:
                 case GGML_UNARY_OP_ROUND:
                 case GGML_UNARY_OP_TRUNC:
-                    return true;
+#if defined (GGML_SYCL_F16)
+                    return ggml_is_contiguous(op->src[0]) && (op->type == op->src[0]->type);
+#else
+                    return ggml_is_contiguous(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) && (op->type == op->src[0]->type);
+#endif
                 default:
                     return false;
             }
@@ -5708,11 +8628,18 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
 
+                // disable Q1_0 until implementation
+                if (a->type == GGML_TYPE_Q1_0 || b->type == GGML_TYPE_Q1_0) {
+                    return false;
+                }
+
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
 
                 ggml_type src0_type = op->src[0]->type;
+
+
 
                 // TODO: The configuration below needs more work to be supported with oneDNN
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
@@ -5728,11 +8655,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 return true;
             }
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 &&
-                   (op->src[0]->type == GGML_TYPE_F32 ||
-                    (op->src[0]->type == GGML_TYPE_Q1_0 && op->src[0]->ne[2] == op->src[1]->ne[2] &&
-                     op->src[0]->ne[3] == op->src[1]->ne[3])) &&
-                   op->src[1]->type == GGML_TYPE_F32;
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5775,114 +8698,80 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
-
-                auto res = ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
                          op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
-                         op->type == GGML_TYPE_Q1_0 ||
-                         op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL ||
-                         op->type == GGML_TYPE_MXFP4 || op->type == GGML_TYPE_NVFP4) &&
-                        op->src[0]->type == GGML_TYPE_F32 &&
+                         op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
                         (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));
-                return res;
             }
             break;
         case GGML_OP_CPY:
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
-
-                if (src0_type == GGML_TYPE_F16) {
-                    if (src1_type == GGML_TYPE_Q2_K ||
-                        src1_type == GGML_TYPE_Q3_K ||
-                        src1_type == GGML_TYPE_Q4_K ||
-                        src1_type == GGML_TYPE_Q5_K ||
-                        src1_type == GGML_TYPE_Q6_K ||
-                        src1_type == GGML_TYPE_IQ2_XXS ||
-                        src1_type == GGML_TYPE_IQ2_XS ||
-                        src1_type == GGML_TYPE_IQ2_S ||
-                        src1_type == GGML_TYPE_IQ3_XXS ||
-                        src1_type == GGML_TYPE_IQ1_S ||
-                        src1_type == GGML_TYPE_IQ1_M ||
-                        src1_type == GGML_TYPE_IQ3_S ||
-                        src1_type == GGML_TYPE_IQ4_XS) {
-                        return false;
-                    }
+                if (src0_type == src1_type && (ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) && src0_type != GGML_TYPE_BF16) {
+                    return true;
                 }
-
-                if (src0_type == GGML_TYPE_BF16) {
-                    if (src1_type == GGML_TYPE_Q4_0 || //big error in ut
-                        src1_type == GGML_TYPE_Q4_1 || //big error in ut
-                        src1_type == GGML_TYPE_Q8_0 || //big error in ut
-                        src1_type == GGML_TYPE_Q2_K ||
-                        src1_type == GGML_TYPE_Q3_K ||
-                        src1_type == GGML_TYPE_Q4_K ||
-                        src1_type == GGML_TYPE_Q5_K ||
-                        src1_type == GGML_TYPE_Q6_K ||
-                        src1_type == GGML_TYPE_IQ2_XXS ||
-                        src1_type == GGML_TYPE_IQ2_XS ||
-                        src1_type == GGML_TYPE_IQ2_S ||
-                        src1_type == GGML_TYPE_IQ3_XXS ||
-                        src1_type == GGML_TYPE_IQ1_S ||
-                        src1_type == GGML_TYPE_IQ1_M ||
-                        src1_type == GGML_TYPE_IQ3_S ||
-                        src1_type == GGML_TYPE_IQ4_XS) {
-                        return false;
-                    }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F32) {
+                    return true;
                 }
-
-                if (src0_type == GGML_TYPE_F32) {
-                    if (src1_type == GGML_TYPE_Q2_K ||
-                        src1_type == GGML_TYPE_Q3_K ||
-                        src1_type == GGML_TYPE_Q4_K ||
-                        src1_type == GGML_TYPE_Q5_K ||
-                        src1_type == GGML_TYPE_Q6_K ||
-                        src1_type == GGML_TYPE_IQ2_XXS ||
-                        src1_type == GGML_TYPE_IQ2_XS ||
-                        src1_type == GGML_TYPE_IQ2_S ||
-                        src1_type == GGML_TYPE_IQ3_XXS ||
-                        src1_type == GGML_TYPE_IQ1_S ||
-                        src1_type == GGML_TYPE_IQ1_M ||
-                        src1_type == GGML_TYPE_IQ3_S ||
-                        src1_type == GGML_TYPE_IQ4_XS) {
-                        return false;
-                    }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_F16) {
+                    return true;
                 }
-
-                if (src1_type == GGML_TYPE_F32) {
-                    if (src0_type == GGML_TYPE_Q1_0 ||
-                        src0_type == GGML_TYPE_NVFP4 ||
-                        src0_type == GGML_TYPE_Q2_K ||
-                        src0_type == GGML_TYPE_Q3_K ||
-                        src0_type == GGML_TYPE_Q4_K ||
-                        src0_type == GGML_TYPE_Q5_K ||
-                        src0_type == GGML_TYPE_Q6_K ||
-                        src0_type == GGML_TYPE_IQ2_XXS ||
-                        src0_type == GGML_TYPE_IQ2_XS ||
-                        src0_type == GGML_TYPE_IQ2_S ||
-                        src0_type == GGML_TYPE_IQ3_XXS ||
-                        src0_type == GGML_TYPE_IQ1_S ||
-                        src0_type == GGML_TYPE_IQ1_M ||
-                        src0_type == GGML_TYPE_IQ3_S ||
-                        src0_type == GGML_TYPE_IQ4_NL ||
-                        src0_type == GGML_TYPE_IQ4_XS
-                    ) {
-                        return false;
-                    }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {
+                    return true;
                 }
-
-                if (src0_type == src1_type) {
-                    if (src1_type == GGML_TYPE_IQ2_XXS ||
-                        src1_type == GGML_TYPE_IQ2_XS ||
-                        src1_type == GGML_TYPE_IQ2_S ||
-                        src1_type == GGML_TYPE_IQ3_XXS ||
-                        src1_type == GGML_TYPE_IQ3_S ||
-                        src1_type == GGML_TYPE_IQ1_S ||
-                        src1_type == GGML_TYPE_IQ1_M) {
-                        return false;
-                    }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_0) {
+                    return true;
                 }
-
-                return true;
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q4_1) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F16) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F16 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q5_0) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q5_0 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q5_1) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_Q5_1 && src1_type == GGML_TYPE_F32) {
+                    return true;
+                }
+                if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
+                    return true;
+                }
+                if(src0_type == GGML_TYPE_Q8_0 && src1_type == GGML_TYPE_Q8_0) {
+                    return true;
+                }
+                if(src0_type == GGML_TYPE_Q5_0 && src1_type == GGML_TYPE_Q5_0) {
+                    return true;
+                }
+                if(src0_type == GGML_TYPE_Q5_1 && src1_type == GGML_TYPE_Q5_1) {
+                    return true;
+                }
+                if(src0_type == GGML_TYPE_Q4_0 && src1_type == GGML_TYPE_Q4_0) {
+                    return true;
+                }
+                if(src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_Q4_1) {
+                    return true;
+                }
+                return false;
             }
         case GGML_OP_REPEAT_BACK:
             {
@@ -5914,6 +8803,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_COS:
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
+#if defined (GGML_SYCL_F16)
+            return ((op->type == GGML_TYPE_F32 || op->type == GGML_SYCL_F16) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_SYCL_F16) && (op->type == op->src[0]->type));
+#else
+            return (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32) && (op->type == op->src[0]->type);
+#endif
         case GGML_OP_NORM:
         case GGML_OP_L2_NORM:
         case GGML_OP_GROUP_NORM:
@@ -5924,7 +8818,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_SCALE:
             return true;
         case GGML_OP_CONT:
-            return true;
+            return op->src[0]->type != GGML_TYPE_BF16;
         case GGML_OP_TRI:
             {
                 const ggml_tensor * src0 = op->src[0];
@@ -5947,26 +8841,13 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_IM2COL_3D:
         case GGML_OP_UPSCALE:
             return true;
-        case GGML_OP_COL2IM_1D:
-            return ggml_is_contiguous(op->src[0]) &&
-                   (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16
-#ifdef GGML_SYCL_HAS_BF16
-                    || op->type == GGML_TYPE_BF16
-#endif
-                   ) &&
-                   op->src[0]->type == op->type;
-        case GGML_OP_CONV_3D:
-            return op->type == GGML_TYPE_F32 &&
-                   (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                   op->src[1]->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(op->src[0]) &&
-                   ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ARGSORT:
-            return true;
+            return op->src[0]->ne[0] * sizeof(int) <=
+                   ggml_sycl_info().devices[device].smpbo;
         case GGML_OP_TOP_K: {
             const ggml_tensor * src0 = op->src[0];
             const int k = op->ne[0];
@@ -5977,9 +8858,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 k > 0 && k <= 32;
         }
         case GGML_OP_POOL_2D:
-        case GGML_OP_POOL_1D:
-        case GGML_OP_ACC:
             return true;
+        case GGML_OP_ACC:
+            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_PAD:
             if (ggml_get_op_params_i32(op, 8) != 0) {
                 return false;
@@ -6012,8 +8893,6 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_DIAG:
-        case GGML_OP_CROSS_ENTROPY_LOSS:
-        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             return true;
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
@@ -6024,13 +8903,6 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
     }
 
     GGML_UNUSED(dev);
-}
-
-static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    bool res = do_ggml_backend_sycl_device_supports_op(dev, op);
-    GGML_SYCL_DEBUG("[SYCL] call %s op->op=%s op->type=%s -> %s\n", __func__, ggml_op_name(op->op),
-                    ggml_type_name(op->type), res ? "true" : "false");
-    return res;
 }
 
 static bool ggml_backend_sycl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -6148,266 +9020,11 @@ static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
-// ==========================================================================
-// Tensor parallelism (--split-mode tensor) for the SYCL backend.
-//
-// The meta-backend invokes these three entry points via get_proc_address:
-//   * ggml_backend_sycl_comm_init             - one-time per-graph setup
-//   * ggml_backend_sycl_comm_allreduce_tensor - per-allreduce step
-//   * ggml_backend_sycl_comm_free             - tear-down
-//
-// For N=2 (dual-GPU), this is a degenerate ring allreduce with dual paths
-// chosen by tensor size:
-//
-//   * Small (nelem < 32K): FP32 direct memcpy + per-device ADD
-//     kernel. The kernel depends_on() its corresponding memcpy event
-//     so it doesn't read partial data. Both devices run in parallel.
-//
-//   * Large (nelem >= 32K): BF16-compressed. Each device compresses
-//     its FP32 partial to BF16 locally, cross-device memcpys
-//     to the peer (half the PCI bandwidth), where it is decompressed
-//     and added into the local FP32 partial. 6 SYCL submissions per
-//     allreduce (2 compress + 2 memcpy + 2 decompress-add) vs the
-//     4 for the small path, but the bandwidth saving > 6 GB/s PCIe x 2
-//     dominates for larger tensors.
-//
-// Storage: A persistent uint8_t buffer per device, sized to
-// 4 * nelem bytes. Both paths reinterpret the same bytes (small path
-// as nelem floats; large path as outbox + inbox = 2*nelem uint16_t
-// each, using the full 4*nelem byte budget either way). Single
-// alloc+free per device keeps the SYCL pool's strict-LIFO invariant
-// trivial.
-//
-// For non-(N=2 FP32 contiguous) cases, comm_init or comm_allreduce_tensor
-// returns null/false, causing the meta-backend to use its generic
-// butterfly all-reduce fallback.
-// ==========================================================================
-
-struct ggml_backend_sycl_comm_context {
-    std::vector<ggml_backend_t> backends;
-    // ONE persistent per-device byte buffer, 4*nelem bytes.  Both the
-    // FP32 small-tensor path and the BF16 large-tensor path share it
-    // by reinterpreting.
-    std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf0;
-    std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>> buf1;
-    int64_t buf_nelem = 0;
-};
-
-void * ggml_backend_sycl_comm_init(ggml_backend_t * backends, size_t n_backends) try {
-    for (size_t i = 0; i < n_backends; ++i) {
-        if (!ggml_backend_is_sycl(backends[i])) {
-            return nullptr;
-        }
-    }
-
-    // Initial version: N=2 only. For N!=2, returning null makes the
-    // meta-backend skip this backend-specific allreduce entirely.
-    if (n_backends != 2) {
-        return nullptr;
-    }
-
-    auto * ctx = new ggml_backend_sycl_comm_context;
-    ctx->backends.assign(backends, backends + n_backends);
-    auto * sctx0 = (ggml_backend_sycl_context *) backends[0]->context;
-    auto * sctx1 = (ggml_backend_sycl_context *) backends[1]->context;
-    ctx->buf0 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx0->pool());
-    ctx->buf1 = std::make_unique<ggml_sycl_pool_alloc<uint8_t>>(sctx1->pool());
-    return ctx;
-}
-catch (const sycl::exception &) { return nullptr; }
-catch (...)                     { return nullptr; }
-
-void ggml_backend_sycl_comm_free(void * comm_ctx_v) {
-    auto * comm_ctx = static_cast<ggml_backend_sycl_comm_context *>(comm_ctx_v);
-    if (comm_ctx == nullptr) {
-        return;
-    }
-
-    // Sync both per-device queues so the pool_alloc destructors don't
-    // return memory still in use by the last kernel.
-    if (comm_ctx->backends.size() == 2) {
-        auto * sctx0 = (ggml_backend_sycl_context *) comm_ctx->backends[0]->context;
-        auto * sctx1 = (ggml_backend_sycl_context *) comm_ctx->backends[1]->context;
-        try {
-            sctx0->stream()->wait();
-            sctx1->stream()->wait();
-        } catch (...) { /* best effort during shutdown */ }
-    }
-
-    delete comm_ctx;
-}
-
-bool ggml_backend_sycl_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) try {
-    if (comm_ctx_v == nullptr) {
-        return false;
-    }
-
-    auto * comm_ctx = static_cast<ggml_backend_sycl_comm_context *>(comm_ctx_v);
-    const size_t n_backends = comm_ctx->backends.size();
-
-    // Fast path: N=2, F32/F16, contiguous, matching shapes.
-    if (n_backends != 2) {
-        return false;
-    }
-    // Accept F32 or F16 inputs natively (types must match). F16 takes the
-    // direct 2-byte memcpy + add path below; other types return false so the
-    // meta-backend uses its generic all-reduce.
-    if (tensors[0]->type != tensors[1]->type) {
-        return false;
-    }
-    if (tensors[0]->type != GGML_TYPE_F32 && tensors[0]->type != GGML_TYPE_F16) {
-        return false;
-    }
-    if (!ggml_is_contiguous(tensors[0]) || !ggml_is_contiguous(tensors[1])) {
-        return false;
-    }
-    if (ggml_nelements(tensors[0]) != ggml_nelements(tensors[1])) {
-        return false;
-    }
-
-    const int64_t nelem  = ggml_nelements(tensors[0]);
-    const size_t  nbytes = ggml_nbytes(tensors[0]);
-    if (nelem == 0) {
-        return true;
-    }
-
-    auto * ctx0 = (ggml_backend_sycl_context *) comm_ctx->backends[0]->context;
-    auto * ctx1 = (ggml_backend_sycl_context *) comm_ctx->backends[1]->context;
-    queue_ptr q0 = ctx0->stream();
-    queue_ptr q1 = ctx1->stream();
-
-    // Grow per-device byte buffers if needed (4 * nelem bytes each).
-    if (comm_ctx->buf_nelem < nelem) {
-        comm_ctx->buf0->realloc(nelem * 4);
-        comm_ctx->buf1->realloc(nelem * 4);
-        comm_ctx->buf_nelem = nelem;
-    }
-    uint8_t * buf0 = comm_ctx->buf0->get();
-    uint8_t * buf1 = comm_ctx->buf1->get();
-
-    // F16 native path: direct 2-byte cross-device copy + add, skipping the
-    // F32 round-trip the meta-backend fallback would force. Cross-device copies
-    // go through dev2dev_memcpy because the two devices are in separate SYCL
-    // contexts (a raw peer-USM q->memcpy would be a silent no-op).
-    if (tensors[0]->type == GGML_TYPE_F16) {
-        sycl::half * f16_out0 = (sycl::half *) tensors[0]->data;
-        sycl::half * f16_out1 = (sycl::half *) tensors[1]->data;
-        sycl::half * f16_tmp0 = (sycl::half *) buf0;
-        sycl::half * f16_tmp1 = (sycl::half *) buf1;
-
-        q0->wait();
-        q1->wait();
-        dev2dev_memcpy(ctx0->device, *q0, ctx1->device, *q1, f16_tmp0, tensors[1]->data, nbytes);
-        dev2dev_memcpy(ctx1->device, *q1, ctx0->device, *q0, f16_tmp1, tensors[0]->data, nbytes);
-
-        q0->submit([&](sycl::handler & h) {
-            h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-                f16_out0[i] = (sycl::half) ((float) f16_out0[i] + (float) f16_tmp0[i]);
-            });
-        });
-        q1->submit([&](sycl::handler & h) {
-            h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-                f16_out1[i] = (sycl::half) ((float) f16_out1[i] + (float) f16_tmp1[i]);
-            });
-        });
-        return true;
-    }
-
-    float * out0 = (float *) tensors[0]->data;
-    float * out1 = (float *) tensors[1]->data;
-
-    // BF16 threshold: above this, the PCIe savings from halving the
-    // cross-device bytes outweigh the 2 extra compress kernels.
-    // Below: stay on the FP32 fast path.  Threshold mirrors the CUDA
-    // NCCL allreduce pattern for n_backends=2.
-    static constexpr int64_t BF16_THRESHOLD = 32768;
-
-    if (nelem < BF16_THRESHOLD) {
-        // FP32 small path: 4 SYCL submissions per allreduce.
-        float * tmp0 = (float *) buf0;
-        float * tmp1 = (float *) buf1;
-
-        // COMM-D2D-FIX: the two devices are in SEPARATE SYCL contexts, so a raw
-        // q->memcpy of a peer USM pointer is a silent no-op. Route cross-device
-        // copies through dev2dev_memcpy (L0 direct copy / host staging). It is
-        // synchronous, so wait for the local partials to be produced first.
-        q0->wait();
-        q1->wait();
-        dev2dev_memcpy(ctx0->device, *q0, ctx1->device, *q1, tmp0, tensors[1]->data, nbytes);
-        dev2dev_memcpy(ctx1->device, *q1, ctx0->device, *q0, tmp1, tensors[0]->data, nbytes);
-
-        q0->submit([&](sycl::handler & h) {
-            h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-                out0[i] += tmp0[i];
-            });
-        });
-        q1->submit([&](sycl::handler & h) {
-            h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-                out1[i] += tmp1[i];
-            });
-        });
-        return true;
-    }
-
-    // BF16 large path: 6 SYCL submissions per allreduce, but the
-    // cross-device memcpy is HALF the bytes. Pure bit-shift
-    // conversion (no rounding) — matches ggml's truncating fp32->bf16.
-    uint16_t * outbox0 = (uint16_t *) buf0;
-    uint16_t * inbox0  = outbox0 + nelem;
-    uint16_t * outbox1 = (uint16_t *) buf1;
-    uint16_t * inbox1  = outbox1 + nelem;
-
-    // Phase A: compress each device's local partial in parallel.
-    sycl::event c0 = q0->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-        outbox0[i] = (uint16_t) (sycl::bit_cast<uint32_t>(out0[i]) >> 16);
-    });
-
-    sycl::event c1 = q1->parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-        outbox1[i] = (uint16_t) (sycl::bit_cast<uint32_t>(out1[i]) >> 16);
-    });
-
-    // Phase B: COMM-D2D-FIX-BF16 cross-device copy of compressed bytes via
-    // dev2dev_memcpy (separate SYCL contexts; sync copy after compress).
-    const size_t bf16_bytes = nelem * sizeof(uint16_t);
-    c0.wait();
-    c1.wait();
-    dev2dev_memcpy(ctx0->device, *q0, ctx1->device, *q1, inbox0, outbox1, bf16_bytes);
-    dev2dev_memcpy(ctx1->device, *q1, ctx0->device, *q0, inbox1, outbox0, bf16_bytes);
-
-    // Phase C: decompress + add into local FP32 partial.
-    q0->submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-            out0[i] += sycl::bit_cast<float>(((uint32_t) inbox0[i]) << 16);
-        });
-    });
-
-    q1->submit([&](sycl::handler & h) {
-        h.parallel_for(sycl::range<1>(nelem), [=](sycl::id<1> i) {
-            out1[i] += sycl::bit_cast<float>(((uint32_t) inbox1[i]) << 16);
-        });
-    });
-
-    return true;
-}
-catch (const sycl::exception &) { return false; }
-catch (...)                     { return false; }
-
 static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, const char *name) {
     GGML_UNUSED(reg);
 
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *)ggml_backend_sycl_split_buffer_type;
-    }
-
-    // Tensor parallelism (--split-mode tensor) entry points.
-    if (strcmp(name, "ggml_backend_comm_init") == 0) {
-        return (void *)ggml_backend_sycl_comm_init;
-    }
-    if (strcmp(name, "ggml_backend_comm_free") == 0) {
-        return (void *)ggml_backend_sycl_comm_free;
-    }
-    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
-        return (void *)ggml_backend_sycl_comm_allreduce_tensor;
     }
 
     // SYCL doesn't support registering host memory, left here for reference

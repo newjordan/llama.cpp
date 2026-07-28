@@ -309,41 +309,6 @@ vec_dot_q6_K_q8_1_impl_mmvq(const int &vl, const int &vh,
         vl, vh, u[0], u[1], scales[0], scales[4], d, d8[0], d8[1]);
 }
 
-#define VDR_Q1_0_Q8_1_MMVQ 1
-#define VDR_Q1_0_Q8_1_MMQ  4
-
-static __dpct_inline__ float
-vec_dot_q1_0_q8_1(const void *__restrict__ vbq,
-                  const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
-
-    const block_q1_0 * bq1_0 = (const block_q1_0 *) vbq;
-
-    const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
-    const float        d1          = bq1_0->d;
-    const int          v           = get_int_from_uint8_aligned(bq1_0->qs, iqs);
-
-    int vi_bytes[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int shift = j * 4;
-        const int bits4 = (v >> shift) & 0x0F;
-        const int b0    = (bits4 & 0x01) ? 1 : -1;
-        const int b1    = (bits4 & 0x02) ? 1 : -1;
-        const int b2    = (bits4 & 0x04) ? 1 : -1;
-        const int b3    = (bits4 & 0x08) ? 1 : -1;
-        vi_bytes[j]     = (b0 & 0xFF) | ((b1 & 0xFF) << 8) | ((b2 & 0xFF) << 16) | ((b3 & 0xFF) << 24);
-    }
-
-    int sumi = 0;
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int u = get_int_from_int8_aligned(bq8_1_chunk->qs, j);
-        sumi        = ggml_sycl_dp4a(vi_bytes[j], u, sumi);
-    }
-
-    return d1 * bq8_1_chunk->ds[0] * sumi;
-}
-
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
 // MMVQ = mul_mat_vec_q, MMQ = mul_mat_q
 
@@ -402,6 +367,12 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
     using q8_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
     using q8_0_traits = typename q8_0_block::traits;
 
+    // Q8_0 reordered layout packs 32×int8 qs contiguously per block (32B aligned).
+    // vdr_mmvq=4 and iqs ∈ {0,4,...} within the block → load 4×int32 (16B) as one
+    // vector instead of 4× scalar (or 8×uint16 via get_int_from_int8). Topology
+    // change: wider loads on the non-hoist multi-col / single-col Q8 MMVQ path.
+    static_assert(q8_0_traits::vdr_mmvq == 4, "Q8_0 vec4 load assumes vdr_mmvq==4");
+
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
                                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
                                      const sycl::half2 * q8_1_ds, const int & iqs) {
@@ -409,23 +380,47 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
         const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
         const ggml_half  d   = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
 
-        int v[q8_0_traits::vdr_mmvq];
-        int u[q8_0_traits::vdr_mmvq];
-
-#pragma unroll
-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
-            v[i] = get_int_from_int8(qs, iqs + i);
-            u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
-        }
+        const sycl::vec<int, 4> v =
+            *reinterpret_cast<const sycl::vec<int, 4> *>(qs + sizeof(int) * iqs);
+        const sycl::vec<int, 4> u =
+            *reinterpret_cast<const sycl::vec<int, 4> *>(q8_1_quant_ptr + sizeof(int) * iqs);
 
         int sumi = 0;
 #pragma unroll
-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+        for (int i = 0; i < 4; ++i) {
             sumi = dpct::dp4a(v[i], u[i], sumi);
         }
 
         const sycl::half2 ds_values = *q8_1_ds;
         return static_cast<float>(d) * static_cast<float>(ds_values[0]) * sumi;
+    }
+
+    // Dual gate+up: load activation u/ds once (shared-expert Q8_0 path).
+    __dpct_inline__ void dual(
+            const void * __restrict__ vbq_a, const void * __restrict__ vbq_b,
+            const std::pair<int, int> ibx_offset, const std::pair<int, int> d_offset,
+            const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds, const int & iqs,
+            float & out_a, float & out_b) {
+        const sycl::vec<int, 4> u =
+            *reinterpret_cast<const sycl::vec<int, 4> *>(q8_1_quant_ptr + sizeof(int) * iqs);
+        const sycl::half2 ds_values = *q8_1_ds;
+        const float       dsu       = static_cast<float>(ds_values[0]);
+
+        auto one = [&](const void * vbq) -> float {
+            const uint8_t * base = static_cast<const uint8_t *>(vbq);
+            const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
+            const ggml_half d    = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
+            const sycl::vec<int, 4> v =
+                *reinterpret_cast<const sycl::vec<int, 4> *>(qs + sizeof(int) * iqs);
+            int sumi = 0;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                sumi = dpct::dp4a(v[i], u[i], sumi);
+            }
+            return static_cast<float>(d) * dsu * sumi;
+        };
+        out_a = one(vbq_a);
+        out_b = one(vbq_b);
     }
 };
 
@@ -611,6 +606,97 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q5_K> {
 
         return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, *dms, d8);
     }
+
+    // Dequantized Q5_K weight fragment for one (row,block,iqs) — reused across
+    // tokens that share the same expert weight (grouped dual path).
+    struct weight_frag {
+        int        vl[2];
+        int        vh[2];
+        uint16_t   aux[2];
+        ggml_half2 dm;
+    };
+
+    // Q8_1 activation fragment for one (block,iqs) — shared across gate+up
+    // weights (dual_gemm motif: C = silu(A@B1)*(A@B2) loads A once).
+    struct act_frag {
+        int   u[2 * QR5_K];
+        float d8[QR5_K];
+    };
+
+    __dpct_inline__ weight_frag load_weight(
+            const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+            const std::pair<int, int> d_offset, const int & iqs) const {
+        const int           bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+        const uint8_t *     base       = static_cast<const uint8_t *>(vbq);
+        const uint8_t *     qs         = base + ibx_offset.first;
+        const uint8_t *     qh_base    = base + ibx_offset.second;
+        const uint8_t *     scs        = base + d_offset.first;
+        const ggml_half2 *  dms        = reinterpret_cast<const ggml_half2 *>(base + d_offset.second);
+        const int *         ql_ptr     = (const int *) (qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+        const int *         qh_ptr     = (const int *) (qh_base + 4 * ((iqs / 2) % 4));
+        const uint16_t *    scales     = (const uint16_t *) scs;
+
+        weight_frag w;
+        w.vl[0] = ql_ptr[0];
+        w.vl[1] = ql_ptr[4];
+        w.vh[0] = qh_ptr[0] >> bq8_offset;
+        w.vh[1] = qh_ptr[4] >> bq8_offset;
+        w.dm    = *dms;
+
+        const int j = (QR5_K * ((iqs / 2) / (QI8_1 / 2))) / 2;
+        if (j < 2) {
+            w.aux[0] = scales[j + 0] & 0x3f3f;
+            w.aux[1] = scales[j + 2] & 0x3f3f;
+        } else {
+            w.aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) | ((scales[j - 2] & 0xc0c0) >> 2);
+            w.aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) | ((scales[j - 0] & 0xc0c0) >> 2);
+        }
+        return w;
+    }
+
+    __dpct_inline__ act_frag load_act(
+            const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+            const int & iqs) const {
+        const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+        act_frag  a;
+#pragma unroll
+        for (int i = 0; i < QR5_K; ++i) {
+            const int8_t * quant_base_ptr = q8_1_quant_ptr + (bq8_offset + i) * QK8_1;
+            sycl::half2    ds_values      = *(q8_1_ds + bq8_offset + i);
+            a.d8[i]                       = ds_values[0];
+            const int * q8                = (const int *) quant_base_ptr + ((iqs / 2) % 4);
+            a.u[2 * i + 0]                = q8[0];
+            a.u[2 * i + 1]                = q8[4];
+        }
+        return a;
+    }
+
+    __dpct_inline__ float dot_weight_act(
+            const weight_frag & w, const act_frag & a) const {
+        const uint8_t * sc = (const uint8_t *) w.aux;
+        const uint8_t * m  = sc + 2;
+        return vec_dot_q5_K_q8_1_impl_vmmq(w.vl, w.vh, a.u, sc, m, w.dm, a.d8);
+    }
+
+    __dpct_inline__ float dot_weight(
+            const weight_frag & w, const int8_t * q8_1_quant_ptr,
+            const sycl::half2 * q8_1_ds, const int & iqs) const {
+        return dot_weight_act(w, load_act(q8_1_quant_ptr, q8_1_ds, iqs));
+    }
+
+    // Dual gate+up: load activation (q8 u/d8) once, dequant two weight blocks.
+    // Matches nvfp4_dual_gemm topology (shared A for B1 and B2).
+    __dpct_inline__ void dual(
+            const void * __restrict__ vbq_a, const void * __restrict__ vbq_b,
+            const std::pair<int, int> ibx_offset, const std::pair<int, int> d_offset,
+            const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds, const int & iqs,
+            float & out_a, float & out_b) {
+        const weight_frag wa = load_weight(vbq_a, ibx_offset, d_offset, iqs);
+        const weight_frag wb = load_weight(vbq_b, ibx_offset, d_offset, iqs);
+        const act_frag    a  = load_act(q8_1_quant_ptr, q8_1_ds, iqs);
+        out_a = dot_weight_act(wa, a);
+        out_b = dot_weight_act(wb, a);
+    }
 };
 
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
@@ -626,33 +712,65 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q6_K> {
             vl, vh, u[0], u[1], scales[0], scales[4], d, d8[0], d8[1]);
     }
 
-    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
-                     const int iqs) {
+    // Dequantized Q6_K weight fragment for one (row,block,iqs) - reused across
+    // tokens that share the same expert weight (grouped MoE-down multi-token).
+    struct weight_frag {
+        int     vl;
+        int     vh;
+        int8_t  sc0;
+        int8_t  sc4;
+        float   d;
+        int     bq8_offset;
+    };
+
+    // Reordered Q6_K packs ql/qh as contiguous int32 lanes (4B-aligned). Prefer
+    // single 32-bit loads over get_int_from_uint8 (2x uint16). Scales for one
+    // (sc0, sc4) pair sit 4 bytes apart; load 8B once when scale_offset is 4B-aligned.
+    // MoE-down on ship is 40/40 Q6_K — this is the FUSED_MOE_DOWN load topology.
+    __dpct_inline__ weight_frag load_weight(
+            const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+            const std::pair<int, int> d_offset, const int & iqs) const {
         const uint8_t *   base   = static_cast<const uint8_t *>(vbq);
         const uint8_t *   ql     = base + ibx_offset.first;
         const uint8_t *   qh     = base + ibx_offset.second;
         const int8_t *    scales = reinterpret_cast<const int8_t *>(base + d_offset.first);
         const ggml_half * d      = (const ggml_half *) (base + d_offset.second);
 
-        const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
         const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
         const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+        const int qh_iqs       = (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4);
 
-        const int vl = get_int_from_uint8(ql, iqs);
-        const int vh = get_int_from_uint8(qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+        weight_frag w;
+        w.bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+        w.vl         = get_int_from_uint8_aligned(ql, iqs);
+        w.vh         = get_int_from_uint8_aligned(qh, qh_iqs) >> vh_shift;
+        // scale_offset is not always 4B-aligned (depends on iqs); keep scalar sc loads.
+        w.sc0        = scales[scale_offset + 0];
+        w.sc4        = scales[scale_offset + 4];
+        w.d          = *d;
+        return w;
+    }
 
-        const int8_t * scs = scales + scale_offset;
-
+    __dpct_inline__ float dot_weight(
+            const weight_frag & w, const int8_t * q8_1_quant_ptr,
+            const sycl::half2 * q8_1_ds, const int & iqs) const {
+        const int lane = iqs % QI8_1;
         const int u0 = get_int_from_int8_aligned(
-            q8_1_quant_ptr + bq8_offset * QK8_1, iqs % QI8_1);
+            q8_1_quant_ptr + w.bq8_offset * QK8_1, lane);
         const int u1 = get_int_from_int8_aligned(
-            q8_1_quant_ptr + (bq8_offset + 2) * QK8_1, iqs % QI8_1);
-        const float d80 = (*(q8_1_ds + bq8_offset + 0))[0];
-        const float d81 = (*(q8_1_ds + bq8_offset + 2))[0];
-
+            q8_1_quant_ptr + (w.bq8_offset + 2) * QK8_1, lane);
+        // half2 ds for bq8 and bq8+2: two scalar loads (non-adjacent).
+        const float d80 = (*(q8_1_ds + w.bq8_offset + 0))[0];
+        const float d81 = (*(q8_1_ds + w.bq8_offset + 2))[0];
         return vec_dot_q6_K_q8_1_impl_mmvq_scalar(
-            vl, vh, u0, u1, scs[0], scs[4], *d, d80, d81);
+            w.vl, w.vh, u0, u1, w.sc0, w.sc4, w.d, d80, d81);
+    }
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
+                     const int iqs) {
+        const weight_frag w = load_weight(vbq, ibx_offset, d_offset, iqs);
+        return dot_weight(w, q8_1_quant_ptr, q8_1_ds, iqs);
     }
 };
 #define VDR_Q4_0_Q8_1_MMVQ 2
@@ -1007,6 +1125,8 @@ vec_dot_q8_0_q8_1(const void *__restrict__ vbq,
 
 #pragma unroll
     for (int i = 0; i < VDR_Q8_0_Q8_1_MMVQ; ++i) {
+        // qs is only 2-byte aligned inside classic block_q8_0 (d half then qs).
+        // Wider vec loads measured NEUTRAL (−0.07% TG) 2026-07-27 — leave scalar.
         v[i] = get_int_from_int8(bq8_0->qs, iqs + i);
         u[i] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
     }

@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 
 #include "dpct/helper.hpp"
 #include "ggml.h"
@@ -59,13 +60,9 @@ void ggml_sycl_host_free(void* ptr);
 
 
 extern int g_ggml_sycl_debug;
-extern int g_ggml_sycl_enable_optimize;
-extern int g_ggml_sycl_enable_fusion;
+extern int g_ggml_sycl_disable_optimize;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_enable_flash_attention;
-extern int g_ggml_sycl_dev2dev_memcpy;
-extern int g_ggml_sycl_fa_onednn;
-extern int g_ggml_sycl_fa_onednn_max_kv;
 
 
 #if defined(__clang__) && __has_builtin(__builtin_expect)
@@ -130,11 +127,6 @@ enum ggml_sycl_backend_gpu_mode {
   SYCL_MUL_GPU_MODE
 };
 
-enum ggml_sycl_dev2dev_memcpy_mode {
-  DEV2DEV_MEMCPY_SYCL = 0,
-  DEV2DEV_MEMCPY_L0 = 1,
-};
-
 static_assert(sizeof(sycl::half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 static void crash() {
@@ -175,6 +167,8 @@ typedef sycl::float2 dfloat2;
 #endif // GGML_SYCL_F16
 
 #define MMVQ_MAX_BATCH_SIZE  8
+// wide-batch cap: chunk-of-8 MMVQ stays ahead of dequant+GEMM up to ~32 token columns
+#define MMVQ_MAX_BATCH_SIZE_WIDE 32
 
 static int g_all_sycl_device_count = -1;
 static bool g_ggml_backend_sycl_buffer_type_initialized = false;
@@ -234,12 +228,10 @@ struct sycl_device_info {
     int max_wg_per_cu; // max work groups per compute unit - refer to
                        // cudaOccupancyMaxActiveBlocksPerMultiprocessor
     bool    vmm;                // virtual memory support
-    bool    l0_discrete_gpu;    // Level Zero backend and not an integrated GPU
     size_t  vmm_granularity;    // granularity of virtual memory
     size_t  total_vram;
     sycl_hw_info hw_info;
     optimize_feature opt_feature;
-    bool    usm_system_support; // support for USM system allocations
 };
 
 
@@ -327,18 +319,22 @@ struct ggml_tensor_extra_gpu {
   optimize_feature optimized_feature;
 };
 
-extern int g_ggml_sycl_use_level_zero_api;
+extern int g_ggml_sycl_enable_level_zero;
 void * ggml_sycl_malloc_device(size_t size, sycl::queue &q);
 void ggml_sycl_free_device(void *ptr, sycl::queue &q);
 
 void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> streams={});
 
-struct mmid_row_mapping {
-    int32_t i1;
-    int32_t i2;
-};
-
 namespace sycl_ex = sycl::ext::oneapi::experimental;
+
+#ifdef GGML_SYCL_GRAPH
+struct ggml_sycl_graph {
+    size_t uid = 0;
+    int64_t last_used_time = 0;
+    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> executable;
+};
+#endif
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
@@ -435,8 +431,6 @@ struct ggml_backend_sycl_context {
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
-    std::vector<mmid_row_mapping> mmid_row_mapping_host;
-
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
@@ -466,7 +460,35 @@ struct ggml_backend_sycl_context {
     }
 
 #ifdef GGML_SYCL_GRAPH
-    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // One backend context can see several scheduler splits over its lifetime. Keep their
+    // executable graphs separate, but evict stale entries so changing batch shapes cannot
+    // grow the cache without bound.
+    std::unordered_map<const void *, std::unique_ptr<ggml_sycl_graph>> sycl_graphs;
+    int64_t last_graph_eviction_sweep = 0;
+
+    ggml_sycl_graph * sycl_graph(const void * first_node_ptr) {
+        const int64_t time_now = ggml_time_us();
+
+        // Match the CUDA graph cache lifetime: sweep every 5 seconds and evict entries
+        // unused for at least 10 seconds.
+        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+            last_graph_eviction_sweep = time_now;
+            for (auto it = sycl_graphs.begin(); it != sycl_graphs.end();) {
+                if (time_now - it->second->last_used_time >= 10'000'000) {
+                    it = sycl_graphs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        auto it = sycl_graphs.find(first_node_ptr);
+        if (it == sycl_graphs.end()) {
+            it = sycl_graphs.emplace(first_node_ptr, std::make_unique<ggml_sycl_graph>()).first;
+        }
+        it->second->last_used_time = time_now;
+        return it->second.get();
+    }
 #endif
 
     ggml_sycl_pool & host_pool(int device) {
@@ -661,8 +683,6 @@ constexpr size_t ceil_div(const size_t m, const size_t n) {
 }
 
 bool gpu_has_xmx(sycl::device &dev);
-
-int ggml_sycl_get_env(const char *env_name, int default_val);
 
 template <int N, class T> std::string debug_get_array_str(const std::string & prefix, const T array[N]) {
     if (LIKELY(!g_ggml_sycl_debug)) {

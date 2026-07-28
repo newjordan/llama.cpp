@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gated_delta_net.hpp"
 #include <cmath>
+#include <cstdlib>
 
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -29,7 +30,13 @@ void gated_delta_net_sycl(const float *     q,
                           const sycl::uint3 neqk1_magic,
                           const sycl::uint3 rq3_magic,
                           float             scale,
-                          int               K) {
+                          int               K,
+                          const int32_t *   state_ids,
+                          int64_t           state_cache_stride,
+                          const float *     state_scratch,
+                          int64_t           state_dst_row0,
+                          float *           state_dst,
+                          int64_t           state_dst_stride) {
     auto           item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const uint32_t h_idx    = item_ct1.get_group(2);
     const uint32_t sequence = item_ct1.get_group(1);
@@ -42,15 +49,23 @@ void gated_delta_net_sycl(const float *     q,
 
     const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     float *       attn_data        = dst;
-    float *       state            = dst + attn_score_elems;
+    float *       state            = state_dst != nullptr
+        ? state_dst + sequence * state_dst_stride
+        : dst + attn_score_elems;
 
     // input state holds s0 only [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
-    const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
+    const int64_t state_in_sequence    = state_ids != nullptr ? state_ids[sequence] : sequence;
+    const bool state_staged = state_ids != nullptr && state_scratch != nullptr &&
+        state_in_sequence != state_dst_row0 + sequence;
+    const int64_t state_in_offset      = state_staged
+        ? sequence * H * S_v * S_v + h_idx * S_v * S_v
+        : state_in_sequence * state_cache_stride + h_idx * S_v * S_v;
+    const int64_t state_out_offset     =
+        ((state_dst != nullptr ? 0 : sequence * H) + h_idx) * S_v * S_v;
     const int64_t state_size_per_token = S_v * S_v * H * n_seqs; // per-slot stride in output
     state += state_out_offset;
-    curr_state += state_in_offset + col * S_v;
+    curr_state = (state_staged ? state_scratch : curr_state) + state_in_offset + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
     constexpr int warp_size = ggml_sycl_get_physical_warp_size() < S_v ? ggml_sycl_get_physical_warp_size() : S_v;
@@ -189,11 +204,31 @@ static void launch_gated_delta_net(const float *   q_d,
                                    int64_t         rq3,
                                    float           scale,
                                    int             K,
+                                   const int32_t * state_ids,
+                                   int64_t         state_cache_stride,
+                                   const float *   state_scratch,
+                                   int64_t         state_dst_row0,
+                                   float *         state_dst,
+                                   int64_t         state_dst_stride,
                                    dpct::queue_ptr stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
 
-    const int num_warps = 4;
+    // Historical default 4 warps/WG. Screen 2026-07-27: force 8 vs 4 was
+    // −0.04% TG noise (GATED_DELTA_NET ~0.4% of stack). Keep opt-in override
+    // only: GGML_SYCL_GDN_NUM_WARPS=1|2|4|8|16.
+    static const int override_warps = []() {
+        const char * env = getenv("GGML_SYCL_GDN_NUM_WARPS");
+        if (env == nullptr || env[0] == '\0') {
+            return 0;
+        }
+        const int v = atoi(env);
+        switch (v) {
+            case 1: case 2: case 4: case 8: case 16: return v;
+            default: return 0;
+        }
+    }();
+    const int num_warps = override_warps != 0 ? override_warps : 4;
     dpct::dim3 grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dpct::dim3 block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
@@ -208,7 +243,9 @@ static void launch_gated_delta_net(const float *   q_d,
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                          gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens,
                                                                        n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
-                                                                       sb3, neqk1_magic, rq3_magic, scale, K);
+                                                                       sb3, neqk1_magic, rq3_magic, scale, K, state_ids,
+                                                                       state_cache_stride, state_scratch, state_dst_row0,
+                                                                       state_dst, state_dst_stride);
                                      });
             }
             break;
@@ -219,7 +256,9 @@ static void launch_gated_delta_net(const float *   q_d,
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                          gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens,
                                                                        n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
-                                                                       sb3, neqk1_magic, rq3_magic, scale, K);
+                                                                       sb3, neqk1_magic, rq3_magic, scale, K, state_ids,
+                                                                       state_cache_stride, state_scratch, state_dst_row0,
+                                                                       state_dst, state_dst_stride);
                                      });
             }
             break;
@@ -230,7 +269,9 @@ static void launch_gated_delta_net(const float *   q_d,
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                             gated_delta_net_sycl<sv, KDA, keep_rs_t>(
                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens, n_seqs, sq1, sq2,
-                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K,
+                                                state_ids, state_cache_stride, state_scratch, state_dst_row0,
+                                                state_dst, state_dst_stride);
                                         });
             }
             break;
@@ -242,7 +283,9 @@ static void launch_gated_delta_net(const float *   q_d,
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                                             gated_delta_net_sycl<sv, KDA, keep_rs_t>(
                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H, n_tokens, n_seqs, sq1, sq2,
-                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                                                sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K,
+                                                state_ids, state_cache_stride, state_scratch, state_dst_row0,
+                                                state_dst, state_dst_stride);
                                         });
             }
             break;
@@ -322,21 +365,25 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, nullptr, H * S_v * S_v,
+                nullptr, 0, nullptr, H * S_v * S_v, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, nullptr, H * S_v * S_v,
+                nullptr, 0, nullptr, H * S_v * S_v, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, nullptr, H * S_v * S_v,
+                nullptr, 0, nullptr, H * S_v * S_v, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, K, nullptr, H * S_v * S_v,
+                nullptr, 0, nullptr, H * S_v * S_v, stream);
         }
     }
 }
@@ -344,4 +391,88 @@ void ggml_sycl_op_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor *
 void ggml_sycl_gated_delta_net(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/6);
     ggml_sycl_op_gated_delta_net(ctx, dst);
+}
+
+void ggml_sycl_gated_delta_net_state_io(
+        ggml_backend_sycl_context & ctx,
+        ggml_tensor * dst,
+        const ggml_tensor * state_cache,
+        const ggml_tensor * state_ids,
+        const ggml_tensor * state_scratch,
+        ggml_tensor * state_dst,
+        int64_t n_rs) {
+    ggml_tensor * src_q    = dst->src[0];
+    ggml_tensor * src_k    = dst->src[1];
+    ggml_tensor * src_v    = dst->src[2];
+    ggml_tensor * src_g    = dst->src[3];
+    ggml_tensor * src_beta = dst->src[4];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t state_size = S_v * S_v * H;
+    const bool kda = src_g->ne[0] == S_v;
+
+    GGML_ASSERT(n_tokens == 1);
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == 1);
+    GGML_ASSERT(src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32 &&
+                src_v->type == GGML_TYPE_F32 && src_g->type == GGML_TYPE_F32 &&
+                src_beta->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_cache->type == GGML_TYPE_F32 && state_scratch->type == GGML_TYPE_F32 &&
+                state_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_ids->type == GGML_TYPE_I32 && state_ids->ne[0] == n_seqs);
+    GGML_ASSERT(state_cache->ne[0] == state_size && state_dst->ne[0] == state_size &&
+                state_dst->ne[1] == n_seqs && state_scratch->ne[0] == state_size &&
+                state_scratch->ne[1] == n_seqs);
+    GGML_ASSERT(state_cache->nb[0] == sizeof(float) && state_dst->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+    GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
+    GGML_ASSERT(ggml_is_contiguous(src_g));
+    GGML_ASSERT(ggml_is_contiguous(src_beta));
+
+    const int64_t sq1 = src_q->nb[1] / sizeof(float);
+    const int64_t sq2 = src_q->nb[2] / sizeof(float);
+    const int64_t sq3 = src_q->nb[3] / sizeof(float);
+    const int64_t sv1 = src_v->nb[1] / sizeof(float);
+    const int64_t sv2 = src_v->nb[2] / sizeof(float);
+    const int64_t sv3 = src_v->nb[3] / sizeof(float);
+    const int64_t sb1 = src_beta->nb[1] / sizeof(float);
+    const int64_t sb2 = src_beta->nb[2] / sizeof(float);
+    const int64_t sb3 = src_beta->nb[3] / sizeof(float);
+    const int64_t state_cache_stride = state_cache->nb[1] / sizeof(float);
+    const int64_t state_dst_stride   = state_dst->nb[1] / sizeof(float);
+    const int64_t neqk1 = src_q->ne[1];
+    const int64_t rq3   = src_v->ne[3] / src_q->ne[3];
+    const float scale = 1.0f / sqrtf((float) S_v);
+    const uintptr_t cache_ptr = (uintptr_t) state_cache->data;
+    const uintptr_t dst_ptr   = (uintptr_t) state_dst->data;
+    GGML_ASSERT(dst_ptr >= cache_ptr && state_cache->nb[1] != 0 &&
+                (dst_ptr - cache_ptr) % state_cache->nb[1] == 0);
+    const int64_t state_dst_row0 = (dst_ptr - cache_ptr) / state_cache->nb[1];
+    GGML_ASSERT(n_rs >= n_seqs && state_dst_row0 + n_rs <= state_cache->ne[1]);
+
+    if (kda) {
+        launch_gated_delta_net<true, false>(
+            (const float *) src_q->data, (const float *) src_k->data,
+            (const float *) src_v->data, (const float *) src_g->data,
+            (const float *) src_beta->data, (const float *) state_cache->data,
+            (float *) dst->data, S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, 1, (const int32_t *) state_ids->data, state_cache_stride,
+            (const float *) state_scratch->data, state_dst_row0,
+            (float *) state_dst->data, state_dst_stride, ctx.stream());
+    } else {
+        launch_gated_delta_net<false, false>(
+            (const float *) src_q->data, (const float *) src_k->data,
+            (const float *) src_v->data, (const float *) src_g->data,
+            (const float *) src_beta->data, (const float *) state_cache->data,
+            (float *) dst->data, S_v, H, n_tokens, n_seqs,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+            scale, 1, (const int32_t *) state_ids->data, state_cache_stride,
+            (const float *) state_scratch->data, state_dst_row0,
+            (float *) state_dst->data, state_dst_stride, ctx.stream());
+    }
 }
