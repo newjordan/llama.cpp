@@ -11,6 +11,9 @@
 //
 
 
+#include <set>
+#include <tuple>
+
 #include <sycl/sycl.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
@@ -18,7 +21,6 @@
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
-#include "fattn-onednn.hpp"
 
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
@@ -97,7 +99,6 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_ONEDNN   = 150, // added enum for onednn==150
     BEST_FATTN_KERNEL_TILE     = 200,
 };
 
@@ -115,6 +116,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * kv_idxs = dst->src[5];
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -188,17 +190,42 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    if (kv_idxs) {
+        if (kv_idxs->type != GGML_TYPE_I32 || kv_idxs->ne[0] != K->ne[1] || kv_idxs->ne[1] != K->ne[3]) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (K->type == GGML_TYPE_F32 || V->type == GGML_TYPE_F32) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (Q->ne[1] != 1 && (K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    static const bool force_vec_kernel = []() {
+        const char * env = getenv("GGML_SYCL_FORCE_FA_VEC");
+        return env != nullptr && atoi(env) != 0;
+    }();
 
-    // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
-    // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
-        return BEST_FATTN_KERNEL_ONEDNN;
+    if (kv_idxs) {
+        if (Q->ne[1] == 1 && force_vec_kernel && can_use_vector_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        return Q->ne[1] == 1 && can_use_vector_kernel ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
     }
+
+    // Todo: Use the XMX kernel if possible:
 
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
+        if (force_vec_kernel) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
             if (Q->ne[1] == 1) {
                 if (!gqa_opt_applies) {
@@ -216,16 +243,23 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
-    switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
+    const best_fattn_kernel kernel = ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst);
+    // GGML_SYCL_FA_DEBUG=1: print each distinct dispatch shape once.
+    static const bool fa_debug = getenv("GGML_SYCL_FA_DEBUG") != nullptr;
+    if (fa_debug) {
+        static std::set<std::tuple<int, int, int64_t, int64_t, bool>> seen;
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const bool indexed = dst->src[5] != nullptr;
+        if (seen.emplace((int) kernel, (int) K->type, Q->ne[1], K->ne[1], indexed).second) {
+            fprintf(stderr, "[fa-debug] kernel=%s Ktype=%s Qrows=%ld KVlen=%ld head=%ld indexed=%d\n",
+                    kernel == BEST_FATTN_KERNEL_VEC ? "VEC" : kernel == BEST_FATTN_KERNEL_TILE ? "TILE" : "NONE",
+                    ggml_type_name(K->type), (long) Q->ne[1], (long) K->ne[1], (long) K->ne[0], indexed ? 1 : 0);
+        }
+    }
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("Not support Flash-Attention");
-        case BEST_FATTN_KERNEL_ONEDNN:
-            // guarded: ggml_sycl_flash_attn_ext_onednn() is only defined under GGML_SYCL_DNNL;
-            // the reference must be compiled out here or the GGML_SYCL_DNNL=0 build fails to link.
-#if GGML_SYCL_DNNL
-            ggml_sycl_flash_attn_ext_onednn(ctx, dst);
-#endif
-            break;
         case BEST_FATTN_KERNEL_TILE:
             ggml_sycl_flash_attn_ext_tile(ctx, dst);
             break;

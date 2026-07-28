@@ -26,6 +26,7 @@ typedef void (*fattn_kernel_t)(
     const char* mask,
     const char* sinks,
     const int* KV_max,
+    const int* kv_idxs,
     float* dst,
     sycl::float2* dst_meta,
     const float scale,
@@ -843,6 +844,7 @@ static void lauch_kernel(
     const char* __restrict__ mask,
     const char* __restrict__ sinks,
     const int* __restrict__ KV_max,
+    const int* __restrict__ kv_idxs,
     float* __restrict__ dst,
     sycl::float2* __restrict__ dst_meta,
     const float scale,
@@ -882,7 +884,7 @@ static void lauch_kernel(
                 static_cast<sycl::range<3>>(local_range)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(warp_size)]] {
                 GGML_UNUSED(item_ct1);
-                fattn_kernel(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+                fattn_kernel(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
                              max_bias, m0, m1, n_head_log2, logit_softcap, ne00,
                              ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11,
                              ne12, ne13, nb11, nb12, nb13, nb21, nb22, nb23,
@@ -904,8 +906,9 @@ void launch_fattn(
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
-    const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * mask    = dst->src[3];
+    const ggml_tensor * sinks   = dst->src[4];
+    const ggml_tensor * kv_idxs = dst->src[5];
 
     ggml_tensor * KQV = dst;
 
@@ -917,6 +920,11 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!kv_idxs || kv_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(!kv_idxs || kv_idxs->ne[0] == K->ne[1]);
+    GGML_ASSERT(!kv_idxs || kv_idxs->ne[1] == K->ne[3]);
+    GGML_ASSERT(!kv_idxs || kv_idxs->ne[2] == 1);
+    GGML_ASSERT(!kv_idxs || kv_idxs->ne[3] == 1);
 
     ggml_sycl_pool & pool = ctx.pool();
     ggml_sycl_fattn_kv_buffers & fbuf = ctx.fattn_buffers();
@@ -941,6 +949,7 @@ void launch_fattn(
     size_t nb23 = V->nb[3];
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
+        GGML_ASSERT(!kv_idxs && "indexed FATTN must read the original K cache rows");
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -968,6 +977,7 @@ void launch_fattn(
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
+        GGML_ASSERT(!kv_idxs && "indexed FATTN must read the original V cache rows");
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1127,6 +1137,7 @@ void launch_fattn(
     lauch_kernel<fattn_kernel, warp_size>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
         mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
+        kv_idxs ? ((const int *) kv_idxs->data) : nullptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,

@@ -59,11 +59,13 @@ void ggml_sycl_hardswish(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_exp(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
-void ggml_sycl_expm1(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
-
 void ggml_sycl_log(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_softplus(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+
+// Fused gated-delta-net gate glue: dst = softplus(a + b) * c (b,c broadcast 1-D over dim0).
+void ggml_sycl_op_fused_add_softplus_mul(ggml_backend_sycl_context & ctx, const ggml_tensor * a,
+                                         const ggml_tensor * b, const ggml_tensor * c, ggml_tensor * dst);
 
 void ggml_sycl_neg(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
@@ -74,8 +76,6 @@ void ggml_sycl_leaky_relu(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 void ggml_sycl_sqr(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_clamp(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
-
-void ggml_sycl_xielu(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_sgn(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 

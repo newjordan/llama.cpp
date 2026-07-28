@@ -15,11 +15,13 @@
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
-static int ggml_sycl_fattn_vec_get_nthreads_device(gpu_arch arch) {
-    // Xe2 (Battlemage, Lunar Lake) runs the flash-attention vec kernel best with a 256-thread work group.
-    return (arch == gpu_arch::intel_gpu_bmg_g21 ||
-            arch == gpu_arch::intel_gpu_bmg_g31 ||
-            arch == gpu_arch::intel_gpu_lnl_m) ? 256 : 128;
+static int ggml_sycl_fattn_vec_get_nthreads_host(const int cc) {
+    return 128;
+    GGML_UNUSED(cc);
+}
+
+static constexpr int ggml_sycl_fattn_vec_get_nthreads_device() {
+    return 128;
 }
 
 // Currenlty llvm with the amdgcn target dose not support unrolling loops
@@ -35,13 +37,18 @@ template <int D,
           int type_V,
           bool use_logit_softcap,
           int warp_size,
-          int nthreads>  // D == head size
+          // cols_are_heads: the ncols columns are the gqa_ratio query heads of ONE KV head
+          // (one Q token per workgroup) instead of ncols Q tokens of one head. Each loaded
+          // K/V block is dotted against all heads of its group -> KV read traffic / gqa_ratio.
+          // Requires gqa_ratio == ncols, max_bias == 0. Launched with ncols1=1, ncols2=ncols.
+          bool cols_are_heads = false>  // D == head size
 static void flash_attn_ext_vec(const char* __restrict__ Q,
                         const char* __restrict__ K,
                         const char* __restrict__ V,
                         const char* __restrict__ mask,
                         const char* __restrict__ sinks,
                         const int* __restrict__ KV_max,
+                        const int* __restrict__ kv_idxs,
                         float* __restrict__ dst,
                         sycl::float2* __restrict__ dst_meta,
                         const float scale,
@@ -78,7 +85,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     if (use_logit_softcap && !(D == 128 || D == 256)) {
-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
             ne00, ne01, ne02, ne03,
                   nb01, nb02, nb03,
@@ -98,6 +105,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int nthreads_KQ_q = (D/4 < warp_size ? D/4 : warp_size);
     constexpr int nthreads_V_q  = (D/4 < warp_size ? D/4 : warp_size);
 
+    constexpr int nthreads    = ggml_sycl_fattn_vec_get_nthreads_device();
     constexpr int nthreads_KQ = type_K == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = type_V == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_V_q;
 
@@ -115,14 +123,31 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
 #endif // GGML_SYCL_F16
 
-    const int ic0 = item_ct1.get_group(2) * ncols;  // Index of the Q/QKV column to work on.
+    // Index of the Q/QKV column to work on: a token block (ncols tokens), or with
+    // cols_are_heads a single token whose ncols=gqa_ratio heads are the columns.
+    const int ic0 = item_ct1.get_group(2) * (cols_are_heads ? 1 : ncols);
 
-    const int sequence  = item_ct1.get_group(0) / ne02;
-    const int head      = item_ct1.get_group(0) - sequence * ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    Q += nb03*sequence + nb02* head              + nb01*ic0;
-    K += nb13*sequence + nb12*(head / gqa_ratio);
-    V += nb23*sequence + nb22*(head / gqa_ratio);
+    int sequence, head; // head = this workgroup's Q head (base head of the KV group if cols_are_heads)
+    if constexpr (cols_are_heads) {
+        sequence          = item_ct1.get_group(0) / ne12;
+        const int kv_head = item_ct1.get_group(0) - sequence * ne12;
+        head              = kv_head * gqa_ratio;
+        Q += nb03*sequence + nb02*head    + nb01*ic0;
+        K += nb13*sequence + nb12*kv_head;
+        V += nb23*sequence + nb22*kv_head;
+    } else {
+        sequence = item_ct1.get_group(0) / ne02;
+        head     = item_ct1.get_group(0) - sequence * ne02;
+        Q += nb03*sequence + nb02* head              + nb01*ic0;
+        K += nb13*sequence + nb12*(head / gqa_ratio);
+        V += nb23*sequence + nb22*(head / gqa_ratio);
+    }
+    // Column j's Q row: next token (nb01), or next head of the KV group (nb02).
+    const int32_t q_col_stride = cols_are_heads ? nb02 : nb01;
+    const char * K_head_base = K;
+    const char * V_head_base = V;
+    const int * kv_idxs_seq = kv_idxs ? kv_idxs + sequence * ne11 : nullptr;
 
     const sycl::half * maskh = (const sycl::half *) (mask + nb33 * (sequence % ne33) + nb31 * ic0);
 
@@ -193,8 +218,8 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             int    * tmp_q_i32 = (int    *) &KQ[j*D];
             sycl::float2 * tmp_q_ds  = (sycl::float2 *) (tmp_q_i32 + D / sizeof(int));
 
-            // Set memory to zero if out of bounds:
-            if (ncols > 1 && ic0 + j >= int(ne01.z())) {
+            // Set memory to zero if out of bounds (head columns are always in bounds):
+            if (!cols_are_heads && ncols > 1 && ic0 + j >= int(ne01.z())) {
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += warp_size) {
                     const int i = i0 + item_ct1.get_local_id(2);
@@ -207,7 +232,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                     tmp_q_ds[item_ct1.get_local_id(2)] = sycl::float2(0.0f, 0.0f);
                 }
             } else {
-                const float * Q_f = (const float *) (Q + j*nb01);
+                const float * Q_f = (const float *) (Q + j*q_col_stride);
                 constexpr int nthreads_quantize = D/sizeof(int) < warp_size ? D/sizeof(int) : warp_size;
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += nthreads_quantize) {
@@ -242,7 +267,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
         const sycl::half2 scale_h2 = sycl::half2(scale, scale);
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j * nb01);
+            const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j * q_col_stride);
 #pragma unroll
             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
                 const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) :
@@ -252,7 +277,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                 sycl::float2 tmp[cpy_ne] = {
                     { 0.0f, 0.0f }
                 };
-                if (ncols == 1 || ic0 + j < int(ne01.z())) {
+                if (cols_are_heads || ncols == 1 || ic0 + j < int(ne01.z())) {
                     ggml_sycl_memcpy_1<cpy_nb>(tmp,            &Q_j[i]);
                     ggml_sycl_memcpy_1<cpy_nb>(tmp + cpy_ne/2, &Q_j[i + cpy_ne/2]);
                 }
@@ -269,11 +294,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 #else
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j*nb01);
+            const sycl::float2 * Q_j = (const sycl::float2 *) (Q + j*q_col_stride);
 #pragma unroll
             for (int i0 = 0; i0 < D/2; i0 += nthreads_KQ*cpy_ne) {
                 const int i = i0 + (nthreads_KQ == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_KQ)*cpy_ne;
-                if (ncols == 1 || ic0 + j < int(ne01.z())) {
+                if (cols_are_heads || ncols == 1 || ic0 + j < int(ne01.z())) {
                     ggml_sycl_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ],            &Q_j[i]);
                     ggml_sycl_memcpy_1<cpy_nb>(&Q_reg[j][i0/nthreads_KQ + cpy_ne/2], &Q_j[i + cpy_ne/2]);
                 }
@@ -296,6 +321,13 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
              // Increment pointers after each loop:
          K += item_ct1.get_group_range(1) * nthreads * nb11, V += item_ct1.get_group_range(1) * nthreads * nb21,
              maskh += item_ct1.get_group_range(1) * nthreads) {
+        const bool use_kv_idxs = kv_idxs_seq != nullptr;
+        const int phys_first = use_kv_idxs ? kv_idxs_seq[k_VKQ_0] : 0;
+        const int phys_last  = use_kv_idxs ? kv_idxs_seq[k_VKQ_0 + nthreads - 1] : 0;
+        const bool kv_block_contiguous = !use_kv_idxs || phys_last == phys_first + nthreads - 1;
+        const char * K_block = use_kv_idxs ? K_head_base + phys_first * nb11 : K;
+        const char * V_block = use_kv_idxs ? V_head_base + phys_first * nb21 : V;
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]={}; // KQ in registers.
         float KQ_max_new[ncols]={};
@@ -313,14 +345,20 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                const char * K_row = K_block + i_KQ*nb11;
+                if (!kv_block_contiguous) {
+                    K_row = K_head_base + kv_idxs_seq[k_VKQ_0 + i_KQ] * nb11;
+                }
+
+                float sum = vec_dot_KQ(K_row, Q_reg[j], Q_i32[j], Q_ds[j]);
                 sum = warp_reduce_sum<nthreads_KQ>(sum);
 
                 if (use_logit_softcap) {
                     sum = logit_softcap * sycl::tanh(sum);
                 }
                 if (mask) {
-                    sum += slope * sycl::vec<sycl::half, 1>(maskh[j * ne11 + i_KQ])
+                    // Head columns share one Q token and therefore one mask row.
+                    sum += slope * sycl::vec<sycl::half, 1>(maskh[(cols_are_heads ? 0 : j * ne11) + i_KQ])
                                        .convert<float, sycl::rounding_mode::automatic>()[0];
                 }
 
@@ -384,7 +422,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 sycl::half2 tmp[V_rows_per_thread / 2];
-                dequantize_V(V + k * nb21, tmp,
+                const char * V_row = V_block + k * nb21;
+                if (!kv_block_contiguous) {
+                    V_row = V_head_base + kv_idxs_seq[k_VKQ_0 + k] * nb21;
+                }
+                dequantize_V(V_row, tmp,
                              2 * i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) :
                                                                       item_ct1.get_local_id(2) % nthreads_V) *
                                                V_rows_per_thread);
@@ -405,7 +447,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 sycl::float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
+                const char * V_row = V_block + k*nb21;
+                if (!kv_block_contiguous) {
+                    V_row = V_head_base + kv_idxs_seq[k_VKQ_0 + k] * nb21;
+                }
+                dequantize_V(V_row, tmp,
                     2*i_VKQ_0 + (nthreads_V == warp_size ? item_ct1.get_local_id(2) : item_ct1.get_local_id(2) % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
@@ -421,8 +467,6 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     }
 
     if (sinks && item_ct1.get_group(1) == 0) {
-        const float sink = ((const float *) sinks)[head];
-
 #pragma unroll
         for (int j0 = 0; j0 < ncols; j0 += nwarps) {
             const int j = j0 + item_ct1.get_local_id(1);
@@ -430,6 +474,8 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
             if (j0 + nwarps > ncols && j >= ncols) {
                 break;
             }
+            // Sinks are per Q head: with head columns each column has its own sink.
+            const float sink = ((const float *) sinks)[cols_are_heads ? head + j : head];
             const float kqmax_new_j  = sycl::fmax(sink, (float) KQ_max[j]);
             const float KQ_max_scale = sycl::native::exp((float) (KQ_max[j] - kqmax_new_j));
             KQ_max[j] = kqmax_new_j;
@@ -474,7 +520,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
 #pragma unroll
     for (int j_VKQ = 0; j_VKQ < ncols; ++j_VKQ) {
-        if (ncols > 1 && ic0 + j_VKQ >= int(ne01.z())) {
+        if (!cols_are_heads && ncols > 1 && ic0 + j_VKQ >= int(ne01.z())) {
             break;
         }
 
@@ -544,10 +590,11 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
                 if (item_ct1.get_group_range(1) == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
-                dst[(((sequence * int(ne01.z()) + ic0 + j_VKQ) * ne02 + head) * item_ct1.get_group_range(1) +
-                     item_ct1.get_group(1)) *
-                        D +
-                    i0 + tid] = dst_val;
+                // Output row: column j is the j-th token of this head, or the j-th head of this token.
+                const int out_row = cols_are_heads
+                    ? (sequence * int(ne01.z()) + ic0) * ne02 + head + j_VKQ
+                    : (sequence * int(ne01.z()) + ic0 + j_VKQ) * ne02 + head;
+                dst[(out_row * item_ct1.get_group_range(1) + item_ct1.get_group(1)) * D + i0 + tid] = dst_val;
             }
         }
 
@@ -557,12 +604,16 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 
     }
 
-    if (item_ct1.get_group_range(1) != 1 && tid < ncols && (ncols == 1 || ic0 + tid < int(ne01.z()))) {
-        dst_meta[((sequence * int(ne01.z()) + ic0 + tid) * ne02 + head) * item_ct1.get_group_range(1) +
-                 item_ct1.get_group(1)] = make_float2(KQ_max[tid], KQ_sum[tid]);
+    if (item_ct1.get_group_range(1) != 1 && tid < ncols &&
+        (cols_are_heads || ncols == 1 || ic0 + tid < int(ne01.z()))) {
+        const int meta_row = cols_are_heads
+            ? (sequence * int(ne01.z()) + ic0) * ne02 + head + tid
+            : (sequence * int(ne01.z()) + ic0 + tid) * ne02 + head;
+        dst_meta[meta_row * item_ct1.get_group_range(1) + item_ct1.get_group(1)] =
+            make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, kv_idxs, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -579,34 +630,28 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
 #endif // __clang__
 
 
-
-template <int D, int cols_per_block, int type_K, int type_V, bool use_logit_softcap>
+template <int D, int cols_per_block, int type_K, int type_V, bool use_logit_softcap, bool cols_are_heads = false>
 void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
-    constexpr int warp_size = WARP_16_SIZE; //better performance than WARP_32_SIZE
+    const int warp_size = WARP_16_SIZE; //better performance than WARP_32_SIZE
+
+    const int cc = ggml_sycl_info().devices[ggml_sycl_get_device()].cc;
+
+    const int nthreads = ggml_sycl_fattn_vec_get_nthreads_host(cc);
+    const int nwarps   = nthreads / warp_size;
 
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
 
-    const auto arch = ggml_sycl_info().devices[ctx.device].hw_info.arch;
-    const int nthreads = ggml_sycl_fattn_vec_get_nthreads_device(arch);
-    // 256 threads would overflow the 64 KB work-group local memory at D == 512, so keep 128 there.
-    if (D <= 256 && nthreads == 256) {
-        constexpr int nthreads_hw = 256;
-        constexpr int nwarps = nthreads_hw / warp_size;
-        launch_fattn<D, cols_per_block, 1,
-                     flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
-                                        use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
-            ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
-    } else {
-        constexpr int nthreads_hw = 128;
-        constexpr int nwarps = nthreads_hw / warp_size;
-        launch_fattn<D, cols_per_block, 1,
-                     flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
-                                        use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
-            ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
-    }
+    // cols_are_heads: columns are the gqa_ratio heads of one KV head -> ncols2 carries the
+    // column count so launch_fattn packs the head group into one workgroup (ncols1 = 1 token).
+    constexpr int ncols1 = cols_are_heads ? 1 : cols_per_block;
+    constexpr int ncols2 = cols_are_heads ? cols_per_block : 1;
+    launch_fattn<D, ncols1, ncols2,
+                 flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
+                                    use_logit_softcap, warp_size, cols_are_heads>, warp_size>(
+        ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
 }
 
 template <int D, int type_K, int type_V>
@@ -618,6 +663,31 @@ void ggml_sycl_flash_attn_ext_vec_case(ggml_backend_sycl_context & ctx, ggml_ten
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
     if (Q->ne[1] == 1) {
+        // GQA head-packed decode for quantized KV: pack the gqa_ratio query heads of each KV
+        // head into one workgroup so every loaded K/V block is reused across the head group
+        // (KV read traffic / gqa_ratio). This is what the f16 path gets from the GQA TILE
+        // kernel; quantized KV cannot take TILE (it would dequantize the whole cache per
+        // token), so it must come from the vec kernel. A/B gate: GGML_SYCL_DISABLE_FA_GQA_VEC=1.
+        if constexpr (type_K != GGML_TYPE_F16 && type_K == type_V && (D == 128 || D == 256)) {
+            static const bool disable_gqa_vec = []() {
+                const char * env = getenv("GGML_SYCL_DISABLE_FA_GQA_VEC");
+                return env != nullptr && atoi(env) != 0;
+            }();
+            const ggml_tensor * K = dst->src[1];
+            float max_bias;
+            memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+            const int gqa_ratio = Q->ne[2] / K->ne[2];
+            // max_bias == 0: the shared per-workgroup ALiBi slope is 1 for every head column.
+            if (!disable_gqa_vec && max_bias == 0.0f && Q->ne[2] % K->ne[2] == 0 && logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                switch (gqa_ratio) {
+                    case 8: ggml_sycl_flash_attn_ext_vec_case_impl<D, 8, type_K, type_V, use_logit_softcap, true>(ctx, dst); return;
+                    case 4: ggml_sycl_flash_attn_ext_vec_case_impl<D, 4, type_K, type_V, use_logit_softcap, true>(ctx, dst); return;
+                    case 2: ggml_sycl_flash_attn_ext_vec_case_impl<D, 2, type_K, type_V, use_logit_softcap, true>(ctx, dst); return;
+                    default: break; // unsupported ratio -> plain single-column path below
+                }
+            }
+        }
         constexpr int cols_per_block = 1;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
