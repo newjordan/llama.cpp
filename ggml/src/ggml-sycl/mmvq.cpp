@@ -1560,7 +1560,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
                 static std::atomic<int> once{0};
                 if (once.fetch_add(1) == 0) {
                     fprintf(stderr,
-                            "[treebeard-q8-coltile] ncols_dst=%d nrows=%d k=%d tile=%d "
+                            "[ggml-sycl-q8-coltile] ncols_dst=%d nrows=%d k=%d tile=%d "
                             "sg=%zu (first entry)\n",
                             ncols_dst, nrows, ncols, col_tile, num_subgroups);
                 }
@@ -1607,7 +1607,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
             static std::atomic<int> once{0};
             if (once.fetch_add(1) == 0) {
                 fprintf(stderr,
-                        "[treebeard-q8-ksplit-local] ncols_dst=%d nrows=%d k=%d "
+                        "[ggml-sycl-q8-ksplit-local] ncols_dst=%d nrows=%d k=%d "
                         "sgs_per_row=%d sg=%zu rows_per_wg=%d (first entry)\n",
                         ncols_dst, nrows, ncols, sgs_per_row, num_subgroups,
                         rows_per_wg);
@@ -1641,7 +1641,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_ncols(
             static std::atomic<int> once{0};
             if (once.fetch_add(1) == 0) {
                 fprintf(stderr,
-                        "[treebeard-q8-ksplit] ncols_dst=%d nrows=%d k=%d split=%d "
+                        "[ggml-sycl-q8-ksplit] ncols_dst=%d nrows=%d k=%d split=%d "
                         "sg=%zu (first entry)\n",
                         ncols_dst, nrows, ncols, k_split, num_subgroups);
             }
@@ -1755,7 +1755,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
         const int seen = n_traced.fetch_add(1, std::memory_order_relaxed);
         if (seen < 8) {
             fprintf(stderr,
-                    "[treebeard-q8-hoist] activated ncols=%d nrows=%d k=%d max_nrows=%d\n",
+                    "[ggml-sycl-q8-hoist] activated ncols=%d nrows=%d k=%d max_nrows=%d\n",
                     ncols_dst, nrows, ncols, q8_0_ncols_hoist_max_nrows());
         }
         switch (ncols_dst) {
@@ -1806,7 +1806,7 @@ static void reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
         static std::atomic<int> n_skip { 0 };
         if (n_skip.fetch_add(1, std::memory_order_relaxed) < 4) {
             fprintf(stderr,
-                    "[treebeard-q8-hoist] skip ncols=%d nrows=%d k=%d max_nrows=%d\n",
+                    "[ggml-sycl-q8-hoist] skip ncols=%d nrows=%d k=%d max_nrows=%d\n",
                     ncols_dst, nrows, ncols, q8_0_ncols_hoist_max_nrows());
         }
     }
@@ -3880,7 +3880,7 @@ static void launch_mul_mat_vec_q_moe_weighted_reorder(
         {
             static std::atomic<int> once{0};
             if (once.fetch_add(1) == 0) {
-                fprintf(stderr, "[treebeard-moe-par8-enter] n_tokens=%d nrows=%d ncols=%d (first entry)\n",
+                fprintf(stderr, "[ggml-sycl-moe-par8-enter] n_tokens=%d nrows=%d ncols=%d (first entry)\n",
                         n_tokens, nrows, ncols);
             }
         }
@@ -3913,7 +3913,7 @@ static void launch_mul_mat_vec_q_moe_weighted_reorder(
     if (rows_per_sg > 1) {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            fprintf(stderr, "[treebeard-moe-rows-per-sg] rows_per_sg=%d n_tokens=%d nrows=%d (first entry)\n",
+            fprintf(stderr, "[ggml-sycl-moe-rows-per-sg] rows_per_sg=%d n_tokens=%d nrows=%d (first entry)\n",
                     rows_per_sg, n_tokens, nrows);
         }
     }
@@ -3921,7 +3921,7 @@ static void launch_mul_mat_vec_q_moe_weighted_reorder(
         if (ggml_sycl_moe_down_no_volatile_enabled()) {
             static std::atomic<int> once{0};
             if (once.fetch_add(1) == 0) {
-                fprintf(stderr, "[treebeard-moe-no-volatile-enter] first deferred launch (NOT bit-exact)\n");
+                fprintf(stderr, "[ggml-sycl-moe-no-volatile-enter] first deferred launch (NOT bit-exact)\n");
             }
             stream->submit([&](sycl::handler & cgh) {
                 cgh.parallel_for(
@@ -4115,7 +4115,7 @@ static void launch_mmid_group_pairs(
         int32_t n_active = 0;
         stream->memcpy(&n_active, scratch + 2 * n_as + 1, sizeof(n_active)).wait();
         std::fprintf(stderr,
-                     "[treebeard-moe-reuse] sample=%d tokens=%d slots=%d routes=%d"
+                     "[ggml-sycl-moe-reuse] sample=%d tokens=%d slots=%d routes=%d"
                      " experts=%d active=%d duplicate_routes=%d ideal_weight_read_reduction=%.6f\n",
                      sample, n_tokens, n_ids, n_tokens * n_ids, n_as, n_active,
                      n_tokens * n_ids - n_active,
@@ -4544,7 +4544,7 @@ static void launch_mul_mat_vec_q_moe_weighted_expert_grouped(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-moe-down-expert-grouped] mode=atomic-dst+count1 "
+                    "[ggml-sycl-moe-down-expert-grouped] mode=atomic-dst+count1 "
                     "max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tokens=%d "
                     "experts_used=%d (first entry)\n",
                     max_groups, nrows, ncols, num_subgroups, rows_per_sg,
@@ -5004,7 +5004,7 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_reorder(
     {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            fprintf(stderr, "[treebeard-moe-dual-launch] n_tokens=%d n_experts=%d nrows=%d ncols=%d sg=%d rps=%d (first entry)\n",
+            fprintf(stderr, "[ggml-sycl-moe-dual-launch] n_tokens=%d n_experts=%d nrows=%d ncols=%d sg=%d rps=%d (first entry)\n",
                     n_tokens, n_experts_used, nrows, ncols, num_subgroups, rows_per_sg);
         }
     }
@@ -5410,7 +5410,7 @@ bool ggml_sycl_mul_mat_vec_q_dense_dual_mmvq_reorder(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-mmvq] shared-q path ncols_dst=%d rows_a=%d rows_b=%d (first entry)\n",
+                    "[ggml-sycl-dense-dual-mmvq] shared-q path ncols_dst=%d rows_a=%d rows_b=%d (first entry)\n",
                     ncols_dst, nrows_a, nrows_b);
         }
         reorder_mul_mat_vec_q8_0_q8_1_sycl_switch_ncols(
@@ -5873,7 +5873,7 @@ static void launch_mul_mat_vec_q_moe_dual_swiglu_grouped_reorder(
     {
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            fprintf(stderr, "[treebeard-moe-dual-grouped-launch] mode=count1 max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tchunk=%d shared_act=%d all_token_wo=%d lds_act=%d (first entry)\n",
+            fprintf(stderr, "[ggml-sycl-moe-dual-grouped-launch] mode=count1 max_groups=%d nrows=%d ncols=%d sg=%d rps=%d tchunk=%d shared_act=%d all_token_wo=%d lds_act=%d (first entry)\n",
                     max_groups, nrows, ncols, num_subgroups, rows_per_sg, dual_tchunk, shared_act, all_token_wo, lds_act);
         }
     }
@@ -6324,7 +6324,7 @@ static void launch_mul_mat_vec_q_moe_dual_down_lds(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-down-lds] mode=one-wg-per-expert "
+                    "[ggml-sycl-moe-dual-down-lds] mode=one-wg-per-expert "
                     "max_groups=%d gate_rows=%d down_rows=%d gate_cols=%d "
                     "sg=%d tokens=%d (first entry)\n",
                     max_groups, gate_nrows, down_nrows, gate_ncols,
@@ -6651,7 +6651,7 @@ static void launch_mul_mat_vec_q_moe_dual_down_q8band(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-down-q8band] mode=multi-wg-kblock "
+                    "[ggml-sycl-moe-dual-down-q8band] mode=multi-wg-kblock "
                     "max_groups=%d k_blocks=%d gate_rows=%d down_rows=%d "
                     "sg=%d tokens=%d (first entry)\n",
                     max_groups, n_k_blocks, gate_nrows, down_nrows,

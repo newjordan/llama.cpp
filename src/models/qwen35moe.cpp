@@ -492,9 +492,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     // sequence, re-reading the whole ssm_out weight n_seqs times per layer. Flattening turns
     // those n_seqs GEMVs into a single ne11 = n_tokens*n_seqs GEMM that reads the weight once
     // and lands on the reorder MMVQ multi-column path.
-    // A/B gate: TREEBEARD_GDN_OUT_FLAT=0 restores the historical 3D form.
+    // A/B gate: GGML_SYCL_GDN_OUT_FLAT=0 restores the historical 3D form.
     static const bool gdn_out_flat = []() {
-        const char * env = getenv("TREEBEARD_GDN_OUT_FLAT");
+        // Prefer GGML_SYCL_GDN_OUT_FLAT; accept legacy TREEBEARD_GDN_OUT_FLAT.
+        const char * env = getenv("GGML_SYCL_GDN_OUT_FLAT");
+        if (env == nullptr) {
+            env = getenv("TREEBEARD_GDN_OUT_FLAT");
+        }
         return env == nullptr || atoi(env) != 0;
     }();
     ggml_tensor * final_output = gdn_out_flat

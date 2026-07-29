@@ -2554,10 +2554,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
             const bool is_moe_router = src0->type == GGML_TYPE_F32 &&
                     std::strstr(src0->name, ".ffn_gate_inp.weight") != nullptr;
             const bool use_mkl_direct = is_moe_router || gemm_flops < mkl_flop_cutoff;
-            // Diagnostic: TREEBEARD_SYCL_GEMM_ROUTE=1 logs FP32 dense GEMM backend choice
+            // Diagnostic: GGML_SYCL_GEMM_ROUTE=1 logs FP32 dense GEMM backend choice
             // every 256 calls (stderr). Used by heavy-push-1 dense MUL_MAT excavation.
             static const bool gemm_route_log = []() {
-                const char * env = getenv("TREEBEARD_SYCL_GEMM_ROUTE");
+                const char * env = getenv("GGML_SYCL_GEMM_ROUTE");
                 return env != nullptr && std::atoi(env) != 0;
             }();
             if (gemm_route_log) {
@@ -2567,7 +2567,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
                     const char * backend = (is_moe_router) ? "mkl-router"
                         : (g_ggml_sycl_disable_dnn || use_mkl_direct) ? "mkl" : "onednn";
                     fprintf(stderr,
-                            "[treebeard-gemm-route] n=%ld backend=%s flops=%lld m=%lld n_cols=%lld k=%lld "
+                            "[ggml-sycl-gemm-route] n=%ld backend=%s flops=%lld m=%lld n_cols=%lld k=%lld "
                             "cutoff=%lld name=%s\n",
                             n, backend, (long long) gemm_flops, (long long) row_diff,
                             (long long) src1_ncols, (long long) ne10, (long long) mkl_flop_cutoff,
@@ -4588,7 +4588,7 @@ static bool ggml_sycl_mul_mat_id_dual_swiglu_fused(
         src1->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
         up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
         if (trace_reject) {
-            fprintf(stderr, "[treebeard-moe-dual-swiglu] dispatcher=type-reject\n");
+            fprintf(stderr, "[ggml-sycl-moe-dual-swiglu] dispatcher=type-reject\n");
         }
         return false;
     }
@@ -4611,7 +4611,7 @@ static bool ggml_sycl_mul_mat_id_dual_swiglu_fused(
         !ggml_are_same_shape(gate, glu)) {
         if (trace_reject) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-swiglu] dispatcher=shape-reject"
+                    "[ggml-sycl-moe-dual-swiglu] dispatcher=shape-reject"
                     " ncols=%" PRId64 " nslots=%" PRId64
                     " tokens=%" PRId64 " used=%" PRId64
                     " rows=%" PRId64 " experts=%" PRId64 "\n",
@@ -4631,7 +4631,7 @@ static bool ggml_sycl_mul_mat_id_dual_swiglu_fused(
         !up_extra->optimized_feature.reorder) {
         if (trace_reject) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-swiglu] dispatcher=reorder-reject"
+                    "[ggml-sycl-moe-dual-swiglu] dispatcher=reorder-reject"
                     " gate_extra=%d gate_reorder=%d up_extra=%d up_reorder=%d\n",
                     gate_extra != nullptr,
                     gate_extra != nullptr && gate_extra->optimized_feature.reorder,
@@ -4712,7 +4712,7 @@ static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
             static std::atomic<int> tr{0};
             if (tr.fetch_add(1, std::memory_order_relaxed) < 12) {
                 fprintf(stderr,
-                        "[treebeard-dense-dual-swiglu] dispatcher=type-reject"
+                        "[ggml-sycl-dense-dual-swiglu] dispatcher=type-reject"
                         " gate_op=%s up_op=%s same_src1=%d"
                         " wgate=%s wup=%s src1=%s gate=%s up=%s glu=%s"
                         " wgate_name=%s wup_name=%s\n",
@@ -4749,7 +4749,7 @@ static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
         ggml_get_op_params_i32(glu, 1) != 0 /* swapped */) {
         if (trace_reject) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-swiglu] dispatcher=shape-reject"
+                    "[ggml-sycl-dense-dual-swiglu] dispatcher=shape-reject"
                     " ncols=%" PRId64 " ncols_dst=%" PRId64 " rows=%" PRId64 "\n",
                     ncols, ncols_dst, nrows);
         }
@@ -4785,7 +4785,7 @@ static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
             const ggml_tensor_extra_gpu * ue =
                 static_cast<const ggml_tensor_extra_gpu *>(up_weights->extra);
             fprintf(stderr,
-                    "[treebeard-dense-dual-swiglu] dispatcher=reorder-reject"
+                    "[ggml-sycl-dense-dual-swiglu] dispatcher=reorder-reject"
                     " gate_reorder=%d up_reorder=%d type=%s\n",
                     ge != nullptr && ge->optimized_feature.reorder,
                     ue != nullptr && ue->optimized_feature.reorder,
@@ -4817,7 +4817,7 @@ static bool ggml_sycl_mul_mat_dense_dual_swiglu_fused(
         const int n = hits.fetch_add(1, std::memory_order_relaxed);
         if (n < 8) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-swiglu] hit type=%s rows=%" PRId64
+                    "[ggml-sycl-dense-dual-swiglu] hit type=%s rows=%" PRId64
                     " cols=%" PRId64 " ncols_dst=%" PRId64 "\n",
                     ggml_type_name(gate_weights->type), nrows, ncols, ncols_dst);
         }
@@ -4849,7 +4849,7 @@ static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
         mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32) {
         if (trace) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-mmvq] type-reject wa=%s wb=%s "
+                    "[ggml-sycl-dense-dual-mmvq] type-reject wa=%s wb=%s "
                     "same_src1=%d\n",
                     ggml_type_name(wa->type), ggml_type_name(wb->type),
                     mm_a->src[1] == mm_b->src[1]);
@@ -4890,7 +4890,7 @@ static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
         mm_a->ne[1] != ncols_dst || mm_b->ne[1] != ncols_dst) {
         if (trace) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-mmvq] shape-reject ncols=%" PRId64
+                    "[ggml-sycl-dense-dual-mmvq] shape-reject ncols=%" PRId64
                     " ncols_dst=%" PRId64 " rows_a=%" PRId64 " rows_b=%" PRId64
                     " cont_src1=%d cont_a=%d cont_b=%d cont_wa=%d cont_wb=%d\n",
                     ncols, ncols_dst, nrows_a, nrows_b,
@@ -4926,7 +4926,7 @@ static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
     };
     if (!ensure_reorder_mmvq(wa) || !ensure_reorder_mmvq(wb)) {
         if (trace) {
-            fprintf(stderr, "[treebeard-dense-dual-mmvq] reorder-reject\n");
+            fprintf(stderr, "[ggml-sycl-dense-dual-mmvq] reorder-reject\n");
         }
         return false;
     }
@@ -4955,7 +4955,7 @@ static bool ggml_sycl_mul_mat_dense_dual_mmvq_fused(
         static std::atomic<int> hits{0};
         if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-mmvq] hit type=%s rows_a=%" PRId64
+                    "[ggml-sycl-dense-dual-mmvq] hit type=%s rows_a=%" PRId64
                     " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
                     " wa=%s wb=%s\n",
                     ggml_type_name(wa->type), nrows_a, nrows_b, ncols,
@@ -4985,7 +4985,7 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
         mm_a->type != GGML_TYPE_F32 || mm_b->type != GGML_TYPE_F32) {
         if (trace) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-f32] type-reject wa=%s wb=%s "
+                    "[ggml-sycl-dense-dual-f32] type-reject wa=%s wb=%s "
                     "same_src1=%d\n",
                     ggml_type_name(wa->type), ggml_type_name(wb->type),
                     mm_a->src[1] == mm_b->src[1]);
@@ -5011,7 +5011,7 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
         mm_a->ne[1] != ncols_dst || mm_b->ne[1] != ncols_dst) {
         if (trace) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-f32] shape-reject ncols=%" PRId64
+                    "[ggml-sycl-dense-dual-f32] shape-reject ncols=%" PRId64
                     " ncols_dst=%" PRId64 " rows_a=%" PRId64 " rows_b=%" PRId64
                     "\n",
                     ncols, ncols_dst, nrows_a, nrows_b);
@@ -5023,7 +5023,7 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
     if (std::strstr(wa->name, ".ffn_gate_inp.weight") != nullptr ||
         std::strstr(wb->name, ".ffn_gate_inp.weight") != nullptr) {
         if (trace) {
-            fprintf(stderr, "[treebeard-dense-dual-f32] router-reject\n");
+            fprintf(stderr, "[ggml-sycl-dense-dual-f32] router-reject\n");
         }
         return false;
     }
@@ -5048,7 +5048,7 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
         static std::atomic<int> hits{0};
         if (hits.fetch_add(1, std::memory_order_relaxed) < 8) {
             fprintf(stderr,
-                    "[treebeard-dense-dual-f32] hit rows_a=%" PRId64
+                    "[ggml-sycl-dense-dual-f32] hit rows_a=%" PRId64
                     " rows_b=%" PRId64 " cols=%" PRId64 " ncols_dst=%" PRId64
                     " wa=%s wb=%s\n",
                     nrows_a, nrows_b, ncols, ncols_dst, wa->name, wb->name);
@@ -5057,7 +5057,7 @@ static bool ggml_sycl_mul_mat_dense_dual_f32_fused(
     return ok;
 }
 
-// Diagnostic (TREEBEARD_MOE_ROUTE_HIST=1): how many DISTINCT experts does a layer
+// Diagnostic (GGML_SYCL_MOE_ROUTE_HIST=1): how many DISTINCT experts does a layer
 // actually touch per decode step? The default MoE-down path serializes the routed
 // experts per token with no cross-token reuse, so the entire upside of any
 // expert-reuse kernel is bounded by draws/distinct. Nothing else measures this.
@@ -5066,7 +5066,7 @@ static void ggml_sycl_moe_route_hist(const ggml_tensor * ids, const ggml_tensor 
                                      int64_t n_tokens, int n_experts_used,
                                      const queue_ptr & stream) {
     static const bool enabled = []() {
-        const char * env = getenv("TREEBEARD_MOE_ROUTE_HIST");
+        const char * env = getenv("GGML_SYCL_MOE_ROUTE_HIST");
         return env != nullptr && std::atoi(env) != 0;
     }();
     if (!enabled) {
@@ -5107,12 +5107,12 @@ static void ggml_sycl_moe_route_hist(const ggml_tensor * ids, const ggml_tensor 
     const long call = call_index.fetch_add(1, std::memory_order_relaxed);
 
     fprintf(stderr,
-            "[treebeard-moe-route] call=%ld tensor=%s n_tokens=%d draws=%d"
+            "[ggml-sycl-moe-route] call=%ld tensor=%s n_tokens=%d draws=%d"
             " distinct=%d top_expert_count=%d\n",
             call, src0->name, (int) n_tokens, draws, distinct, top_count);
 }
 
-// Controlled reuse probe (TREEBEARD_MOE_ROUTE_FORCE=N, N>0): overwrite the ids
+// Controlled reuse probe (GGML_SYCL_MOE_ROUTE_FORCE=N, N>0): overwrite the ids
 // buffer so the layer touches exactly N distinct experts while the (token,slot)
 // PAIR count stays at n_tokens*n_experts_used. That is the one experiment that
 // separates the two live explanations for why the grouped reuse kernel ties:
@@ -5125,7 +5125,7 @@ static void ggml_sycl_moe_route_force(const ggml_tensor * ids, int64_t n_tokens,
                                       int n_experts_used, int n_as,
                                       const queue_ptr & stream) {
     static const int force_n = []() {
-        const char * env = getenv("TREEBEARD_MOE_ROUTE_FORCE");
+        const char * env = getenv("GGML_SYCL_MOE_ROUTE_FORCE");
         return env == nullptr ? 0 : std::atoi(env);
     }();
     if (force_n <= 0) {
@@ -5145,7 +5145,7 @@ static void ggml_sycl_moe_route_force(const ggml_tensor * ids, int64_t n_tokens,
         stream->memcpy(ids->data, ids_host.data(), ggml_nbytes(ids)).wait()));
 }
 
-// Phase attribution (TREEBEARD_MOE_DOWN_PHASE_PROF=1) for the MoE-down op.
+// Phase attribution (GGML_SYCL_MOE_DOWN_PHASE_PROF=1) for the MoE-down op.
 // The op is not just the GEMV: it also runs the reorder check and a src1
 // quantize launch. The npl scaling fit leaves a ~188 us/op intercept at np12
 // and this splits that intercept across the sub-steps. Inserts a stream wait
@@ -5153,7 +5153,7 @@ static void ggml_sycl_moe_route_force(const ggml_tensor * ids, int64_t n_tokens,
 // never as a perf arm.
 static bool ggml_sycl_moe_phase_prof_enabled() {
     static const bool enabled = []() {
-        const char * env = getenv("TREEBEARD_MOE_DOWN_PHASE_PROF");
+        const char * env = getenv("GGML_SYCL_MOE_DOWN_PHASE_PROF");
         return env != nullptr && std::atoi(env) != 0;
     }();
     return enabled;
@@ -5204,7 +5204,7 @@ static void ggml_sycl_moe_phase_report(int64_t n_tokens) {
     const double q = (cur[1] - prev[1]) / 1e3 / window;
     const double g = (cur[2] - prev[2]) / 1e3 / window;
     fprintf(stderr,
-            "[treebeard-moe-phase] window_end=%ld mean_tokens=%.1f"
+            "[ggml-sycl-moe-phase] window_end=%ld mean_tokens=%.1f"
             " reorder=%.2f quantize=%.2f gemv=%.2f total=%.2f us/op"
             " (gemv %.1f%%)\n",
             calls, (double) (cur_tokens - prev_tokens) / window, r, q, g, r + q + g,
@@ -5323,7 +5323,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
                     static std::atomic<int> once{0};
                     if (trace_eg && once.fetch_add(1) < 4) {
                         fprintf(stderr,
-                                "[treebeard-moe-down-reduce] event=expert-grouped-hit"
+                                "[ggml-sycl-moe-down-reduce] event=expert-grouped-hit"
                                 " mode=atomic-dst rows=%d experts=%d tokens=%" PRId64 "\n",
                                 nrows, n_experts_used, ne12);
                     }
@@ -5362,7 +5362,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_weighted(
                 if (trace_grouped &&
                     trace_counts[ne12].fetch_add(1, std::memory_order_relaxed) < 4) {
                     fprintf(stderr,
-                            "[treebeard-moe-down-reduce] event=batched-grouped-hit"
+                            "[ggml-sycl-moe-down-reduce] event=batched-grouped-hit"
                             " rows=%d experts=%d tokens=%" PRId64 "\n",
                             nrows, n_experts_used, ne12);
                 }
@@ -5473,7 +5473,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
         dst->type != GGML_TYPE_F32) {
         if (trace_reject) {
             fprintf(stderr,
-                    "[treebeard-moe-pipeline] dispatcher=type-or-edge-reject"
+                    "[ggml-sycl-moe-pipeline] dispatcher=type-or-edge-reject"
                     " gate=%s up=%s down=%s glu_op=%d\n",
                     ggml_type_name(gate_weights->type),
                     ggml_type_name(up_weights->type),
@@ -5511,7 +5511,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
         dst->ne[2] != 1 || dst->ne[3] != 1) {
         if (trace_reject) {
             fprintf(stderr,
-                    "[treebeard-moe-pipeline] dispatcher=shape-reject"
+                    "[ggml-sycl-moe-pipeline] dispatcher=shape-reject"
                     " gate_cols=%" PRId64 " gate_rows=%" PRId64
                     " down_rows=%" PRId64 " slots=%" PRId64
                     " used=%" PRId64 " tokens=%" PRId64
@@ -5541,7 +5541,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
         !down_extra->optimized_feature.reorder) {
         if (trace_reject) {
             fprintf(stderr,
-                    "[treebeard-moe-pipeline] dispatcher=reorder-reject"
+                    "[ggml-sycl-moe-pipeline] dispatcher=reorder-reject"
                     " gate=%d up=%d down=%d\n",
                     gate_extra != nullptr && gate_extra->optimized_feature.reorder,
                     up_extra != nullptr && up_extra->optimized_feature.reorder,
@@ -5586,7 +5586,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-down-q8band] dispatcher=hit "
+                    "[ggml-sycl-moe-dual-down-q8band] dispatcher=hit "
                     "gate=%s down=%s rows_g=%" PRId64 " rows_d=%" PRId64
                     " k_blocks=%" PRId64 " tokens=%" PRId64 " used=%" PRId64
                     " (first entry)\n",
@@ -5608,7 +5608,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
             return true;
         }
         if (trace_reject) {
-            fprintf(stderr, "[treebeard-moe-dual-down-q8band] dispatch-reject\n");
+            fprintf(stderr, "[ggml-sycl-moe-dual-down-q8band] dispatch-reject\n");
         }
         return false;
     }
@@ -5623,7 +5623,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-down-lds] dispatcher=hit "
+                    "[ggml-sycl-moe-dual-down-lds] dispatcher=hit "
                     "gate=%s down=%s rows_g=%" PRId64 " rows_d=%" PRId64
                     " tokens=%" PRId64 " used=%" PRId64 " (first entry)\n",
                     ggml_type_name(gate_weights->type),
@@ -5644,7 +5644,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
             return true;
         }
         if (trace_reject) {
-            fprintf(stderr, "[treebeard-moe-dual-down-lds] dispatch-reject\n");
+            fprintf(stderr, "[ggml-sycl-moe-dual-down-lds] dispatch-reject\n");
         }
         return false;
     }
@@ -5660,7 +5660,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
             fprintf(stderr,
-                    "[treebeard-moe-dual-down-v2] mode=modern-dual+eg-down "
+                    "[ggml-sycl-moe-dual-down-v2] mode=modern-dual+eg-down "
                     "gate=%s down=%s rows_g=%" PRId64 " rows_d=%" PRId64
                     " tokens=%" PRId64 " used=%" PRId64 " (first entry)\n",
                     ggml_type_name(gate_weights->type),
@@ -5686,7 +5686,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
                 dst_token_stride_b, stream)) {
             if (trace_reject) {
                 fprintf(stderr,
-                        "[treebeard-moe-dual-down-v2] dual-grouped-reject\n");
+                        "[ggml-sycl-moe-dual-down-v2] dual-grouped-reject\n");
             }
             return false;
         }
@@ -5711,7 +5711,7 @@ static bool ggml_sycl_moe_swiglu_down_pipeline_fused(
                 q8_token_stride, route_weights->nb[2], dst->nb[1], stream)) {
             if (trace_reject) {
                 fprintf(stderr,
-                        "[treebeard-moe-dual-down-v2] eg-down-reject\n");
+                        "[ggml-sycl-moe-dual-down-v2] eg-down-reject\n");
             }
             return false;
         }
@@ -6548,7 +6548,7 @@ static void ggml_sycl_trace_moe_down_reduce(
     const int occurrence = event_counts[event][token_index].fetch_add(1, std::memory_order_relaxed);
     if (occurrence < 4) {
         fprintf(stderr,
-                "[treebeard-moe-down-reduce] event=%s occurrence=%d rows=%" PRId64
+                "[ggml-sycl-moe-down-reduce] event=%s occurrence=%d rows=%" PRId64
                 " experts=%" PRId64 " tokens=%" PRId64
                 " detail=0x%x experts_data=%p dst_data=%p\n",
                 event_names[event], occurrence + 1, experts->ne[0], experts->ne[1], experts->ne[2],
@@ -6615,7 +6615,7 @@ static void ggml_sycl_trace_moe_pipeline(
         1, std::memory_order_relaxed);
     if (occurrence < 8) {
         fprintf(stderr,
-                "[treebeard-moe-pipeline] event=%s occurrence=%d gate_type=%s"
+                "[ggml-sycl-moe-pipeline] event=%s occurrence=%d gate_type=%s"
                 " rows=%" PRId64 " used=%" PRId64 " tokens=%" PRId64
                 " gate_data=%p dst_data=%p\n",
                 event, occurrence + 1, ggml_type_name(gate->src[0]->type),
@@ -6648,7 +6648,7 @@ static void ggml_sycl_trace_moe_dual_swiglu(
         1, std::memory_order_relaxed);
     if (occurrence < 4) {
         fprintf(stderr,
-                "[treebeard-moe-dual-swiglu] event=%s occurrence=%d type=%s"
+                "[ggml-sycl-moe-dual-swiglu] event=%s occurrence=%d type=%s"
                 " rows=%" PRId64 " experts=%" PRId64 " tokens=%" PRId64
                 " gate_data=%p dst_data=%p\n",
                 event, occurrence + 1, ggml_type_name(gate->src[0]->type),
@@ -7589,7 +7589,7 @@ static int ggml_sycl_try_fuse(
                     static std::atomic<int> hits{0};
                     if (hits.fetch_add(1, std::memory_order_relaxed) < 12) {
                         fprintf(stderr,
-                                "[treebeard-dense-dual-mmvq] hit-nonadj"
+                                "[ggml-sycl-dense-dual-mmvq] hit-nonadj"
                                 " i=%d j=%d wa=%s wb=%s type=%s"
                                 " ne1_a=%" PRId64 " ne1_b=%" PRId64
                                 " act_ne1=%" PRId64 "\n",
@@ -7605,7 +7605,7 @@ static int ggml_sycl_try_fuse(
                 static std::atomic<int> miss{0};
                 if (miss.fetch_add(1, std::memory_order_relaxed) < 12) {
                     fprintf(stderr,
-                            "[treebeard-dense-dual-mmvq] dispatch-miss"
+                            "[ggml-sycl-dense-dual-mmvq] dispatch-miss"
                             " i=%d j=%d wa=%s wb=%s\n",
                             i, j, mm0->src[0]->name, mm1->src[0]->name);
                 }
@@ -7647,7 +7647,7 @@ static int ggml_sycl_try_fuse(
                     static std::atomic<int> hits{0};
                     if (hits.fetch_add(1, std::memory_order_relaxed) < 12) {
                         fprintf(stderr,
-                                "[treebeard-dense-dual-f32] hit-nonadj"
+                                "[ggml-sycl-dense-dual-f32] hit-nonadj"
                                 " i=%d j=%d wa=%s wb=%s"
                                 " ne1_a=%" PRId64 " ne1_b=%" PRId64 "\n",
                                 i, j, mm0->src[0]->name, mm1->src[0]->name,
@@ -7689,7 +7689,7 @@ static int ggml_sycl_try_fuse(
                     static std::atomic<int> cands{0};
                     if (cands.fetch_add(1, std::memory_order_relaxed) < 16) {
                         fprintf(stderr,
-                                "[treebeard-dense-dual-f32] equal-cand"
+                                "[ggml-sycl-dense-dual-f32] equal-cand"
                                 " i=%d j=%d wa=%s wb=%s act_ne1=%" PRId64 "\n",
                                 i, equal_j, mm0->src[0]->name,
                                 cgraph->nodes[equal_j]->src[0]->name,
@@ -7822,18 +7822,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     g_sycl_dual_mmvq_elide.clear();
     ggml_sycl_set_main_device(sycl_ctx->device);
 
-    // Optional Treebeard SYCL per-op profiler (TREEBEARD_SYCL_PROF=1): serializes each op with a
+    // Optional SYCL per-op profiler (GGML_SYCL_PROF=1): serializes each op with a
     // queue wait and accumulates host-observed GPU time per op type. Serialization inflates
     // absolutes (removes overlap) but the RELATIVE breakdown + serialized-total-vs-wall ratio
     // reveal where decode time goes. Diagnostic only - not a ship path.
-    // TREEBEARD_SYCL_PROF_TRIGGER_FILE: leave execution unmodified until that file exists so a
+    // GGML_SYCL_PROF_TRIGGER_FILE: leave execution unmodified until that file exists so a
     // late profile window can open after expensive prompt/state setup without restarting.
     // Legacy aliases (still accepted): SIQ_PROF, SIQ_PROF_TRIGGER_FILE.
     static const bool prof = []() {
-        return getenv("TREEBEARD_SYCL_PROF") != nullptr || getenv("SIQ_PROF") != nullptr;
+        return getenv("GGML_SYCL_PROF") != nullptr || getenv("SIQ_PROF") != nullptr;
     }();
     static const std::string prof_trigger_file = []() {
-        const char * path = getenv("TREEBEARD_SYCL_PROF_TRIGGER_FILE");
+        const char * path = getenv("GGML_SYCL_PROF_TRIGGER_FILE");
         if (path == nullptr) {
             path = getenv("SIQ_PROF_TRIGGER_FILE");
         }
@@ -7845,7 +7845,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (trigger != nullptr) {
             fclose(trigger);
             if (!prof_active.exchange(true, std::memory_order_relaxed)) {
-                fprintf(stderr, "[treebeard-sycl-prof] trigger active file=%s\n",
+                fprintf(stderr, "[ggml-sycl-sycl-prof] trigger active file=%s\n",
                         prof_trigger_file.c_str());
             }
         }
@@ -7958,7 +7958,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
         if (full_width && !state_io_dumped.exchange(true, std::memory_order_relaxed)) {
-            fprintf(stderr, "[treebeard-state-io] event=graph-dump nodes=%d\n", cgraph->n_nodes);
+            fprintf(stderr, "[ggml-sycl-state-io] event=graph-dump nodes=%d\n", cgraph->n_nodes);
             for (int i = 0; i < cgraph->n_nodes; ++i) {
                 const ggml_tensor * node = cgraph->nodes[i];
                 if (node->op != GGML_OP_GET_ROWS && node->op != GGML_OP_CPY &&
@@ -7967,7 +7967,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     continue;
                 }
                 fprintf(stderr,
-                        "[treebeard-state-io] index=%d op=%s name=%s ptr=%p data=%p"
+                        "[ggml-sycl-state-io] index=%d op=%s name=%s ptr=%p data=%p"
                         " view_src=%p uses=%d",
                         i, ggml_op_name(node->op), ggml_get_name(node), (const void *) node,
                         node->data, (void *) node->view_src,
@@ -8031,7 +8031,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const int trace = plan_traces.fetch_add(1, std::memory_order_relaxed);
             if (trace < 8) {
                 fprintf(stderr,
-                        "[treebeard-state-io] event=runtime-plan direct=%zu conflict-gathers=%zu elide=%zu\n",
+                        "[ggml-sycl-state-io] event=runtime-plan direct=%zu conflict-gathers=%zu elide=%zu\n",
                         state_io_direct.size(), state_io_plan.size(), state_io_elide.size());
             }
         }
@@ -8192,7 +8192,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         std::sort(rows.begin(), rows.end(), [](const row & a, const row & b){ return a.us > b.us; });
         double tot = 0; for (auto & r : rows) tot += r.us;
         fprintf(stderr,
-                "[treebeard-sycl-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",
+                "[ggml-sycl-sycl-prof] after %d graph evals  serialized-total=%.1f ms  (%.1f us/eval)\n",
                 geval, tot / 1000.0, tot / geval);
         for (auto & r : rows) {
             fprintf(stderr, "  %-14s %9.1f ms  %6.1f%%  n=%-8ld %.2f us/op (per-eval n=%.1f)\n",
@@ -8208,7 +8208,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             named_total_us += row.us;
         }
         fprintf(stderr,
-                "[treebeard-sycl-prof-mul-mat] after %d graph evals window-total=%.1f ms families=%zu\n",
+                "[ggml-sycl-sycl-prof-mul-mat] after %d graph evals window-total=%.1f ms families=%zu\n",
                 geval, named_total_us / 1000.0, named_rows.size());
         const size_t named_limit = std::min<size_t>(named_rows.size(), 32);
         for (size_t row_index = 0; row_index < named_limit; ++row_index) {
@@ -8232,7 +8232,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             state_total_us += row.us;
         }
         fprintf(stderr,
-                "[treebeard-sycl-prof-state] after %d graph evals window-total=%.1f ms families=%zu\n",
+                "[ggml-sycl-sycl-prof-state] after %d graph evals window-total=%.1f ms families=%zu\n",
                 geval, state_total_us / 1000.0, state_rows.size());
         const size_t state_limit = std::min<size_t>(state_rows.size(), 32);
         for (size_t row_index = 0; row_index < state_limit; ++row_index) {

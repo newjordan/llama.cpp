@@ -895,6 +895,39 @@ Pass these via `CXXFLAGS` or add a one-off `#define` to enable a flag on the spo
 ### **GitHub contribution**:
 Please add the `[SYCL]` prefix/tag in issues/PRs titles to help the SYCL contributors to check/address them without delay.
 
+## MoE multi-slot decode package (Intel GPU)
+
+Optional SYCL knobs used for multi-slot MoE decode on Arc GPUs (validated on
+Arc Pro B70 with Qwen3.6-35B-A3B Q5). Same weights; quality is unchanged vs
+clean upstream on matched Agent Bench / held-out runs. Multi-slot p50/agent is
+concurrent capacity, not single-user chat speed.
+
+| Variable | Typical package value | Role |
+| --- | --- | --- |
+| `GGML_SYCL_MOE_DOWN_ROWS_PER_SG` | `4` | MoE-down rows per subgroup |
+| `GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS` | `32` | Q8 MMVQ multi-column subgroups |
+| `GGML_SYCL_ENABLE_MOE_DOWN_EXPERT_GROUPED` | `1` | Expert-grouped MoE-down path |
+| `GGML_SYCL_ENABLE_FUSION` | `1` | Fusion framework (when built) |
+| `GGML_SYCL_DISABLE_GRAPH` | `1` | Often required for stable SYCL graphs on B70 |
+| `GGML_SYCL_ENABLE_MOE_PIPELINE` | `0` | Keep off (PARK / regress path) |
+| `GGML_SYCL_ENABLE_MOE_DOWN_GROUPED` | `0` | Keep off unless measuring grouped down |
+| `GGML_SYCL_GDN_OUT_FLAT` | `1` (default on when unset) | Flatten GDN out for Qwen3.5/3.6 MoE; set `0` for historical 3D layout. Legacy alias: `TREEBEARD_GDN_OUT_FLAT` |
+
+Example (one device, multi-slot server):
+
+```bash
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+export ZE_AFFINITY_MASK=0
+export GGML_SYCL_DISABLE_GRAPH=1
+export GGML_SYCL_MOE_DOWN_ROWS_PER_SG=4
+export GGML_SYCL_Q8_MMVQ_NCOLS_SUBGROUPS=32
+export GGML_SYCL_ENABLE_MOE_DOWN_EXPERT_GROUPED=1
+export GGML_SYCL_GDN_OUT_FLAT=1
+```
+
+Diagnostics (opt-in, stderr): `GGML_SYCL_PROF`, `GGML_SYCL_GEMM_ROUTE`,
+`GGML_SYCL_MOE_ROUTE_HIST`, `GGML_SYCL_MOE_DOWN_PHASE_PROF`.
+
 ## TODO
 
 - Review ZES_ENABLE_SYSMAN: https://github.com/intel/compute-runtime/blob/master/programmers-guide/SYSMAN.md#support-and-limitations
