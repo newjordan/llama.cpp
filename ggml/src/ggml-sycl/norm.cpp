@@ -150,7 +150,14 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
 static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
-    const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size) {
+    const float eps, const sycl::nd_item<3>& item_ct1, float* s_sum, int block_size,
+    // optional fused elementwise epilogue: dst = (scale*x) * mul [+ add], ggml-style broadcast
+    const float* mul = nullptr, const int64_t mul_stride_row = 0, const int64_t mul_stride_channel = 0,
+    const int64_t mul_stride_sample = 0, const int mul_ncols = 0, const int mul_nrows = 0,
+    const int mul_nchannels = 0, const int mul_nsamples = 0,
+    const float* add = nullptr, const int64_t add_stride_row = 0, const int64_t add_stride_channel = 0,
+    const int64_t add_stride_sample = 0, const int add_ncols = 0, const int add_nrows = 0,
+    const int add_nchannels = 0, const int add_nsamples = 0) {
 
     const int nrows = item_ct1.get_group_range(2);
     const int nchannels = item_ct1.get_group_range(1);
@@ -170,6 +177,19 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     x   += src_offset;
     dst += dst_offset;
 
+    // Broadcast operands into this row/channel/sample (ggml: modulo over each dim)
+    if (mul != nullptr) {
+        const int mrow  = mul_nrows     ? (row     % mul_nrows)     : 0;
+        const int mchan = mul_nchannels ? (channel % mul_nchannels) : 0;
+        const int msamp = mul_nsamples  ? (sample  % mul_nsamples)  : 0;
+        mul += msamp * mul_stride_sample + mchan * mul_stride_channel + mrow * mul_stride_row;
+    }
+    if (add != nullptr) {
+        const int arow  = add_nrows     ? (row     % add_nrows)     : 0;
+        const int achan = add_nchannels ? (channel % add_nchannels) : 0;
+        const int asamp = add_nsamples  ? (sample  % add_nsamples)  : 0;
+        add += asamp * add_stride_sample + achan * add_stride_channel + arow * add_stride_row;
+    }
 
     float tmp = 0.0f; // partial sum for thread in warp
 
@@ -202,7 +222,15 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
     const float scale = sycl::rsqrt(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col * dst_stride_col] = scale * x[col * src_stride_col];
+        // Sequential (scale*x)*w matches stock RMS then MUL.
+        float val = scale * x[col * src_stride_col];
+        if (mul != nullptr) {
+            val *= mul[col % mul_ncols];
+        }
+        if (add != nullptr) {
+            val += add[col % add_ncols];
+        }
+        dst[col * dst_stride_col] = val;
     }
 }
 
@@ -333,7 +361,13 @@ static void group_norm_f32_sycl(const float* x, float* dst,
 static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
-    const float eps, queue_ptr stream, int device) {
+    const float eps, queue_ptr stream, int device,
+    const float* mul = nullptr, const int64_t mul_stride_row = 0, const int64_t mul_stride_channel = 0,
+    const int64_t mul_stride_sample = 0, const int mul_ncols = 0, const int mul_nrows = 0,
+    const int mul_nchannels = 0, const int mul_nsamples = 0,
+    const float* add = nullptr, const int64_t add_stride_row = 0, const int64_t add_stride_channel = 0,
+    const int64_t add_stride_sample = 0, const int add_ncols = 0, const int add_nrows = 0,
+    const int add_nchannels = 0, const int add_nsamples = 0) {
     // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
 
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
@@ -347,7 +381,9 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
                     rms_norm_f32(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, nullptr, WARP_SIZE);
+                        eps, item_ct1, nullptr, WARP_SIZE,
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                        add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols, add_nrows, add_nchannels, add_nsamples);
                 });
             });
     }
@@ -370,7 +406,9 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
                     rms_norm_f32(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size);
+                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                        add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols, add_nrows, add_nchannels, add_nsamples);
                 });
             });
     }
@@ -516,6 +554,155 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const int64_t ds3 = nb3 / tdst;
     rms_norm_f32_sycl(src0_dd, dst_dd, ne00, ne01, ne02, ne03,
         ss0, ss1, ss2, ss3, ds0, ds1, ds2, ds3, eps, main_stream, ctx.device);
+}
+
+
+// Fused RMS_NORM + MUL: write weight-scaled norm into MUL buffer (elide intermediate).
+// Mirrors ggml_cuda_op_rms_norm_fused. `dst` is the RMS_NORM node; `mul_tensor` is the MUL.
+void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+    const ggml_tensor * rms_norm_src = dst->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float *       src0_dd = static_cast<const float *>(rms_norm_src->data);
+    const float *       mul_dd  = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    if (mul_tensor->src[0] == dst) {
+        mul_dd  = static_cast<const float *>(mul_tensor->src[1]->data);
+        mul_src = mul_tensor->src[1];
+    } else if (mul_tensor->src[1] == dst) {
+        mul_dd  = static_cast<const float *>(mul_tensor->src[0]->data);
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float * dst_dd = static_cast<float *>(mul_tensor->data);
+
+    dpct::queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type          == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type   == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t ne00 = rms_norm_src->ne[0];
+    const int64_t ne01 = rms_norm_src->ne[1];
+    const int64_t ne02 = rms_norm_src->ne[2];
+    const int64_t ne03 = rms_norm_src->ne[3];
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s00 = 1;
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    // Output into MUL buffer (contiguous same-shape as RMS for Laguna pre-norm).
+    const size_t tdst = ggml_type_size(mul_tensor->type);
+    GGML_ASSERT(mul_tensor->nb[0] == tdst);
+    const int64_t d00 = 1;
+    const int64_t d01 = mul_tensor->nb[1] / tdst;
+    const int64_t d02 = mul_tensor->nb[2] / tdst;
+    const int64_t d03 = mul_tensor->nb[3] / tdst;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    rms_norm_f32_sycl(src0_dd, dst_dd, (int) ne00, (int) ne01, (int) ne02, (int) ne03,
+        s00, s01, s02, s03, d00, d01, d02, d03, eps, main_stream, ctx.device,
+        mul_dd, mul_s01, mul_s02, mul_s03,
+        (int) mul_src->ne[0], (int) mul_src->ne[1], (int) mul_src->ne[2], (int) mul_src->ne[3]);
+}
+
+void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                     ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
+    const ggml_tensor * rms_norm_src = dst->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    const float *       src0_dd = static_cast<const float *>(rms_norm_src->data);
+    const float *       mul_dd  = nullptr;
+    const ggml_tensor * mul_src = nullptr;
+
+    if (mul_tensor->src[0] == dst) {
+        mul_dd  = static_cast<const float *>(mul_tensor->src[1]->data);
+        mul_src = mul_tensor->src[1];
+    } else if (mul_tensor->src[1] == dst) {
+        mul_dd  = static_cast<const float *>(mul_tensor->src[0]->data);
+        mul_src = mul_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    const float *       add_dd  = nullptr;
+    const ggml_tensor * add_src = nullptr;
+
+    if (add_tensor->src[0] == mul_tensor) {
+        add_dd  = static_cast<const float *>(add_tensor->src[1]->data);
+        add_src = add_tensor->src[1];
+    } else if (add_tensor->src[1] == mul_tensor) {
+        add_dd  = static_cast<const float *>(add_tensor->src[0]->data);
+        add_src = add_tensor->src[0];
+    } else {
+        GGML_ASSERT(false);
+    }
+
+    float * dst_dd = static_cast<float *>(add_tensor->data);
+
+    dpct::queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    GGML_ASSERT(rms_norm_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type          == GGML_TYPE_F32);
+    GGML_ASSERT(mul_tensor->type   == GGML_TYPE_F32);
+    GGML_ASSERT(add_tensor->type   == GGML_TYPE_F32);
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int64_t ne00 = rms_norm_src->ne[0];
+    const int64_t ne01 = rms_norm_src->ne[1];
+    const int64_t ne02 = rms_norm_src->ne[2];
+    const int64_t ne03 = rms_norm_src->ne[3];
+
+    const size_t ts0 = ggml_type_size(rms_norm_src->type);
+    GGML_ASSERT(rms_norm_src->nb[0] == ts0);
+    const int64_t s00 = 1;
+    const int64_t s01 = rms_norm_src->nb[1] / ts0;
+    const int64_t s02 = rms_norm_src->nb[2] / ts0;
+    const int64_t s03 = rms_norm_src->nb[3] / ts0;
+
+    const size_t tdst = ggml_type_size(add_tensor->type);
+    GGML_ASSERT(add_tensor->nb[0] == tdst);
+    const int64_t d00 = 1;
+    const int64_t d01 = add_tensor->nb[1] / tdst;
+    const int64_t d02 = add_tensor->nb[2] / tdst;
+    const int64_t d03 = add_tensor->nb[3] / tdst;
+
+    const size_t ts_mul = ggml_type_size(mul_src->type);
+    GGML_ASSERT(mul_src->nb[0] == ts_mul);
+    const int64_t mul_s01 = mul_src->nb[1] / ts_mul;
+    const int64_t mul_s02 = mul_src->nb[2] / ts_mul;
+    const int64_t mul_s03 = mul_src->nb[3] / ts_mul;
+
+    const size_t ts_add = ggml_type_size(add_src->type);
+    GGML_ASSERT(add_src->nb[0] == ts_add);
+    const int64_t add_s01 = add_src->nb[1] / ts_add;
+    const int64_t add_s02 = add_src->nb[2] / ts_add;
+    const int64_t add_s03 = add_src->nb[3] / ts_add;
+
+    rms_norm_f32_sycl(src0_dd, dst_dd, (int) ne00, (int) ne01, (int) ne02, (int) ne03,
+        s00, s01, s02, s03, d00, d01, d02, d03, eps, main_stream, ctx.device,
+        mul_dd, mul_s01, mul_s02, mul_s03,
+        (int) mul_src->ne[0], (int) mul_src->ne[1], (int) mul_src->ne[2], (int) mul_src->ne[3],
+        add_dd, add_s01, add_s02, add_s03,
+        (int) add_src->ne[0], (int) add_src->ne[1], (int) add_src->ne[2], (int) add_src->ne[3]);
 }
 
 void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {

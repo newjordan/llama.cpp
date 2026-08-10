@@ -29,7 +29,12 @@ else()
     add_subdirectory(tokenize)
     add_subdirectory(parser)
     add_subdirectory(tts)
-    add_subdirectory(mtmd)
+    # mtmd needs tools/mtmd/models (a submodule not present in this vendored
+    # tree); keep it optional so LLAMA_BUILD_TOOLS=ON works without it.
+    option(LLAMA_BUILD_MTMD_TOOL "llama: build tools/mtmd (requires models submodule)" OFF)
+    if (LLAMA_BUILD_MTMD_TOOL)
+        add_subdirectory(mtmd)
+    endif()
     if (GGML_RPC)
         add_subdirectory(rpc)
     endif()

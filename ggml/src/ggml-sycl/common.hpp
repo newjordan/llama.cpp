@@ -435,7 +435,42 @@ struct ggml_backend_sycl_context {
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
+    // Q8_1 src1 memo (serial decode): several mul_mat ops per layer consume the same
+    // activation tensor (attn_norm -> Q/K/V/gate projections) with no writer in between,
+    // and each one re-launches quantize_row_q8_1_sycl on that identical src1. Memoizing
+    // the q8_1 output of the first consumer and reusing it for the next mul_mat with the
+    // same (src1 ptr, shape) is bit-identical (same input bytes -> same q8_1 bytes) and
+    // deletes ~3 tiny kernel launches per layer. The scratch slot is a dedicated USM
+    // arena (never a pool slot: the VMM pool is strict-LIFO) held for the backend
+    // lifetime. Invalidation: ggml_sycl_compute_forward clears quant_memo_valid when
+    // any op's dst aliases quant_memo_src1, so cross-op reuse is impossible.
+    void  * quant_memo_buf      = nullptr;
+    size_t quant_memo_buf_bytes = 0;
+    bool    quant_memo_valid    = false;
+    const void * quant_memo_src1 = nullptr;
+    ggml_type quant_memo_type   = GGML_TYPE_COUNT;
+    int64_t  quant_memo_ne10    = 0;
+    int64_t  quant_memo_nrows1  = 0;
+    size_t   quant_memo_padded  = 0;
+    int64_t  quant_memo_hits    = 0;  // reuse counter for A/B verification
+    int64_t  quant_memo_gen     = 0;  // bumped on every arena write; guards against
+    int64_t  quant_memo_gen_at_store = -1;  // an intervening requantize of another src1
+
     std::vector<mmid_row_mapping> mmid_row_mapping_host;
+
+    // [lx-ids-once] ids one-sync-per-layer memo: at pp512 the gate/up/down
+    // MUL_MAT_ID ops of a MoE layer all consume the SAME selected_experts (ids)
+    // tensor, so one D2H ids copy + one full stream->wait() + one counting sort
+    // per layer is bit-identical (the first consumer's wait already follows the
+    // router/topk write; ops 2-3 reuse the identical host bytes + sort output).
+    // Keyed on the ids tensor object + a per-graph-execution generation so a
+    // recycled tensor pointer with new content can never hit a stale copy.
+    uint64_t               mmid_ids_memo_gen        = 0;
+    uint64_t               mmid_ids_memo_gen_store  = 0;
+    const ggml_tensor    * mmid_ids_memo_tensor     = nullptr;
+    std::vector<int64_t>   mmid_ids_memo_counts;
+    std::vector<int64_t>   mmid_ids_memo_offsets;
+    std::vector<mmid_row_mapping> mmid_ids_memo_mapping;
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 

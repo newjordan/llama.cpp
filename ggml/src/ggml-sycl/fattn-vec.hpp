@@ -10,6 +10,7 @@
 #include "common.hpp"
 #include "ggml.h"
 #include "fattn-common.hpp"
+#include <atomic>
 #include <cmath>
 #include <float.h>
 
@@ -590,15 +591,39 @@ void ggml_sycl_flash_attn_ext_vec_case_impl(ggml_backend_sycl_context & ctx, ggm
     constexpr size_t nbytes_shared = 0;
 
     const auto arch = ggml_sycl_info().devices[ctx.device].hw_info.arch;
-    const int nthreads = ggml_sycl_fattn_vec_get_nthreads_device(arch);
+    int nthreads = ggml_sycl_fattn_vec_get_nthreads_device(arch);
+    // [lx-fattn-decode] decode (single-token Q) A/B: the Xe2 tuning constant is
+    // 256, but at T<=128 each 16-lane warp covers exactly 16 K rows, so warps
+    // 8-15 are idle (reading masked rows) while still paying the per-K-step
+    // work-group barrier and local-memory round trip. GGML_SYCL_FATTN_DECODE_
+    // NTHREADS=128 selects the self-consistent 128-thread/nbatch=128 path for
+    // Q.ne[1]==1 only (batch/prefill keep the tuned 256). Default 0 = current
+    // behavior; measurement-only knob, never on by default.
+    static const int lx_decode_nthreads = []() {
+        const char * e = getenv("GGML_SYCL_FATTN_DECODE_NTHREADS");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    if (lx_decode_nthreads == 128 && dst->src[0]->ne[1] == 1) {
+        nthreads = lx_decode_nthreads;
+    }
     // 256 threads would overflow the 64 KB work-group local memory at D == 512, so keep 128 there.
     if (D <= 256 && nthreads == 256) {
         constexpr int nthreads_hw = 256;
         constexpr int nwarps = nthreads_hw / warp_size;
+        // [lx-fattn] nbatch_fa must equal the kernel's K stride (nthreads=256), not D=128:
+        // with nbatch_fa=128 the grid got ntiles_KQ=ceil(ne11/128) y-blocks while each block
+        // strides K by 256, so every block starting at k>=ne11 was a fully dead WG (writing
+        // meta + zero partials into dst_tmp) and parallel_blocks>1 forced the combine + two
+        // dst_tmp allocs per layer. nbatch=256 => ntiles_KQ=1 for ne11<=256 => single block,
+        // group_range(1)==1 => in-kernel normalized write straight to dst, no combine.
+        static std::atomic<int> lx_fattn_once{0};
+        if (lx_fattn_once.fetch_add(1) == 0) {
+            fprintf(stderr, "[lx-control-fattn] vec nthreads=256 nbatch=256 single-block K (no combine, no dead WG)\n");
+        }
         launch_fattn<D, cols_per_block, 1,
                      flash_attn_ext_vec<D, cols_per_block, type_K, type_V,
                                         use_logit_softcap, warp_size, nthreads_hw>, warp_size>(
-            ctx, dst, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+            ctx, dst, nwarps, nbytes_shared, nthreads_hw, need_f16_K, need_f16_V, false);
     } else {
         constexpr int nthreads_hw = 128;
         constexpr int nwarps = nthreads_hw / warp_size;

@@ -197,13 +197,21 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
-    // If there are no tensor cores available, use the generic tile kernel:
+    // Vector kernel for small Q batch (serial decode Q.ne[1]==1).
+    // Laguna GQA previously fell through to TILE when gqa_opt_applies; VEC is
+    // ~+3.6 tg on B70 tip. Kill TILE restore: GGML_SYCL_FATTN_FORCE_TILE=1
+    // notes/SHIP_20260730_fattn_vec_gqa_default.md
     if (can_use_vector_kernel) {
+        static const bool force_tile = []() {
+            const char * e = getenv("GGML_SYCL_FATTN_FORCE_TILE");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-            if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
+            if (Q->ne[1] == 1 && !force_tile) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+            if (Q->ne[1] == 1 && force_tile && !gqa_opt_applies) {
+                return BEST_FATTN_KERNEL_VEC; // stock non-GQA still VEC
             }
         } else {
             if (Q->ne[1] <= 2) {
@@ -215,6 +223,16 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 }
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    // [lx-diag-decode] measurement-only skip (bit 8 = flash-attention kernels).
+    {
+        static const int skip = []() {
+            const char * e = getenv("GGML_SYCL_DIAG_SKIP_DECODE");
+            return e != nullptr ? std::atoi(e) : 0;
+        }();
+        if (skip & 8) {
+            return;
+        }
+    }
     ggml_sycl_set_device(ctx.device);
     switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
