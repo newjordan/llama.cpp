@@ -1069,12 +1069,27 @@ void launch_fattn(
         // todo fix the hard code change
         // parallel_blocks = ntiles_KQ;
 
+        // [lx-fattn-pb] GGML_SYCL_LX_FATTN_PARALLEL_BLOCKS=<N> (env, default 0
+        // = stock): override the occupancy-derived split-K width. At decode
+        // (ne1=1, 48 Q heads) the stock cap of max_wg_per_cu=4 leaves each
+        // workgroup serially walking kv_len/(4*nbatch_fa) KV tiles; a wider
+        // split shortens the serial walk and deepens the DRAM queue at the
+        // cost of a larger combine pass. Clamped to ntiles_KQ. Skips the
+        // efficiency search below when set.
+        static const int lx_fattn_pb = []() {
+            const char * e = getenv("GGML_SYCL_LX_FATTN_PARALLEL_BLOCKS");
+            return e != nullptr ? std::atoi(e) : 0;
+        }();
+        if (lx_fattn_pb > 0) {
+            parallel_blocks = std::min(lx_fattn_pb, ntiles_KQ);
+        }
+
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
         int nwaves_best = 0;
         int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
+        for (int parallel_blocks_test = parallel_blocks; lx_fattn_pb == 0 && parallel_blocks_test <= ntiles_KQ; ++parallel_blocks_test) {
             const int nblocks_total = ntiles_total * parallel_blocks_test;
             const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
             const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
