@@ -4716,10 +4716,32 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // PPL -nan on dual_down expert-loop (confirmed OPT=0 fixes PPL, kills decode).
     // Force chunked reorder-MMVQ for any column count when src0 is already reordered.
     // notes/SHIP_20260731_dual_down_expert_loop_ppl.md
+    //
+    // [lx-reorder-multicol] GGML_SYCL_LX_REORDER_MULTICOL_MKL=1 (env, default OFF):
+    // narrow that guard to the decode / spec-verify width it was written for
+    // (ne[1] <= MMVQ_MAX_BATCH_SIZE) and let wider batches fall through to the
+    // fp16/oneMKL path. The guard's hazard is raw SoA weights reaching a kernel
+    // that assumes linear blocks; ggml_sycl_op_mul_mat_sycl does not read them
+    // raw — it dequantizes via ggml_get_to_fp16_sycl, which already dispatches
+    // dequantize_row_q{4,5,6}_K_sycl_reorder for reordered banks (convert.cpp),
+    // and reorder_qw_q*_k_moe keeps each expert self-contained inside its nb02
+    // stride so the per-expert slice pointer stays valid. MMQ is still forbidden
+    // on reordered weights (it does read them raw), so the bypass suppresses it.
+    // Measured motivation: the 8-column chunking re-reads the whole expert slice
+    // ceil(N/8) times at prefill widths. Quality arbitrated by the KLD gate.
+    static const bool lx_reorder_multicol_mkl = []() {
+        const char * e = getenv("GGML_SYCL_LX_REORDER_MULTICOL_MKL");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    const bool lx_reorder_multicol_bypass =
+        lx_reorder_multicol_mkl && src1->ne[1] > MMVQ_MAX_BATCH_SIZE;
     {
         ggml_tensor_extra_gpu * extra0 = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
         const bool reordered = extra0 && extra0->optimized_feature.reorder;
-        if (!split && reordered && ggml_is_quantized(src0->type) &&
+        if (reordered && lx_reorder_multicol_bypass) {
+            use_mul_mat_q = false;
+        }
+        if (!split && reordered && !lx_reorder_multicol_bypass && ggml_is_quantized(src0->type) &&
             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
             src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] >= 1 &&
             ggml_sycl_supports_reorder_mmvq(src0->type)) {
