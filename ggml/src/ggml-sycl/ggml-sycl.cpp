@@ -48,6 +48,8 @@
 #    define GGML_SYCL_SUPPORT_VMM
 #endif
 #include <sycl/half_type.hpp>
+// [lx-expert-tile] joint_matrix (XMX) for the fused MoE expert-tile GEMM
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 #include "ggml.h"
 #include "ggml-sycl.h"
@@ -6650,6 +6652,584 @@ struct lx_chrono_wait_guard {
     }
 };
 
+// [lx-expert-tile] GGML_SYCL_LX_EXPERT_TILE_GEMM=1 (env, default OFF): fused
+// XMX dequant-GEMM for the MUL_MAT_ID prefill expert loop, v2. v1 (scalar SIMT
+// dequant-dot, results/p2-c1-tile-*/c1-expert-tile.patch) kept the correct
+// engagement/skip/metadata plumbing but its kernel was ~2x slower than the
+// per-expert oneMKL loop (notes/FINDING_20260811_p2_expert_gemm_sizing.md).
+// v2 reuses that plumbing and replaces the kernel with the microbench-proven
+// XMX configuration (benchmark/xmx-dequant-gemm, winning cfg at N<=32:
+// t16x16x16-wgm64-sgc16-nb32-sk16-kb64-sg16 — 1.33x/1.21x vs MKL at N=16/32):
+//   - 16x16x16 fp16*fp16+fp32 joint_matrix (the only hardware-real BMG combo),
+//     sub-group 16;
+//   - each workgroup dequantizes a KB=64 x WG_M=64 q4_K weight tile into
+//     VNNI/ext_intel_packed fp16 SLM (half2 stores) from EITHER serving-state
+//     layout (reordered per-expert SoA [qs|scales|dm] or linear block array);
+//   - oversubscribed dequant: 16 sub-groups cooperate on the dequant phase,
+//     the first 4 do the joint_matrix MADs (WG_M/SG_COLS = 64/16);
+//   - split-K across workgroups with fp32 partials + a fixup kernel.
+// Scope: src0->type == GGML_TYPE_Q4_K only (gate/up all 38 layers + down in
+// 22); q6_K down dispatches stay 100% on the oneMKL loop. Band: experts with
+// 1..LX_ET MAX_N=32 routed rows (microbench crossover); larger experts stay on
+// the loop, which skips exactly the band, keyed off the SAME counts array.
+//
+// Grid/enumeration (documented choice): flattened metadata-indexed. The host
+// compacts the in-band experts into slots [0..n_slots); workgroup id wg maps
+// as slot = wg / (n_m_tiles*split_k), mt = (wg % (n_m_tiles*split_k)) / split_k,
+// split = wg % split_k, i.e. grid = n_slots x (ne01/WG_M) m-tiles x split_k
+// K-blocks, all launched as ONE 1-D nd_range of 256-thread workgroups. No WG
+// is idle (out-of-band experts are never enumerated). Because joint_matrix
+// stores cannot mask token rows, each slot's rows are PADDED to a multiple of
+// TM=16 in two device-side scratch surfaces indexed by pad-row:
+//   act  : fp16 activation staging [n_pad_rows x ne00] (F32 src1_contiguous
+//          rows converted on device; pad rows zero-filled) — keeps the A-tile
+//          joint_matrix_load identical to the proven microbench (global fp16,
+//          stride K);
+//   part : fp32 partials [split_k x n_pad_rows x ne01] written by
+//          joint_matrix_store.
+// A fixup kernel then sums the split_k partials of each REAL row and scatters
+// into dst_contiguous. split_k is derived per shape: largest power of two
+// <= 16 that divides ne00/KB while keeping >=2 chunks per split (K=2048 ->
+// 16, exactly the winning microbench config; K=512 -> 4), then halved until
+// the partials fit LX_ET_PART_BUDGET (the microbench measured one expert; the
+// multi-expert grid already fills the machine, so shrinking split_k for big
+// bands only removes redundancy).
+//
+// Verify mode: GGML_SYCL_LX_EXPERT_TILE_VERIFY=1 keeps the oneMKL loop
+// computing the band too; dst_contiguous is snapshotted after the tile+fixup
+// writes and compared row-for-row against the loop's output (max-abs /
+// max-rel, rel denominator max(1,|ref|) as in the microbench), printed per
+// dispatch. Slow by design; it exists to prove numerics.
+static bool lx_expert_tile_gemm_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_SYCL_LX_EXPERT_TILE_GEMM");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool lx_expert_tile_verify_enabled() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_SYCL_LX_EXPERT_TILE_VERIFY");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+
+namespace lx_et {
+
+namespace sem = sycl::ext::oneapi::experimental::matrix;
+
+static constexpr int MAX_N      = 32;                  // band: experts with 1..MAX_N routed rows
+static constexpr int TM         = 16;                  // joint_matrix tile (BMG hardware-real combo)
+static constexpr int TN         = 16;
+static constexpr int TK         = 16;
+static constexpr int SG_SIZE    = 16;
+static constexpr int WG_M       = 64;                  // output features (of ne01) per workgroup
+static constexpr int SG_COLS    = 16;                  // output features per MAD sub-group (RM = SG_COLS/TN = 1)
+static constexpr int NSG_MAD    = WG_M / SG_COLS;      // 4 MAD sub-groups
+static constexpr int NSG_TOT    = 16;                  // oversubscribed dequant: 16 SGs total
+static constexpr int WG_THREADS = NSG_TOT * SG_SIZE;   // 256
+static constexpr int KB         = 64;                  // K per chunk: one q4_K super-block quarter
+static constexpr int SPLIT_K_MAX = 16;
+static constexpr int RN_MAX     = MAX_N / TM;          // 2 token tiles per WG max
+static constexpr size_t PART_BUDGET = 128ull * 1024 * 1024;  // split-K partials cap (bytes)
+
+template <typename T> static inline auto gptr(T * p) {
+    return sycl::address_space_cast<sycl::access::address_space::global_space,
+                                    sycl::access::decorated::no>(p);
+}
+
+// Same math as dequantize_q4_K_common (dequantize.hpp), but the stores go
+// through a functor store2(j, v0, v1) with j (even) the in-block index of the
+// value pair — needed to write the VNNI/ext_intel_packed SLM layout with
+// vectorized half2 stores. Copied from benchmark/xmx-dequant-gemm/main.cpp
+// (value math identical; falsified-v1 already proved the mapping vs both bank
+// layouts).
+template <typename Store2Fn>
+static inline void dequantize_q4_K_math(Store2Fn && store2, const uint8_t * __restrict__ qs_ptr, const float dall,
+                                        const float dmin, const uint8_t * __restrict__ scales_local, int il, int ir) {
+    const int is = 2 * il;
+    constexpr int n = 4;
+
+    uint8_t sc, m;
+    get_scale_min_k4(is + 0, scales_local, sc, m);
+    const float d1 = dall * sc;
+    const float m1 = dmin * m;
+
+    get_scale_min_k4(is + 1, scales_local, sc, m);
+    const float d2 = dall * sc;
+    const float m2 = dmin * m;
+
+    sycl::vec<uint8_t, n> q_vec = vec_aligned_load<uint8_t, n>(qs_ptr + 32 * il + n * ir);
+    const int j0 = 64 * il + n * ir;
+    store2(j0 + 0,  d1 * (q_vec[0] & 0xF) - m1, d1 * (q_vec[1] & 0xF) - m1);
+    store2(j0 + 2,  d1 * (q_vec[2] & 0xF) - m1, d1 * (q_vec[3] & 0xF) - m1);
+    store2(j0 + 32, d2 * (q_vec[0] >>  4) - m2, d2 * (q_vec[1] >>  4) - m2);
+    store2(j0 + 34, d2 * (q_vec[2] >>  4) - m2, d2 * (q_vec[3] >>  4) - m2);
+}
+
+using local_half_ptr = sycl::multi_ptr<sycl::half, sycl::access::address_space::local_space,
+                                       sycl::access::decorated::no>;
+
+// One workgroup = (in-band slot, m-tile of WG_M output features, split-K
+// block). Phase 1 (all 16 SGs): dequantize the KB x WG_M weight tile into
+// packed SLM — 64 tasks of 8 threads (llama's il/ir split), 2 passes over the
+// 256 threads. Phase 2 (first 4 SGs): 16x16x16 joint_matrix MADs, A tiles
+// straight from the padded fp16 activation staging (row stride ne00), B from
+// SLM. fp32 accumulate across all chunks of this split; stores go to the
+// padded fp32 partials surface (never to dst rows — masking happens in the
+// fixup kernel).
+template <bool REORDERED>
+static inline void tile_gemm_device(const uint8_t *__restrict__ w_base_all,  // quantized bank (src0->data)
+                                    const sycl::half *__restrict__ act,      // [n_pad_rows][ne00] staged fp16
+                                    float *__restrict__ part,                // [split_k][n_pad_rows][ne01]
+                                    const int32_t *__restrict__ slots,       // [n_slots][3] = {expert, nrows, pad_off}
+                                    const int64_t ne00, const int64_t ne01,
+                                    const size_t  nb02,                      // bytes per expert slice
+                                    const int n_m_tiles, const int split_k,
+                                    const int64_t n_pad_rows,
+                                    sycl::half * wt, local_half_ptr wt_mp,
+                                    const sycl::nd_item<1> & it) {
+    const int wg    = (int) it.get_group(0);
+    const int slot  = wg / (n_m_tiles * split_k);
+    const int rem   = wg % (n_m_tiles * split_k);
+    const int mt    = rem / split_k;
+    const int split = rem % split_k;
+
+    const int e     = slots[3 * slot + 0];
+    const int nrows = slots[3 * slot + 1];
+    const int poff  = slots[3 * slot + 2];
+    const int RN    = (nrows + TM - 1) / TM;  // 1 or 2 (uniform per WG: barrier-safe)
+
+    const int       m0         = mt * WG_M;
+    const int       row_blocks = (int) (ne00 / QK_K);           // super-blocks per weight row
+    const int64_t   nbpe       = (int64_t) row_blocks * ne01;   // super-blocks per expert
+    const uint8_t * base       = w_base_all + (size_t) e * nb02;
+    // reordered per-expert SoA section bases (exactly reorder_qw_q4_k_moe /
+    // dequantize_block_q4_K_reorder offset math); unused when !REORDERED
+    const uint8_t * sc_base    = base + (size_t) nbpe * (QK_K / 2);
+    const uint8_t * dm_base    = sc_base + (size_t) nbpe * K_SCALE_SIZE;
+
+    sycl::sub_group sg = it.get_sub_group();
+    const int  lid       = (int) it.get_local_id(0);
+    const int  sgid      = (int) sg.get_group_id()[0];
+    const bool is_mad_sg = sgid < NSG_MAD;
+    const int  sg_m0     = sgid * SG_COLS;  // MAD SGs only
+
+    const int tq = lid / 8;  // dequant task slot within pass
+    const int ir = lid % 8;  // llama's ir: 4-value column within quarter
+
+    const int cps = (int) (ne00 / KB) / split_k;  // chunks per split (>= 1, exact)
+
+    sem::joint_matrix<sycl::sub_group, float, sem::use::accumulator, TM, TN> C[RN_MAX];
+    for (int rn = 0; rn < RN; ++rn) {
+        sem::joint_matrix_fill(sg, C[rn], 0.0f);
+    }
+
+    for (int c = 0; c < cps; ++c) {
+        const int kb  = split * cps + c;
+        const int blk = (kb * KB) / QK_K;        // super-block column
+        const int il  = (kb * KB % QK_K) / 64;   // quarter within the super-block
+        // cooperative dequant: WG_M tasks (KB==64 -> one quarter per weight row),
+        // 8 threads each, WG_THREADS/8 = 32 tasks per pass -> 2 passes
+#pragma unroll
+        for (int pass = 0; pass < WG_M / (WG_THREADS / 8); ++pass) {
+            const int     ml = pass * (WG_THREADS / 8) + tq;    // weight row within the m-tile
+            const int64_t ib = (int64_t) (m0 + ml) * row_blocks + blk;
+            const uint8_t * qs;
+            const uint8_t * scp;
+            sycl::half2     dm;
+            if constexpr (REORDERED) {
+                qs  = base + ib * (QK_K / 2);
+                scp = sc_base + ib * K_SCALE_SIZE;
+                dm  = *reinterpret_cast<const sycl::half2 *>(dm_base + ib * sizeof(sycl::half2));
+            } else {
+                const block_q4_K * xb = reinterpret_cast<const block_q4_K *>(base) + ib;
+                qs  = xb->qs;
+                scp = xb->scales;
+                dm  = xb->dm;
+            }
+            const float dall = dm[0];
+            const float dmin = dm[1];
+            dequantize_q4_K_math(
+                [&](int j, float v0, float v1) {
+                    const int kl = j - 64 * il;  // local k within the chunk, even
+                    *reinterpret_cast<sycl::vec<sycl::half, 2> *>(&wt[(kl >> 1) * (2 * WG_M) + ml * 2]) =
+                        sycl::vec<sycl::half, 2>{(sycl::half) v0, (sycl::half) v1};
+                },
+                qs, dall, dmin, scp, il, ir);
+        }
+        sycl::group_barrier(it.get_group());
+        if (is_mad_sg) {
+#pragma unroll
+            for (int kt = 0; kt < KB / TK; ++kt) {
+                sem::joint_matrix<sycl::sub_group, sycl::half, sem::use::b, TK, TN, sem::layout::ext_intel_packed> B;
+                sem::joint_matrix_load(sg, B, wt_mp + (size_t) (kt * TK / 2) * (2 * WG_M) + sg_m0 * 2,
+                                       (size_t) (2 * WG_M));
+                for (int rn = 0; rn < RN; ++rn) {
+                    sem::joint_matrix<sycl::sub_group, sycl::half, sem::use::a, TM, TK, sem::layout::row_major> A;
+                    sem::joint_matrix_load(sg, A,
+                        gptr(const_cast<sycl::half *>(act)) +
+                            (size_t) (poff + rn * TM) * (size_t) ne00 + (size_t) kb * KB + kt * TK,
+                        (size_t) ne00);
+                    sem::joint_matrix_mad(sg, C[rn], A, B, C[rn]);
+                }
+            }
+        }
+        sycl::group_barrier(it.get_group());
+    }
+
+    if (is_mad_sg) {
+        float * outp = part + (size_t) split * (size_t) n_pad_rows * (size_t) ne01;
+        for (int rn = 0; rn < RN; ++rn) {
+            sem::joint_matrix_store(sg, C[rn],
+                gptr(outp) + (size_t) (poff + rn * TM) * (size_t) ne01 + m0 + sg_m0,
+                (size_t) ne01, sem::layout::row_major);
+        }
+    }
+}
+
+template <bool REORDERED>
+static void submit_tile(queue_ptr stream, const uint8_t * w_base_all, const sycl::half * act, float * part,
+                        const int32_t * slots, int n_slots, int64_t ne00, int64_t ne01, size_t nb02,
+                        int n_m_tiles, int split_k, int64_t n_pad_rows) {
+    const size_t n_wg = (size_t) n_slots * n_m_tiles * split_k;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::half, 1> wtile(sycl::range<1>((size_t) KB * WG_M), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(n_wg * WG_THREADS, WG_THREADS),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                tile_gemm_device<REORDERED>(w_base_all, act, part, slots, ne00, ne01, nb02,
+                                            n_m_tiles, split_k, n_pad_rows,
+                                            get_pointer(wtile),
+                                            wtile.template get_multi_ptr<sycl::access::decorated::no>(), it);
+            });
+    });
+}
+
+}  // namespace lx_et
+
+// launch-shape record for the verify report
+struct lx_expert_tile_stats {
+    int     n_slots    = 0;
+    int64_t n_rows     = 0;
+    int64_t n_pad_rows = 0;
+    int     split_k    = 1;
+    bool    reordered  = false;
+};
+
+// Host side: decide engagement for this dispatch and enqueue the staging +
+// tile + fixup kernels covering every expert in the [1, MAX_N] band. Returns
+// true iff enqueued (the caller must then skip exactly that band in the
+// per-expert loop — unless verifying). Returning false leaves the dispatch
+// fully on the loop.
+static bool lx_expert_tile_gemm_launch(ggml_backend_sycl_context & ctx, queue_ptr stream,
+                                       const ggml_tensor * src0, const char * src1_cont, char * dst_cont,
+                                       const std::vector<int64_t> & expert_row_counts,
+                                       const std::vector<int64_t> & expert_row_offsets,
+                                       lx_expert_tile_stats * stats_out) {
+    if (src0->type != GGML_TYPE_Q4_K) {
+        return false;  // v2 scope: q4_K banks only; q6_K dispatches stay 100% oneMKL
+    }
+    if (!ggml_is_contiguous(src0)) {
+        return false;
+    }
+
+    const int64_t ne00 = src0->ne[0];  // K (in features)
+    const int64_t ne01 = src0->ne[1];  // M (out features)
+    const int64_t n_as = src0->ne[2];
+    const size_t  nb02 = src0->nb[2];
+
+    if (ne00 % QK_K != 0 || ne01 % lx_et::WG_M != 0) {
+        return false;  // whole super-blocks / whole m-tiles only (Laguna: 2048x512, 512x2048 — both pass)
+    }
+    const int64_t nbpe = ne00 * ne01 / QK_K;  // super-blocks per expert
+    if (nb02 != (size_t) nbpe * sizeof(block_q4_K)) {
+        return false;  // padded/strided bank: the in-kernel offset math would not hold
+    }
+
+    // one-time device capability check: hardware 16x16x16 fp16->fp32
+    // joint_matrix + sub-group 16 (true on B70/BMG; keeps the env knob safe on
+    // anything else)
+    static const int device_ok = [&]() -> int {
+        try {
+            const sycl::device dev = stream->get_device();
+            const auto sgs = dev.get_info<sycl::info::device::sub_group_sizes>();
+            if (std::find(sgs.begin(), sgs.end(), (size_t) lx_et::SG_SIZE) == sgs.end()) {
+                return 0;
+            }
+            namespace sex = sycl::ext::oneapi::experimental;
+            for (const auto & c : dev.get_info<sex::info::device::matrix_combinations>()) {
+                if ((int) c.msize == lx_et::TM && (int) c.nsize == lx_et::TN && (int) c.ksize == lx_et::TK &&
+                    c.atype == lx_et::sem::matrix_type::fp16 && c.btype == lx_et::sem::matrix_type::fp16 &&
+                    c.ctype == lx_et::sem::matrix_type::fp32 && c.dtype == lx_et::sem::matrix_type::fp32) {
+                    return 1;
+                }
+            }
+        } catch (const std::exception &) {
+        }
+        return 0;
+    }();
+    if (!device_ok) {
+        static std::atomic<int> warned(0);
+        if (warned.fetch_add(1) == 0) {
+            fprintf(stderr,
+                    "[lx-control-expert-tile] DISABLED: device lacks %dx%dx%d fp16->fp32 joint_matrix or SG%d\n",
+                    lx_et::TM, lx_et::TN, lx_et::TK, lx_et::SG_SIZE);
+        }
+        return false;
+    }
+
+    GGML_ASSERT(expert_row_offsets[n_as] <= INT32_MAX);
+
+    // band census
+    int     n_slots    = 0;
+    int64_t n_rows     = 0;
+    int64_t n_pad_rows = 0;
+    for (int64_t e = 0; e < n_as; e++) {
+        const int64_t nr = expert_row_counts[e];
+        if (nr >= 1 && nr <= lx_et::MAX_N) {
+            n_slots++;
+            n_rows += nr;
+            n_pad_rows += ((nr + lx_et::TM - 1) / lx_et::TM) * lx_et::TM;
+        }
+    }
+    if (n_slots == 0) {
+        return false;
+    }
+
+    // split-K: winning microbench shape keeps >=2 KB-chunks per split and
+    // split_k <= 16 (K=2048 -> 16, the measured config; K=512 -> 4); halve
+    // further only if the fp32 partials would blow the scratch budget.
+    int           split_k      = 1;
+    const int64_t total_chunks = ne00 / lx_et::KB;
+    while (split_k * 2 <= lx_et::SPLIT_K_MAX && total_chunks % (int64_t) (split_k * 2) == 0 &&
+           (int64_t) (split_k * 2) < total_chunks) {
+        split_k *= 2;
+    }
+    while (split_k > 1 &&
+           (size_t) split_k * (size_t) n_pad_rows * (size_t) ne01 * sizeof(float) > lx_et::PART_BUDGET) {
+        split_k /= 2;
+    }
+
+    // Metadata (one int32 H2D): [slots 3*n_slots: expert, nrows, pad_off]
+    // [rows 2*n_rows: dst_row, pad_row] [pad2src n_pad_rows: src row or -1].
+    // Bytes are a pure function of the memoized counts/offsets (identical for
+    // the layer's gate/up/down ops); host staging persists in the context (see
+    // lx_expert_tile_meta_host in common.hpp for the drain contract). Device
+    // slots are pool allocs released at return: the in-order queue serializes
+    // any later reuse behind the kernels enqueued here.
+    std::vector<int32_t> & mh = ctx.lx_expert_tile_meta_host;
+    mh.resize((size_t) (3 * n_slots) + (size_t) (2 * n_rows) + (size_t) n_pad_rows);
+    int32_t * mh_slots = mh.data();
+    int32_t * mh_rows  = mh_slots + 3 * n_slots;
+    int32_t * mh_p2s   = mh_rows + 2 * n_rows;
+    {
+        int32_t s = 0;
+        int64_t r = 0, p = 0;
+        for (int64_t e = 0; e < n_as; e++) {
+            const int64_t nr = expert_row_counts[e];
+            if (nr < 1 || nr > lx_et::MAX_N) {
+                continue;
+            }
+            const int64_t roff = expert_row_offsets[e];
+            const int64_t npad = ((nr + lx_et::TM - 1) / lx_et::TM) * lx_et::TM;
+            mh_slots[3 * s + 0] = (int32_t) e;
+            mh_slots[3 * s + 1] = (int32_t) nr;
+            mh_slots[3 * s + 2] = (int32_t) p;
+            for (int64_t n = 0; n < nr; n++) {
+                mh_rows[2 * (r + n) + 0] = (int32_t) (roff + n);
+                mh_rows[2 * (r + n) + 1] = (int32_t) (p + n);
+            }
+            for (int64_t n = 0; n < npad; n++) {
+                mh_p2s[p + n] = n < nr ? (int32_t) (roff + n) : -1;
+            }
+            s++;
+            r += nr;
+            p += npad;
+        }
+    }
+    ggml_sycl_pool_alloc<int32_t> meta_dev(ctx.pool(), mh.size());
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(meta_dev.get(), mh.data(), mh.size() * sizeof(int32_t))));
+
+    ggml_sycl_pool_alloc<sycl::half> act_dev(ctx.pool(), (size_t) n_pad_rows * (size_t) ne00);
+    ggml_sycl_pool_alloc<float>      part_dev(ctx.pool(),
+                                              (size_t) split_k * (size_t) n_pad_rows * (size_t) ne01);
+
+    // Serving-state banks are reordered per-expert SoA (reorder_qw with
+    // ne[2] > 1 always takes the _moe writers); before warmup / under OPT=0
+    // they are linear block arrays. Flag read on host BEFORE the loop can
+    // lazily reorder; in-order stream keeps bytes consistent with the flag.
+    const ggml_tensor_extra_gpu * extra0    = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const bool                    reordered = extra0 != nullptr && extra0->optimized_feature.reorder;
+
+    // 1) stage fp16 activations, padded per slot (pad rows zero-filled)
+    {
+        const int64_t     total  = n_pad_rows * ne00;
+        const int64_t     nblk   = (total + 255) / 256;
+        const int32_t *   p2s    = meta_dev.get() + 3 * n_slots + 2 * n_rows;
+        const float *     srcf   = (const float *) src1_cont;
+        sycl::half *      actp   = act_dev.get();
+        const int64_t     ne00c  = ne00;
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nblk * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> item) {
+                const int64_t i = (int64_t) item.get_global_linear_id();
+                if (i < total) {
+                    const int64_t pr   = i / ne00c;
+                    const int64_t k    = i % ne00c;
+                    const int32_t srow = p2s[pr];
+                    actp[i] = srow >= 0 ? (sycl::half) srcf[(size_t) srow * (size_t) ne00c + (size_t) k]
+                                        : sycl::half(0.0f);
+                }
+            });
+    }
+
+    // 2) ONE fused XMX tile launch over all in-band experts
+    const int n_m_tiles = (int) (ne01 / lx_et::WG_M);
+    if (reordered) {
+        lx_et::submit_tile<true>(stream, (const uint8_t *) src0->data, act_dev.get(), part_dev.get(),
+                                 meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+    } else {
+        lx_et::submit_tile<false>(stream, (const uint8_t *) src0->data, act_dev.get(), part_dev.get(),
+                                  meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+    }
+
+    // 3) fixup: sum the split-K partials of each REAL band row into dst_contiguous
+    {
+        const int64_t   total = n_rows * ne01;
+        const int64_t   nblk  = (total + 255) / 256;
+        const int32_t * rows  = meta_dev.get() + 3 * n_slots;
+        const float *   partp = part_dev.get();
+        float *         dstf  = (float *) dst_cont;
+        const int64_t   ne01c = ne01;
+        const int64_t   npr   = n_pad_rows;
+        const int       sk    = split_k;
+        stream->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) nblk * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> item) {
+                const int64_t i = (int64_t) item.get_global_linear_id();
+                if (i < total) {
+                    const int64_t r = i / ne01c;
+                    const int64_t m = i % ne01c;
+                    const int32_t dst_row = rows[2 * r + 0];
+                    const int32_t pad_row = rows[2 * r + 1];
+                    float s = 0.0f;
+                    for (int sp = 0; sp < sk; ++sp) {
+                        s += partp[((size_t) sp * (size_t) npr + (size_t) pad_row) * (size_t) ne01c + (size_t) m];
+                    }
+                    dstf[(size_t) dst_row * (size_t) ne01c + (size_t) m] = s;
+                }
+            });
+    }
+
+    static std::atomic<int> announced(0);
+    if (announced.fetch_add(1) == 0) {
+        fprintf(stderr,
+                "[lx-control-expert-tile] engaged(xmx): n_as=%d slots=%d rows=%d pad_rows=%d M=%d K=%d "
+                "layout=%s split_k=%d grid=%dx%d cfg=t%dx%dx%d-wgm%d-sgc%d-kb%d-sg%d\n",
+                (int) n_as, n_slots, (int) n_rows, (int) n_pad_rows, (int) ne01, (int) ne00,
+                reordered ? "reorder-soa" : "linear", split_k,
+                (int) ((size_t) n_slots * n_m_tiles * split_k), lx_et::WG_THREADS,
+                lx_et::TM, lx_et::TN, lx_et::TK, lx_et::WG_M, lx_et::SG_COLS, lx_et::KB, lx_et::NSG_TOT);
+    }
+
+    if (stats_out != nullptr) {
+        stats_out->n_slots    = n_slots;
+        stats_out->n_rows     = n_rows;
+        stats_out->n_pad_rows = n_pad_rows;
+        stats_out->split_k    = split_k;
+        stats_out->reordered  = reordered;
+    }
+    return true;
+}
+
+// Verify mode: compare the tile kernel's dst_contiguous band rows (snapshotted
+// before the oneMKL loop overwrote them) against the loop's own output.
+// Prints max-abs-err and max-rel-err (rel denominator max(1,|ref|), matching
+// the microbench) per dispatch, to stderr AND to a side log
+// (GGML_SYCL_LX_EXPERT_TILE_VERIFY_LOG, default /tmp/lx-expert-tile-verify.log)
+// because llama-server swallows stderr into its own log file.
+static void lx_expert_tile_verify_report(ggml_backend_sycl_context & ctx, queue_ptr stream,
+                                         const ggml_tensor * src0,
+                                         const float * mkl_out, const float * tile_out,
+                                         const std::vector<int64_t> & expert_row_counts,
+                                         const std::vector<int64_t> & expert_row_offsets,
+                                         int64_t ne01, const lx_expert_tile_stats & st) {
+    const int64_t n_as = src0->ne[2];
+    std::vector<int32_t> rows;  // dst_contiguous row index of every band row
+    rows.reserve((size_t) st.n_rows);
+    for (int64_t e = 0; e < n_as; e++) {
+        const int64_t nr = expert_row_counts[e];
+        if (nr < 1 || nr > lx_et::MAX_N) {
+            continue;
+        }
+        for (int64_t n = 0; n < nr; n++) {
+            rows.push_back((int32_t) (expert_row_offsets[e] + n));
+        }
+    }
+    if (rows.empty()) {
+        return;
+    }
+    const int64_t R = (int64_t) rows.size();
+
+    ggml_sycl_pool_alloc<int32_t> rows_dev(ctx.pool(), (size_t) R);
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(rows_dev.get(), rows.data(), (size_t) R * sizeof(int32_t))));
+    ggml_sycl_pool_alloc<float> err_dev(ctx.pool(), 2);
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(err_dev.get(), 0, 2 * sizeof(float))));
+
+    {
+        const int32_t * rd    = rows_dev.get();
+        float *         ep    = err_dev.get();
+        const int64_t   ne01c = ne01;
+        const int64_t   total = R * ne01;
+        stream->parallel_for(
+            sycl::range<1>((size_t) total),
+            sycl::reduction(ep + 0, sycl::maximum<float>()),
+            sycl::reduction(ep + 1, sycl::maximum<float>()),
+            [=](sycl::id<1> idx, auto & amax, auto & rmax) {
+                const int64_t i   = (int64_t) idx[0];
+                const int64_t r   = i / ne01c;
+                const int64_t m   = i % ne01c;
+                const size_t  off = (size_t) rd[r] * (size_t) ne01c + (size_t) m;
+                const float   ref = mkl_out[off];
+                const float   got = tile_out[off];
+                const float   ad  = sycl::fabs(got - ref);
+                amax.combine(ad);
+                rmax.combine(ad / sycl::fmax(1.0f, sycl::fabs(ref)));
+            });
+    }
+
+    float err[2] = { 0.0f, 0.0f };
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(err, err_dev.get(), sizeof(err))));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));  // also drains the rows H2D before the vector dies
+
+    static std::atomic<int> vcount(0);
+    const int d = vcount.fetch_add(1);
+    if (d < 400) {
+        char line[512];
+        snprintf(line, sizeof(line),
+                 "[lx-expert-tile-verify] dispatch=%d M=%d K=%d n_as=%d band_experts=%d band_rows=%d "
+                 "split_k=%d layout=%s max_abs_err=%.3e max_rel_err=%.3e\n",
+                 d, (int) ne01, (int) src0->ne[0], (int) n_as, st.n_slots, (int) st.n_rows,
+                 st.split_k, st.reordered ? "reorder-soa" : "linear", (double) err[0], (double) err[1]);
+        fputs(line, stderr);
+        static FILE * side = []() -> FILE * {
+            const char * p = getenv("GGML_SYCL_LX_EXPERT_TILE_VERIFY_LOG");
+            FILE * f = fopen(p != nullptr ? p : "/tmp/lx-expert-tile-verify.log", "a");
+            if (f != nullptr) {
+                fprintf(f, "=== lx-expert-tile verify: new process ===\n");
+            }
+            return f;
+        }();
+        if (side != nullptr) {
+            fputs(line, side);
+            fflush(side);
+        }
+    }
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -6942,11 +7522,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                       });
                   }
               }
-        } else
+        } else {
+        // [lx-expert-tile] one fused XMX dequant-GEMM launch computes every
+        // q4_K expert whose routed row count is in [1, lx_et::MAX_N] BEFORE the
+        // per-expert oneMKL loop; the loop then skips exactly that band, keyed
+        // off the same expert_row_counts the kernel's metadata was built from.
+        // In-order stream ordering: launched after k_copy_src1_to_contiguous,
+        // before the loop's GEMMs (which may lazily reorder the bank —
+        // serialized behind this kernel) and before the dst scatter. Disabled
+        // under the DIAG_EXPERT_CAP measurement hook, whose "first N non-empty
+        // experts" semantics the tile band would pollute.
+        bool lx_et_engaged = false;
+        lx_expert_tile_stats lx_et_stats;
+        if (lx_expert_tile_gemm_enabled() && lx_diag_expcap == 0 &&
+            src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            dst->ne[0] == src0->ne[1] &&
+            nb11 == sizeof(float) * (size_t) ne10 && nb1 == sizeof(float) * (size_t) ne0) {
+            lx_et_engaged = lx_expert_tile_gemm_launch(ctx, stream, src0,
+                    src1_contiguous.get(), dst_contiguous.get(),
+                    expert_row_counts, expert_row_offsets, &lx_et_stats);
+        }
+        // Verify mode: snapshot the tile+fixup output before the loop (which
+        // then recomputes the band via oneMKL and overwrites dst_contiguous);
+        // the report kernel after the loop compares the two.
+        const bool lx_et_verify = lx_et_engaged && lx_expert_tile_verify_enabled();
+        ggml_sycl_pool_alloc<float> lx_et_snap(ctx.pool());
+        if (lx_et_verify) {
+            lx_et_snap.alloc((size_t) n_routed_rows * (size_t) ne0);
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(lx_et_snap.get(), dst_contiguous.get(),
+                    sizeof(float) * (size_t) n_routed_rows * (size_t) ne0)));
+        }
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
             if (num_src1_rows == 0) {
+                continue;
+            }
+            // [lx-expert-tile] already computed by the fused tile kernel above;
+            // must not be double-computed (same counts array, same band). In
+            // verify mode the loop DOES recompute it so dst can be compared.
+            if (lx_et_engaged && !lx_et_verify && num_src1_rows <= lx_et::MAX_N) {
                 continue;
             }
             if (lx_diag_expcap > 0 && i02 >= lx_diag_expcap) {
@@ -7003,6 +7618,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
             }
         }
+
+        if (lx_et_verify) {
+            lx_expert_tile_verify_report(ctx, stream, src0,
+                                         (const float *) dst_contiguous.get(), lx_et_snap.get(),
+                                         expert_row_counts, expert_row_offsets,
+                                         (int64_t) ne0, lx_et_stats);
+        }
+        }  // [lx-expert-tile] end of non-gemm-batch expert-loop else block
 
         {
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));

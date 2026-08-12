@@ -472,6 +472,16 @@ struct ggml_backend_sycl_context {
     std::vector<int64_t>   mmid_ids_memo_offsets;
     std::vector<mmid_row_mapping> mmid_ids_memo_mapping;
 
+    // [lx-expert-tile] host staging for the fused expert-tile GEMM metadata
+    // (compact in-band slot/row/pad tables, int32). Persists in the context
+    // for the same reason as mmid_row_mapping_host: its H2D memcpy is async on
+    // the in-order stream, so the bytes must stay valid after the op returns.
+    // The full stream->wait() at each layer's first MUL_MAT_ID ([lx-ids-once]
+    // memo miss) drains all readers before the content can change; the layer's
+    // remaining ops rewrite bit-identical bytes (pure function of the memoized
+    // counts/offsets — the tables never depend on ne00/ne01).
+    std::vector<int32_t> lx_expert_tile_meta_host;
+
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
