@@ -6662,16 +6662,19 @@ struct lx_chrono_wait_guard {
 // t16x16x16-wgm64-sgc16-nb32-sk16-kb64-sg16 — 1.33x/1.21x vs MKL at N=16/32):
 //   - 16x16x16 fp16*fp16+fp32 joint_matrix (the only hardware-real BMG combo),
 //     sub-group 16;
-//   - each workgroup dequantizes a KB=64 x WG_M=64 q4_K weight tile into
-//     VNNI/ext_intel_packed fp16 SLM (half2 stores) from EITHER serving-state
-//     layout (reordered per-expert SoA [qs|scales|dm] or linear block array);
+//   - each workgroup dequantizes a KB=64 x WG_M=64 q4_K or q6_K weight tile
+//     into VNNI/ext_intel_packed fp16 SLM (half2 stores) from EITHER
+//     serving-state layout (reordered per-expert SoA — q4_K [qs|scales|dm],
+//     q6_K [ql|qh|scales|d] — or linear block array);
 //   - oversubscribed dequant: 16 sub-groups cooperate on the dequant phase,
 //     the first 4 do the joint_matrix MADs (WG_M/SG_COLS = 64/16);
 //   - split-K across workgroups with fp32 partials + a fixup kernel.
-// Scope: src0->type == GGML_TYPE_Q4_K only (gate/up all 38 layers + down in
-// 22); q6_K down dispatches stay 100% on the oneMKL loop. Band: experts with
-// 1..LX_ET MAX_N=32 routed rows (microbench crossover); larger experts stay on
-// the loop, which skips exactly the band, keyed off the SAME counts array.
+// Scope: src0->type == GGML_TYPE_Q4_K (gate/up all 38 layers + down in 22)
+// and GGML_TYPE_Q6_K (down in the remaining 16 layers) — a QT template
+// dimension on the same kernel; other types stay 100% on the oneMKL loop.
+// Band: experts with 1..LX_ET MAX_N=32 routed rows (microbench crossover);
+// larger experts stay on the loop, which skips exactly the band, keyed off
+// the SAME counts array.
 //
 // Grid/enumeration (documented choice): flattened metadata-indexed. The host
 // compacts the in-band experts into slots [0..n_slots); workgroup id wg maps
@@ -6769,6 +6772,45 @@ static inline void dequantize_q4_K_math(Store2Fn && store2, const uint8_t * __re
     store2(j0 + 34, d2 * (q_vec[2] >>  4) - m2, d2 * (q_vec[3] >>  4) - m2);
 }
 
+// Same math as dequantize_block_q6_K / dequantize_block_q6_K_reorder
+// (dequantize.hpp), restructured chunk-local: the reference thread (ip, ilq)
+// writes y[0]/y[32]/y[64]/y[96] spread over a 128-value super-block half,
+// i.e. across TWO KB=64 chunks. Here one call covers exactly one chunk:
+// quarter il selects the half ip = il/2 and the nibble family hi = il%2
+// (0 -> y[0]/y[32] low-nibble values, 1 -> y[64]/y[96] high-nibble values),
+// and ir covers the reference's ilq = 4*ir..4*ir+3, so the store2 j-pattern
+// (j0, j0+2, j0+32, j0+34 with j0 = 64*il + 4*ir) is identical to the q4_K
+// variant. No vector loads: sizeof(block_q6_K) == 210 leaves linear-layout
+// blocks only 2-byte aligned.
+template <typename Store2Fn>
+static inline void dequantize_q6_K_math(Store2Fn && store2, const uint8_t * __restrict__ ql_ptr,
+                                        const uint8_t * __restrict__ qh_ptr,
+                                        const int8_t * __restrict__ scales_ptr, const float d,
+                                        int il, int ir) {
+    const int ip = il / 2;                   // 128-value half of the super-block
+    const int hi = il % 2;                   // nibble family of this chunk within the half
+    const int is = 8 * ip + (4 * ir) / 16;   // ilq/16 is constant over ilq = 4*ir..4*ir+3
+    const float dA = d * scales_ptr[is + (hi ? 4 : 0)];   // y[64] : y[0]
+    const float dB = d * scales_ptr[is + (hi ? 6 : 2)];   // y[96] : y[32]
+    const int shA = hi ? 4 : 0;  // qh bit pair of family A
+    const int shB = hi ? 6 : 2;  // qh bit pair of family B
+    const uint8_t * ql = ql_ptr + 64 * ip + 4 * ir;
+    const uint8_t * qh = qh_ptr + 32 * ip + 4 * ir;
+    float vA[4], vB[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        const uint8_t qa = hi ? (uint8_t) (ql[t] >> 4) : (uint8_t) (ql[t] & 0xF);
+        const uint8_t qb = hi ? (uint8_t) (ql[t + 32] >> 4) : (uint8_t) (ql[t + 32] & 0xF);
+        vA[t] = dA * ((int8_t) (qa | (((qh[t] >> shA) & 3) << 4)) - 32);
+        vB[t] = dB * ((int8_t) (qb | (((qh[t] >> shB) & 3) << 4)) - 32);
+    }
+    const int j0 = 64 * il + 4 * ir;
+    store2(j0 + 0,  vA[0], vA[1]);
+    store2(j0 + 2,  vA[2], vA[3]);
+    store2(j0 + 32, vB[0], vB[1]);
+    store2(j0 + 34, vB[2], vB[3]);
+}
+
 using local_half_ptr = sycl::multi_ptr<sycl::half, sycl::access::address_space::local_space,
                                        sycl::access::decorated::no>;
 
@@ -6780,7 +6822,7 @@ using local_half_ptr = sycl::multi_ptr<sycl::half, sycl::access::address_space::
 // SLM. fp32 accumulate across all chunks of this split; stores go to the
 // padded fp32 partials surface (never to dst rows — masking happens in the
 // fixup kernel).
-template <bool REORDERED>
+template <bool REORDERED, ggml_type QT>
 static inline void tile_gemm_device(const uint8_t *__restrict__ w_base_all,  // quantized bank (src0->data)
                                     const sycl::half *__restrict__ act,      // [n_pad_rows][ne00] staged fp16
                                     float *__restrict__ part,                // [split_k][n_pad_rows][ne01]
@@ -6806,10 +6848,22 @@ static inline void tile_gemm_device(const uint8_t *__restrict__ w_base_all,  // 
     const int       row_blocks = (int) (ne00 / QK_K);           // super-blocks per weight row
     const int64_t   nbpe       = (int64_t) row_blocks * ne01;   // super-blocks per expert
     const uint8_t * base       = w_base_all + (size_t) e * nb02;
-    // reordered per-expert SoA section bases (exactly reorder_qw_q4_k_moe /
-    // dequantize_block_q4_K_reorder offset math); unused when !REORDERED
-    const uint8_t * sc_base    = base + (size_t) nbpe * (QK_K / 2);
-    const uint8_t * dm_base    = sc_base + (size_t) nbpe * K_SCALE_SIZE;
+    // reordered per-expert SoA section bases; unused when !REORDERED.
+    // q4_K [qs|scales|dm]: exactly reorder_qw_q4_k_moe /
+    // dequantize_block_q4_K_reorder offset math. q6_K [ql|qh|scales|d]:
+    // exactly reorder_qw_q6_k_moe / dequantize_block_q6_K_reorder
+    // (nb = blocks-per-expert = nbpe, base = bank + e*nb02).
+    const uint8_t * qh_base = nullptr;  // q6_K only
+    const uint8_t * sc_base;            // q4_K: scales (K_SCALE_SIZE/blk), q6_K: scales (16 int8/blk)
+    const uint8_t * dm_base;            // q4_K: dm (half2/blk),            q6_K: d (half/blk)
+    if constexpr (QT == GGML_TYPE_Q4_K) {
+        sc_base = base + (size_t) nbpe * (QK_K / 2);
+        dm_base = sc_base + (size_t) nbpe * K_SCALE_SIZE;
+    } else {
+        qh_base = base + (size_t) nbpe * (QK_K / 2);
+        sc_base = qh_base + (size_t) nbpe * (QK_K / 4);
+        dm_base = sc_base + (size_t) nbpe * (QK_K / 16);
+    }
 
     sycl::sub_group sg = it.get_sub_group();
     const int  lid       = (int) it.get_local_id(0);
@@ -6837,28 +6891,47 @@ static inline void tile_gemm_device(const uint8_t *__restrict__ w_base_all,  // 
         for (int pass = 0; pass < WG_M / (WG_THREADS / 8); ++pass) {
             const int     ml = pass * (WG_THREADS / 8) + tq;    // weight row within the m-tile
             const int64_t ib = (int64_t) (m0 + ml) * row_blocks + blk;
-            const uint8_t * qs;
-            const uint8_t * scp;
-            sycl::half2     dm;
-            if constexpr (REORDERED) {
-                qs  = base + ib * (QK_K / 2);
-                scp = sc_base + ib * K_SCALE_SIZE;
-                dm  = *reinterpret_cast<const sycl::half2 *>(dm_base + ib * sizeof(sycl::half2));
+            const auto store2 = [&](int j, float v0, float v1) {
+                const int kl = j - 64 * il;  // local k within the chunk, even
+                *reinterpret_cast<sycl::vec<sycl::half, 2> *>(&wt[(kl >> 1) * (2 * WG_M) + ml * 2]) =
+                    sycl::vec<sycl::half, 2>{(sycl::half) v0, (sycl::half) v1};
+            };
+            if constexpr (QT == GGML_TYPE_Q4_K) {
+                const uint8_t * qs;
+                const uint8_t * scp;
+                sycl::half2     dm;
+                if constexpr (REORDERED) {
+                    qs  = base + ib * (QK_K / 2);
+                    scp = sc_base + ib * K_SCALE_SIZE;
+                    dm  = *reinterpret_cast<const sycl::half2 *>(dm_base + ib * sizeof(sycl::half2));
+                } else {
+                    const block_q4_K * xb = reinterpret_cast<const block_q4_K *>(base) + ib;
+                    qs  = xb->qs;
+                    scp = xb->scales;
+                    dm  = xb->dm;
+                }
+                const float dall = dm[0];
+                const float dmin = dm[1];
+                dequantize_q4_K_math(store2, qs, dall, dmin, scp, il, ir);
             } else {
-                const block_q4_K * xb = reinterpret_cast<const block_q4_K *>(base) + ib;
-                qs  = xb->qs;
-                scp = xb->scales;
-                dm  = xb->dm;
+                const uint8_t * qlp;
+                const uint8_t * qhp;
+                const int8_t  * scp;
+                float           d;
+                if constexpr (REORDERED) {
+                    qlp = base + ib * (QK_K / 2);
+                    qhp = qh_base + ib * (QK_K / 4);
+                    scp = reinterpret_cast<const int8_t *>(sc_base + ib * (QK_K / 16));
+                    d   = *reinterpret_cast<const sycl::half *>(dm_base + ib * sizeof(sycl::half));
+                } else {
+                    const block_q6_K * xb = reinterpret_cast<const block_q6_K *>(base) + ib;
+                    qlp = xb->ql;
+                    qhp = xb->qh;
+                    scp = xb->scales;
+                    d   = xb->d;
+                }
+                dequantize_q6_K_math(store2, qlp, qhp, scp, d, il, ir);
             }
-            const float dall = dm[0];
-            const float dmin = dm[1];
-            dequantize_q4_K_math(
-                [&](int j, float v0, float v1) {
-                    const int kl = j - 64 * il;  // local k within the chunk, even
-                    *reinterpret_cast<sycl::vec<sycl::half, 2> *>(&wt[(kl >> 1) * (2 * WG_M) + ml * 2]) =
-                        sycl::vec<sycl::half, 2>{(sycl::half) v0, (sycl::half) v1};
-                },
-                qs, dall, dmin, scp, il, ir);
         }
         sycl::group_barrier(it.get_group());
         if (is_mad_sg) {
@@ -6890,7 +6963,7 @@ static inline void tile_gemm_device(const uint8_t *__restrict__ w_base_all,  // 
     }
 }
 
-template <bool REORDERED>
+template <bool REORDERED, ggml_type QT>
 static void submit_tile(queue_ptr stream, const uint8_t * w_base_all, const sycl::half * act, float * part,
                         const int32_t * slots, int n_slots, int64_t ne00, int64_t ne01, size_t nb02,
                         int n_m_tiles, int split_k, int64_t n_pad_rows) {
@@ -6900,10 +6973,10 @@ static void submit_tile(queue_ptr stream, const uint8_t * w_base_all, const sycl
         cgh.parallel_for(
             sycl::nd_range<1>(n_wg * WG_THREADS, WG_THREADS),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
-                tile_gemm_device<REORDERED>(w_base_all, act, part, slots, ne00, ne01, nb02,
-                                            n_m_tiles, split_k, n_pad_rows,
-                                            get_pointer(wtile),
-                                            wtile.template get_multi_ptr<sycl::access::decorated::no>(), it);
+                tile_gemm_device<REORDERED, QT>(w_base_all, act, part, slots, ne00, ne01, nb02,
+                                                n_m_tiles, split_k, n_pad_rows,
+                                                get_pointer(wtile),
+                                                wtile.template get_multi_ptr<sycl::access::decorated::no>(), it);
             });
     });
 }
@@ -6929,8 +7002,8 @@ static bool lx_expert_tile_gemm_launch(ggml_backend_sycl_context & ctx, queue_pt
                                        const std::vector<int64_t> & expert_row_counts,
                                        const std::vector<int64_t> & expert_row_offsets,
                                        lx_expert_tile_stats * stats_out) {
-    if (src0->type != GGML_TYPE_Q4_K) {
-        return false;  // v2 scope: q4_K banks only; q6_K dispatches stay 100% oneMKL
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q6_K) {
+        return false;  // scope: the two Laguna MoE bank types (q4_K gate/up/down, q6_K down)
     }
     if (!ggml_is_contiguous(src0)) {
         return false;
@@ -6944,8 +7017,9 @@ static bool lx_expert_tile_gemm_launch(ggml_backend_sycl_context & ctx, queue_pt
     if (ne00 % QK_K != 0 || ne01 % lx_et::WG_M != 0) {
         return false;  // whole super-blocks / whole m-tiles only (Laguna: 2048x512, 512x2048 — both pass)
     }
-    const int64_t nbpe = ne00 * ne01 / QK_K;  // super-blocks per expert
-    if (nb02 != (size_t) nbpe * sizeof(block_q4_K)) {
+    const int64_t nbpe      = ne00 * ne01 / QK_K;  // super-blocks per expert
+    const size_t  blk_bytes = src0->type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q6_K);
+    if (nb02 != (size_t) nbpe * blk_bytes) {
         return false;  // padded/strided bank: the in-kernel offset math would not hold
     }
 
@@ -7088,12 +7162,22 @@ static bool lx_expert_tile_gemm_launch(ggml_backend_sycl_context & ctx, queue_pt
 
     // 2) ONE fused XMX tile launch over all in-band experts
     const int n_m_tiles = (int) (ne01 / lx_et::WG_M);
-    if (reordered) {
-        lx_et::submit_tile<true>(stream, (const uint8_t *) src0->data, act_dev.get(), part_dev.get(),
-                                 meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+    if (src0->type == GGML_TYPE_Q4_K) {
+        if (reordered) {
+            lx_et::submit_tile<true, GGML_TYPE_Q4_K>(stream, (const uint8_t *) src0->data, act_dev.get(),
+                    part_dev.get(), meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+        } else {
+            lx_et::submit_tile<false, GGML_TYPE_Q4_K>(stream, (const uint8_t *) src0->data, act_dev.get(),
+                    part_dev.get(), meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+        }
     } else {
-        lx_et::submit_tile<false>(stream, (const uint8_t *) src0->data, act_dev.get(), part_dev.get(),
-                                  meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+        if (reordered) {
+            lx_et::submit_tile<true, GGML_TYPE_Q6_K>(stream, (const uint8_t *) src0->data, act_dev.get(),
+                    part_dev.get(), meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+        } else {
+            lx_et::submit_tile<false, GGML_TYPE_Q6_K>(stream, (const uint8_t *) src0->data, act_dev.get(),
+                    part_dev.get(), meta_dev.get(), n_slots, ne00, ne01, nb02, n_m_tiles, split_k, n_pad_rows);
+        }
     }
 
     // 3) fixup: sum the split-K partials of each REAL band row into dst_contiguous
@@ -7127,8 +7211,9 @@ static bool lx_expert_tile_gemm_launch(ggml_backend_sycl_context & ctx, queue_pt
     static std::atomic<int> announced(0);
     if (announced.fetch_add(1) == 0) {
         fprintf(stderr,
-                "[lx-control-expert-tile] engaged(xmx): n_as=%d slots=%d rows=%d pad_rows=%d M=%d K=%d "
+                "[lx-control-expert-tile] engaged(xmx): type=%s n_as=%d slots=%d rows=%d pad_rows=%d M=%d K=%d "
                 "layout=%s split_k=%d grid=%dx%d cfg=t%dx%dx%d-wgm%d-sgc%d-kb%d-sg%d\n",
+                ggml_type_name(src0->type),
                 (int) n_as, n_slots, (int) n_rows, (int) n_pad_rows, (int) ne01, (int) ne00,
                 reordered ? "reorder-soa" : "linear", split_k,
                 (int) ((size_t) n_slots * n_m_tiles * split_k), lx_et::WG_THREADS,
@@ -7210,9 +7295,9 @@ static void lx_expert_tile_verify_report(ggml_backend_sycl_context & ctx, queue_
     if (d < 400) {
         char line[512];
         snprintf(line, sizeof(line),
-                 "[lx-expert-tile-verify] dispatch=%d M=%d K=%d n_as=%d band_experts=%d band_rows=%d "
+                 "[lx-expert-tile-verify] dispatch=%d type=%s M=%d K=%d n_as=%d band_experts=%d band_rows=%d "
                  "split_k=%d layout=%s max_abs_err=%.3e max_rel_err=%.3e\n",
-                 d, (int) ne01, (int) src0->ne[0], (int) n_as, st.n_slots, (int) st.n_rows,
+                 d, ggml_type_name(src0->type), (int) ne01, (int) src0->ne[0], (int) n_as, st.n_slots, (int) st.n_rows,
                  st.split_k, st.reordered ? "reorder-soa" : "linear", (double) err[0], (double) err[1]);
         fputs(line, stderr);
         static FILE * side = []() -> FILE * {
@@ -7524,7 +7609,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
               }
         } else {
         // [lx-expert-tile] one fused XMX dequant-GEMM launch computes every
-        // q4_K expert whose routed row count is in [1, lx_et::MAX_N] BEFORE the
+        // q4_K/q6_K expert whose routed row count is in [1, lx_et::MAX_N] BEFORE the
         // per-expert oneMKL loop; the loop then skips exactly that band, keyed
         // off the same expert_row_counts the kernel's metadata was built from.
         // In-order stream ordering: launched after k_copy_src1_to_contiguous,
